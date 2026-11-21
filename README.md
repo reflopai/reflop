@@ -124,7 +124,8 @@ the release signature.
 
 > [!WARNING]
 > On 0.2.0 or earlier, plain `update` can fail because the repository moved.
-> Run `reflop update --version v0.2.1` (Guest) or
+> Run 
+> `reflop update --version v0.2.1` (Guest) or
 > `reflopd update --version v0.2.1` (Owner) once, then use plain `update`.
 
 In a uv project, `reflop update` upgrades `reflop` in
