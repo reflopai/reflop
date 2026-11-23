@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.2.8 (2026-11-23)
+
+This patch fixes complex `conj()` views and backward through `select` and
+`diagonal`, and makes reflopd check seven view and scatter operators before it
+allocates memory. Owners: update reflopd for the backward fix and the checks.
+The `conj()` fix is in the Guest client and works with an older daemon.
 
 - `conj()` on a complex reFLOP tensor gives conjugated values. Before, arithmetic
   on the view could return the unconjugated input, and reading the view,
