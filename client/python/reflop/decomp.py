@@ -71,7 +71,15 @@ def _thnn_fused_gru_cell_backward(grad_hy, workspace, has_bias):
     return grad_input_gates, grad_hidden_gates, ghx, gib, ghb
 
 
+def _conj_physical(x):
+    # torch.conj_physical calls this, and it is not in the opset. A conj()
+    # view on the reflop device is already materialized (tensor._view_step);
+    # the clone gives the result storage of its own, as _conj_physical does.
+    return aten.clone.default(aten._conj.default(x))
+
+
 TABLE = {
+    aten._conj_physical.default: _conj_physical,
     aten._thnn_fused_lstm_cell.default: _thnn_fused_lstm_cell,
     aten._thnn_fused_lstm_cell_backward_impl.default: _thnn_fused_lstm_cell_backward_impl,
     aten._thnn_fused_gru_cell.default: _thnn_fused_gru_cell,

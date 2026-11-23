@@ -303,8 +303,12 @@ class Executor:
             raise ReflopError(cpb.ERROR_EXECUTION, f"{str(e)[:500]}", E3, idx, op_id) from None
         res = cpb.ExecuteResult()
         K = cpb.OutputSpec
+        from .safetensors import resolved
+
         for spec, r in zip(ex.outputs, prog.outputs):
-            t = env[r]
+            # Handles hold plain values: a conj() or _neg_view() output would
+            # keep its lazy bit, and later raw copies (reads, snapshots) drop it.
+            t = resolved(env[r])
             if spec.kind == K.KIND_STORE:
                 self.handles.put_new(spec.handle, t)
             elif spec.kind == K.KIND_REBIND:

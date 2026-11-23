@@ -461,6 +461,8 @@ def _inverse(sess, func, rest, k, base_meta, base_val: Value, new_val: Value, vi
         return rec("aten.view_as_complex.default", aten.view_as_complex.default, [new_val], base_meta)[0]
     if name == "aten.view_as_complex.default":
         return rec("aten.view_as_real.default", aten.view_as_real.default, [new_val], base_meta)[0]
+    if name == "aten.conj_physical.default":  # a conj() view, see _view
+        return rec("aten.conj_physical.default", aten.conj_physical.default, [new_val], base_meta)[0]
     if name == "aten.expand.default":
         raise RuntimeError("unsupported operation: in-place write to an expanded tensor (more than one element "
                            "of the written-to tensor refers to a single memory location)")
@@ -652,12 +654,42 @@ def _dispatch(sess, func, args, kwargs):
     return _functional(sess, func, args, kwargs)
 
 
+# conj() returns a view with PyTorch's conjugate bit set, and the kernel that
+# reads it does the conjugation. That bit cannot live on a reflop tensor: the
+# wrapper and its meta would disagree about it, and so would the client and
+# the server. A conj() view therefore joins the view chain as a materialized
+# step, conj_physical: reads see conjugated values, and a write through the
+# view is inverted by conjugating again (_inverse). Tensors on the reflop
+# device never report is_conj().
+def _view_step(func, src: RemoteTensor):
+    """The op recorded in src's view chain for the view op func."""
+    if func is aten._conj.default:
+        return aten.conj_physical.default
+    if func in (aten.as_strided.default, aten.as_strided_.default) and any(
+            f is aten.conj_physical.default for f, _, _ in src._rf_chain):
+        # as_strided addresses the base's storage, but the conjugated step
+        # has a storage of its own.
+        raise UnsupportedOperatorError("as_strided on a conj() view is not supported on the reflop device; "
+                                       "call .conj_physical() or .clone() first")
+    return func
+
+
+def _check_math_bits(func, out_meta) -> None:
+    """Fail closed on any other view that sets the conjugate or negative bit."""
+    for m in _flat_tensors(out_meta):
+        if m.is_conj() or m.is_neg():
+            raise UnsupportedOperatorError(f"{_op_name(func)}: views with the conjugate or negative bit set are "
+                                           "not supported on the reflop device")
+
+
 def _view(sess, func, args, kwargs):
     vals = normalize(func, args, kwargs)
     src = vals[0]
     if not isinstance(src, RemoteTensor):
         return _functional(sess, func, args, kwargs)
+    func = _view_step(func, src)
     out_meta = run_meta(func, args, kwargs)
+    _check_math_bits(func, out_meta)
     rest = tuple(_freeze(v) for v in vals[1:])
     st = src._rf_storage
     if _op_name(func) in ("aten.alias.default", "aten.detach.default", "aten.lift_fresh.default"):
@@ -683,6 +715,7 @@ def _inplace_view(sess, func, args, kwargs):
     ffunc = found[0] if found else None
     if ffunc is None or not isinstance(t, RemoteTensor):
         raise UnsupportedOperatorError(f"{func}: unsupported in-place view operator")
+    _view_step(ffunc, t)
     rest = tuple(_freeze(v) for v in vals[1:])
     fa, fk = _rebind(ffunc, [t._rf_meta, *vals[1:]])
     new_meta = run_meta(ffunc, fa, fk)

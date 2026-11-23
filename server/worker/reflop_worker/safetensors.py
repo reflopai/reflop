@@ -114,9 +114,20 @@ def parse_header(buf, total_len: int, max_numel: int = 1 << 40) -> tuple[int, di
     return data_start, out
 
 
+def resolved(t: torch.Tensor) -> torch.Tensor:
+    """t with its conjugate and negative bits applied to the data, else t
+    itself (the same object, so a recorded value range stays with it).
+
+    conj() and _neg_view() give views whose kernels apply the bit lazily, and
+    a raw byte copy would drop it."""
+    if t.is_conj() or t.is_neg():
+        return t.detach().resolve_conj().resolve_neg()
+    return t
+
+
 def tensor_bytes(t: torch.Tensor) -> bytes:
     """Raw little-endian bytes of a tensor without numpy (not in the runtime)."""
-    t = t.detach().contiguous().cpu()
+    t = resolved(t).detach().contiguous().cpu()
     n = t.numel() * t.element_size()
     if n == 0:
         return b""

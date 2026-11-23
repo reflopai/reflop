@@ -1068,3 +1068,41 @@ different Owner.
 **Consequences.** Explicit device selection still permits moves between
 Owners. An implicit CPU session stays out of the default stack. Existing
 servers can use the fix through the Python client update.
+
+## ADR-039: Materialize conj() views in the view chain
+
+**Context.** PyTorch's `conj()` returns a view with the conjugate bit set,
+and the kernel that reads the view applies the conjugation. A reFLOP wrapper
+tensor did not carry the bit, but its meta tensor did, and the worker's
+tensor did too. So the client and the server disagreed about the tensor.
+Reading the view failed because the worker's byte copy rejects conjugate
+views. `.imag`, `@` and `view_as_real` raised errors on the client. The
+in-process worker returned unconjugated results whenever a flush started
+inside `__torch_dispatch__`, because PyTorch turns off the Conjugate and
+Negative dispatch keys there.
+
+**Decision.** The client records `aten._conj` as `aten.conj_physical` in the
+tensor's view chain. Reads replay the chain and get conjugated values. A
+write through the view is inverted by conjugating again. reFLOP tensors and
+their metas never set the conjugate bit. `as_strided` over a chain that holds
+this step raises `UnsupportedOperatorError`, because `as_strided` addresses
+the base's storage and the conjugated step has a storage of its own. Any other
+view that sets the conjugate or negative bit also raises. The worker applies
+both bits to every output before it stores, returns or fetches the tensor, so
+handles hold plain values. The in-process worker runs under the dispatch key
+sets of a fresh thread with the caller's dispatch and function modes turned
+off, which is the state of a reflopd worker process.
+
+**Alternatives.** Setting the conjugate bit on the wrapper makes PyTorch's
+conjugate fallback emit its own conjugation on the client, which applies the
+bit a second time on the server. Recording `_conj` as a plain functional
+op would break aliasing, so writes through the view would not reach the base.
+Running the in-process worker on its own thread gives the same dispatch state
+but adds a thread handoff to every request.
+
+**Consequences.** `z.conj()` costs one materialized copy on the server. On a
+reFLOP tensor, `is_conj()` is `False` where PyTorch reports `True`, and
+`view_as_real(z.conj())` works where PyTorch asks for `resolve_conj()`
+first. Other clients can still send `aten._conj` and get plain values back.
+The fix is in both the client and the worker. An updated client works with
+an older reflopd.

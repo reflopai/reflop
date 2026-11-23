@@ -551,6 +551,9 @@ Does not work:
 - sparse, nested or quantized tensors
 - multi-GPU training, `torch.distributed`
 - explicit `torch.Generator` objects on reFLOP tensors (use `reflop.seed(n)`)
+- `as_strided` on a `conj()` view (call `.conj_physical()` or `.clone()`
+  first). A `conj()` view of a reFLOP tensor is already conjugated, so
+  `is_conj()` returns `False`.
 
 GPU results can differ from your CPU's in the last bits (TF32 is on for
 convolutions by default, and some GPU kernels are not deterministic).
