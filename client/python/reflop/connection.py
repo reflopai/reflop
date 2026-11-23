@@ -227,6 +227,38 @@ class Connection:
         self.closed = True
 
 
+_FRESH_KEYS: tuple | None = None
+
+
+def _as_worker_process():
+    """Run in-process worker code in the dispatch state of a worker process.
+
+    A flush can start inside RemoteTensor.__torch_dispatch__ (x.cpu() does
+    it). There PyTorch turns off the Conjugate, Negative, ZeroTensor and other
+    dispatch keys, and the caller's dispatch and function modes stay active,
+    so the worker's kernels would compute differently than they do in
+    reflopd's worker (z.conj() + 0 came back unconjugated). The key sets are
+    the ones a fresh thread starts with."""
+    import contextlib
+
+    import torch
+    from torch.utils._python_dispatch import _disable_current_modes
+
+    global _FRESH_KEYS
+    if _FRESH_KEYS is None:
+        got = []
+        t = threading.Thread(target=lambda: got.append((torch._C._dispatch_tls_local_include_set(),
+                                                         torch._C._dispatch_tls_local_exclude_set())))
+        t.start()
+        t.join()
+        _FRESH_KEYS = got[0]
+    stack = contextlib.ExitStack()
+    stack.enter_context(torch._C._ForceDispatchKeyGuard(*_FRESH_KEYS))
+    stack.enter_context(_disable_current_modes())
+    stack.enter_context(torch._C.DisableTorchFunction())
+    return stack
+
+
 class LocalConnection(Connection):
     """Runs the reflop worker's request handling in-process.
 
@@ -315,7 +347,7 @@ class LocalConnection(Connection):
 
     def _send(self, env: cpb.Envelope) -> None:
         which = env.WhichOneof("body")
-        with self._wlock:
+        with self._wlock, _as_worker_process():
             if which in ("list_snapshots", "delete_snapshot", "describe_snapshot"):
                 return self._admin(env, which)
             if self._dead:

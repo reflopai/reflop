@@ -24,7 +24,7 @@ from .graph import Builder
 from .handles import HandleTable, check_new
 from .meta import infer
 from .ops_generated import OPS
-from .safetensors import MAX_HEADER, RESERVED, SafetensorsError, parse_header
+from .safetensors import MAX_HEADER, RESERVED, SafetensorsError, parse_header, resolved
 
 # Tier 2 capability keys and how to detect them on a device.
 CAPABILITY_KEYS = ("linalg", "complex", "fp8", "rnn_fused", "ctc", "cdist_backward")
@@ -120,7 +120,7 @@ def device_info(device: torch.device, gd: gpb.Device) -> kpb.DeviceInfo:
 def _host_copy(t: torch.Tensor) -> torch.Tensor:
     """The tensor's bytes as a flat uint8 tensor on the host (one copy for a
     device tensor, as .cpu() always made)."""
-    return t.detach().contiguous().cpu().reshape(-1).view(torch.uint8)
+    return resolved(t).detach().contiguous().cpu().reshape(-1).view(torch.uint8)
 
 
 def _chunk_bytes(flat: torch.Tensor, off: int, n: int) -> bytes:

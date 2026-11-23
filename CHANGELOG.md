@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+- `conj()` on a complex reFLOP tensor gives conjugated values. Before, arithmetic
+  on the view could return the unconjugated input, and reading the view,
+  `resolve_conj()`, `.imag`, `@` and `view_as_real` raised errors. Writes
+  through a `conj()` view reach its base. `torch.conj_physical` runs on the
+  server instead of the client CPU.
+- `as_strided` on a `conj()` view raises `UnsupportedOperatorError`, as do
+  views that set PyTorch's negative bit (`torch._neg_view`).
+- reflopd's worker applies the conjugate and negative bits before it stores,
+  returns or snapshots a tensor. A graph that ends in `aten._conj` no longer
+  fails when its result is read.
+- The in-process worker (`reflop.device(local=...)`, `reflop verify`) runs with
+  the dispatch state of a worker process. Its results no longer change when a
+  flush starts inside PyTorch dispatch, as `.cpu()` does.
+
 ## 0.2.7 (2026-11-22)
 
 This patch fixes seeding, large tensor reads, and CPU placement in the Guest
