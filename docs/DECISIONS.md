@@ -1345,3 +1345,83 @@ the worker fails closed at E3 because PyTorch's meta and CPU kernels
 disagree on an auxiliary output's shape). A new test requires every seed of
 a strictly checked op, a call PyTorch itself makes, to pass V4, since the
 parity test does not report false rejections for those ops.
+
+## ADR-044: Fuzz the worker's graph pipeline; count view memory in V5
+
+**Context.** Decoding and validating a graph (V1-V5) and running it is the
+main surface a Guest reaches, and it was tested only with hand-written cases
+and the parity test, which checks one op at a time (GH#4). CI fuzzed only
+the Go framing, safetensors and manifest parsers.
+
+**Decision.** `tests/security/fuzz` adds a structure-aware fuzzer that
+drives an in-process CPU worker through its real entry points
+(`wire.Channel.recv`'s decode and checks, then `Session.handle`). Three
+generators: random graphs built from the opset by schema type (unknown op
+ids, wrong arities and argument kinds, dangling and forward references, odd
+dtypes, shapes and enum values); graphs chained from the parity seeds, which
+pass V4 often enough to reach V5, bindings, runtime checks and execution
+(about 40% of them run); and byte mutations of serialized envelopes. Every
+case comes from a seed and an index. The properties: decode fails only with
+a decode or protocol error; no exception escapes `Session.handle`, and every
+request gets one final response, a result or a structured error with a
+stage, never `INTERNAL` (except the known E3 output-shape check); a result
+has the registered output metadata; an execute holds no more memory than V5
+computed, measured over every storage created while it runs, within an
+allowance for transient copies; the worker keeps serving. CI runs 5,000
+cases from fixed seeds (a few seconds); `.github/workflows/fuzz.yml` runs
+200,000 from fresh seeds nightly, and the Go fuzzers for 5 minutes each.
+Failing cases are saved as replay files (framed worker envelopes) and added
+to `tests/security/fuzz/corpus/`.
+
+The first runs found:
+
+- A Tensor argument may be a wrapped Python number (V3 allows it for scalar
+  promotion); validators that call `.dim()` on it raised `AttributeError`
+  out of `Session.handle`. The static and runtime validator wrappers now turn
+  it into a rejection.
+- A shape with a zero dim beside huge ones (`[0, 2**62, 2**62]`) has no
+  elements, passed the element limit, and overflowed the strides when V4
+  built its meta tensor. V2 bounds the product of the nonzero dims; V4 turns
+  a failure to build an input's meta tensor into a rejection.
+- `new_empty_strided` accepted any strides: 18 elements reaching `2**31 * 2`
+  into their storage reserved about 17 GB for a tensor V5 counted as 72
+  bytes. It now has `empty_strided`'s validator (dense, non-overlapping).
+- V5 counted views as free and freed a view's base at the view. A graph
+  that expanded a 0-d input to `[2**31, 2]` and returned it was estimated at
+  1.4 KB; returning it copied 16 GiB (`max_fetch_bytes`) on the host, past
+  the device quota and the host budget. The same graph with a stored view,
+  fetched later, did the same.
+
+V5 now keeps a view's base alive as long as the view (`alias_last_use`),
+and adds the size of every non-contiguous view output at the end of the
+graph, the copy that returning or fetching it makes (`.contiguous()`).
+Contiguous views (a slice along dim 0, `view`, `reshape`) add nothing.
+
+Measured on an RTX 5070 (V5 compares against 11.48 GiB): a graph whose
+output is `x.t()` of a tensor it makes registers up to `x` = 11.48 GiB under
+the old rule and 5.74 GiB under the new one; fetching that output already
+ran out of memory above about 5.5 GiB (it needs a second copy). Only storing
+such a view and never reading it worked between 5.74 and about 10.5 GiB,
+and the client never stores a view: it keeps views as view chains and stores
+their base. Across eleven common patterns and four training workloads
+(ResNet-18, a 6-layer transformer, an LSTM, an MLP), the copy term added
+bytes only when the program read a non-contiguous view, which makes that
+copy. The alias term corrected an undercount: the transformer's training
+step was estimated at 1128 MiB beside inputs and measured 1789 MiB; the new
+estimate is 1808 MiB. ResNet-18, the LSTM and the MLP changed by at most
+32 MiB; cuDNN workspaces, which neither rule counts, keep ResNet and the
+LSTM above both estimates.
+
+**Alternatives.** Hypothesis or atheris: Hypothesis shrinks failures, but
+graphs need tight control of references, schema types and inferred output
+metadata, cases must replay from a seed alone, and each failure is saved as a
+replay file anyway; atheris needs a clang build. Checking a returned view's
+copy at execute time (E1) instead of in V5 is precise for stored views but
+leaves a later fetch unchecked unless fetch streams without the copy.
+
+**Consequences.** Graphs that output large non-contiguous views, and graphs
+whose temporaries are read through views, get a larger estimate and can be
+refused with `OUT_OF_MEMORY` or `QUOTA` at V5 where they used to fail
+during execute. The fuzz session caps `max_fetch_bytes` at 64 MiB and the
+device quota at 256 MiB so a fuzzed size never reaches the allocator. Not
+yet fuzzed: uploads, fetches, datasets, snapshots and checkpoints.

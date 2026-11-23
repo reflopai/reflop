@@ -98,7 +98,8 @@ KNOWN = {
     "aten.native_group_norm_backward.default": {"I3"},
     "aten.native_layer_norm.default": {"I3"},
     "aten.native_layer_norm_backward.default": {"I3"},
-    "aten.new_empty_strided.default": {"I3"},
+    # Dense, non-overlapping layouts only, as for empty_strided (deliberate, ADR-044).
+    "aten.new_empty_strided.default": {"false-rejection"},
     "aten.nll_loss2d_backward.default": {"I3", "false-rejection"},
     "aten.nll_loss2d_forward.default": {"I3", "false-rejection"},
     "aten.nll_loss_backward.default": {"I3", "false-rejection"},
