@@ -99,7 +99,9 @@ def test_a_view_keeps_its_base_alive(sess):
 def test_an_expanded_scalar_cannot_pass_the_rails():
     # The original finding: a 0-d input expanded to [2**31, 2] and returned
     # made the worker copy 16 GiB on the host past every rail. V5 now counts
-    # the copy, so a device quota refuses it.
+    # the copy, so a device quota refuses it. 2 GiB here: over the 1 GiB
+    # quota, under any machine's memory (a CPU session's device size is the
+    # host's RAM, and the device-size check would answer first).
     from reflop.connection import default_limits
     from reflop_worker._pb import capabilities_pb2 as kpb
     from reflop_worker._pb import worker_pb2 as wpb
@@ -109,12 +111,14 @@ def test_an_expanded_scalar_cannot_pass_the_rails():
     init.device.kind = gpb.DEVICE_CPU
     init.limits.CopyFrom(default_limits(kpb))
     s = Session(init)
+    assert s.dev_info.total_memory_bytes == 0 or s.dev_info.total_memory_bytes > 2 * GiB
     g = graph(s, [(torch.float32, ())],
-              [("aten.expand.default", [tin(0), gpb.Arg(ints=gpb.Int64List(values=[2**31, 2])), B(False)])],
-              [(torch.float32, (2**31, 2))])
+              [("aten.expand.default", [tin(0), gpb.Arg(ints=gpb.Int64List(values=[2**28, 2])), B(False)])],
+              [(torch.float32, (2**28, 2))])
     r = register(s, g)
     assert r.WhichOneof("body") == "error" and r.error.code == cpb.ERROR_QUOTA, r
     assert r.error.stage == cpb.STAGE_V5_SAFETY
+    assert f"~{2**28 * 2 * 4 + 4} bytes" in r.error.message  # the copy, and the 0-d input
     small = graph(s, [(torch.float32, ())],
                   [("aten.expand.default", [tin(0), gpb.Arg(ints=gpb.Int64List(values=[4, 2])), B(False)])],
                   [(torch.float32, (4, 2))])
