@@ -72,9 +72,53 @@ def _view_backward(view):
     return infer
 
 
+def _as_strided_view(out, a):
+    """as_strided_scatter's view of the clone, with the bounds the kernel's
+    setStorage would check (the meta as_strided does not check them)."""
+    off = a.get("storage_offset")
+    off = out.storage_offset() if off is None else off
+    try:
+        top = validators._reach(a["size"], a["stride"], off)
+    except (ValueError, OverflowError) as e:
+        raise RuntimeError(str(e)) from None
+    # A view without elements touches no memory; PyTorch accepts any offset.
+    if top >= validators._storage_numel(out) and all(n != 0 for n in a["size"]):
+        raise RuntimeError("the view reaches past the end of self's storage")
+    return out.as_strided(a["size"], a["stride"], off)
+
+
+def _scatter(view):
+    """select_scatter, slice_scatter, diagonal_scatter and as_strided_scatter.
+
+    PyTorch's meta kernels for these check nothing: a bad index, dims, offset
+    or src shape passes, and the device kernel allocates its output before it
+    raises. The kernels clone self, take the view of the clone and copy src
+    into it; do the same on meta tensors. The view checks dim, index and
+    offset; src must have the view's exact shape (any dtype, as copy_ casts);
+    the view must not write one element twice."""
+
+    def infer(node, pos, kw):
+        a = validators._named(node, pos, kw)
+        out = a["self"].clone()
+        v = view(out, a)
+        src = a["src"]
+        if tuple(src.shape) != tuple(v.shape):
+            raise RuntimeError(f"src has shape {list(src.shape)}; the view of self has shape {list(v.shape)}")
+        if any(n > 1 and st == 0 for n, st in zip(v.shape, v.stride())):
+            raise RuntimeError("more than one element of the view refers to a single memory location")
+        return out
+
+    return infer
+
+
 # aten ops that PyTorch ships without a meta kernel, or with one that checks
 # nothing; each one checks its inputs itself.
 OVERRIDES = {
+    "aten.select_scatter.default": _scatter(lambda o, a: o.select(a["dim"], a["index"])),
+    "aten.slice_scatter.default": _scatter(
+        lambda o, a: torch.ops.aten.slice.Tensor(o, a["dim"], a["start"], a["end"], a["step"])),
+    "aten.diagonal_scatter.default": _scatter(lambda o, a: o.diagonal(a["offset"], a["dim1"], a["dim2"])),
+    "aten.as_strided_scatter.default": _scatter(_as_strided_view),
     "aten._ctc_loss_backward.default": _ctc_loss_backward,
     "aten.select_backward.default": _view_backward(lambda b, a: b.select(a["dim"], a["index"])),
     "aten.diagonal_backward.default": _view_backward(lambda b, a: b.diagonal(a["offset"], a["dim1"], a["dim2"])),
