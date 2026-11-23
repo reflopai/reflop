@@ -1140,3 +1140,37 @@ registration instead of after an allocation. The forward scatter ops
 (`select_scatter`, `slice_scatter`, `diagonal_scatter`,
 `as_strided_scatter`) have the same unchecked meta kernels and are left for a
 separate change (`docs/THREAT_MODEL.md`, residual risks).
+
+## ADR-041: Validate the scatter ops the way their kernels run
+
+**Context.** PyTorch's meta kernels for `select_scatter`, `slice_scatter`,
+`diagonal_scatter` and `as_strided_scatter` return a tensor like `self` and
+check nothing. V4 passed a bad index, dims or offset, a `src` of the wrong
+shape, and an `as_strided` view past the end of storage. The device kernel
+then allocated its output and raised on the host before it read anything
+(I3). No read went out of bounds, and V5 already counted the output. The
+client sends these ops for every write through a view (ADR-040 fixed the same
+gap in the backward view ops).
+
+**Decision.** `meta.OVERRIDES` runs each op the way its kernel does: clone
+`self`, take the view of the clone (`select`, `slice`, `diagonal` or
+`as_strided`), and require `src` to have the view's exact shape in any dtype.
+The view checks dim, index and offset. The meta `as_strided` does not check
+storage bounds, so the worker checks them against the clone with `_reach`, and
+skips views without elements, as PyTorch does. A view that writes one element
+twice through a zero stride is rejected, as PyTorch's internal overlap check
+does; other overlapping views are accepted, as in PyTorch. The output is the
+meta clone, with the same strides PyTorch reports. Index, offset and size
+arguments are always graph constants (scalar inputs bind only to float and
+Scalar arguments), so the check at registration covers every execute.
+
+**Alternatives.** Rejecting every overlapping `as_strided` view would be
+simpler but would refuse graphs PyTorch runs. Checking `src` only for
+broadcastability would accept graphs every kernel rejects. A differential test
+over the whole opset (meta against CPU on malformed arguments) would find the
+remaining ops of this kind; it is planned separately.
+
+**Consequences.** A malformed scatter graph fails at registration with
+`SHAPE_MISMATCH/V4_META` instead of at execute. A test runs about 2,400 cases
+per device against PyTorch's kernels and requires the same accept or reject
+decision for each one, and the same values when accepted.

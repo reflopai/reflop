@@ -24,6 +24,11 @@
   `slice_backward` with an out-of-range index, identical diagonal dims, or a
   `grad_output` that does not fit `input_sizes` at registration. Before, these
   graphs registered, and the kernel allocated its output before it raised.
+- reflopd also rejects a `select_scatter`, `slice_scatter`, `diagonal_scatter`
+  or `as_strided_scatter` that PyTorch's kernel would refuse at
+  registration: a bad index, dims or offset, a `src` of the wrong shape, an
+  `as_strided` view past the end of storage, or one that writes an element
+  twice through a zero stride. It accepts everything else PyTorch accepts.
 
 ## 0.2.7 (2026-11-22)
 
