@@ -123,13 +123,19 @@ def _tensor_from_data(td: cpb.TensorData | None, meta: gpb.TensorMeta, data: byt
     return torch.frombuffer(buf, dtype=torch.uint8).view(dt).reshape(shape).clone()
 
 
+def _flat(t: torch.Tensor) -> torch.Tensor:
+    # A contiguous tensor's elements, 1-d: reshape(-1) keeps the stride of a
+    # size-1 dim (x[::12]), which view(torch.uint8) refuses.
+    return t.as_strided((t.numel(),), (1,))
+
+
 def tensor_bytes(t: torch.Tensor) -> bytes:
     t = t.detach().contiguous().cpu()
     n = t.numel() * t.element_size()
     if n == 0:
         return b""
     buf = bytearray(n)
-    torch.frombuffer(buf, dtype=torch.uint8).copy_(t.reshape(-1).view(torch.uint8))
+    torch.frombuffer(buf, dtype=torch.uint8).copy_(_flat(t).view(torch.uint8))
     return bytes(buf)
 
 

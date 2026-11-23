@@ -1259,3 +1259,89 @@ deliberate rejections (`sparse=True`, strided `empty_strided`). An entry
 that stops occurring fails the test, so the table only shrinks.
 `tests/security/corpus/test_kernel_bounds.py` holds one case per unsafe
 call and checks that the calls autograd makes still run.
+
+## ADR-043: Check more kernel inputs, found by wider parity coverage
+
+**Context.** The parity test (ADR-042) covered 204 ops. Seed programs for
+losses, norms, linear algebra, distances, FFT, grid sampling, activations,
+`_foreach` ops and the reflop fused optimizers raised that to 394 ops and
+about 23,000 cases per device. The new cases found more kernels that read or
+write out of bounds, or kill the CUDA context, on inputs the worker accepted:
+
+- `_cdist_backward` and `_pdist_backward` read `grad_output`, `cdist`/`pdist`
+  and the inputs with each other's sizes (CPU SIGSEGV on an empty
+  `grad_output`; other mismatches returned memory the tensors do not own).
+- `_fft_r2c` and `_fft_c2r` index with `dim` as given; `torch.fft` wraps
+  negative dims first, and a negative one crashed the CPU kernel.
+- The batch norm family reads `weight`, `bias` and the statistics at every
+  channel: a 0-d `weight` read past its end, and on CUDA a float64
+  `running_mean` beside a float32 input was read as float32.
+- `grid_sampler_2d/3d` (and backward) switch on the interpolation and
+  padding modes without a default; an unknown mode computed from
+  uninitialized values.
+- The fused optimizers (`fused_adam`, `fused_adamw`, `fused_sgd`,
+  `fused_adagrad`) walk every state list with the param's size and dtype;
+  V4 checked only that params and grads match. `amp_unscale_and_check` and
+  `amp_update_scale` read one element of `found_inf`, `inv_scale`, `scale`
+  and `growth_tracker` unchecked.
+- `native_layer_norm_backward` crashed the multi-threaded CPU kernel on a
+  `grad_out` of another shape (V4 already rejected it through PyTorch's meta
+  kernel; the worker now checks the whole contract itself, as for group
+  norm).
+- On CUDA, `binary_cross_entropy` asserts on the device that every input
+  and target value is in [0, 1]. One value outside, or NaN, ends the CUDA
+  context, and the session with it. The CPU kernel raises for the same
+  values.
+
+The same run found that reading a one-element strided view (`x[::12]` of
+ten elements) failed: PyTorch calls a tensor contiguous whatever the stride
+of a size-1 dim, `reshape(-1)` keeps that stride, and `view(torch.uint8)`
+refused it. Returned values, fetches, checkpoints, uploads and tensorpacks
+all went through that path.
+
+**Decision.** As in ADR-042, V4 requires the shapes and dtypes autograd and
+the optimizers pass:
+
+- cdist backward: `grad_output` and `cdist` are what `_cdist_forward(x1, x2)`
+  gives (batch dims broadcast), `x1` and `x2` share a dtype; pdist backward:
+  `self` is 2-d and `grad_output` and `pdist` have `n * (n - 1) / 2`
+  elements.
+- FFT: `dim` lists distinct dims from 0, not negative ones.
+- batch norm (`native_batch_norm`, the `_native_batch_norm_legit` variants
+  and the backward): `weight`, `bias` and the running statistics are
+  `(C,)` and share one dtype, the input's or float32 for half and bfloat16
+  input; the saved statistics are `(C,)`, or empty from an eval-mode
+  forward; `grad_out` has the input's shape and dtype.
+- layer norm and group norm (and backward): `normalized_shape` is input's
+  trailing shape, `N`, `C` and `HxW` describe input, `group` divides `C`,
+  weight and bias match, and the backward's `mean` and `rstd` are what the
+  forward gives.
+- grid sampler: modes PyTorch defines (interpolation 0-2 in 2-d, 0-1 in 3-d;
+  padding 0-2); the backward's `grad_output` is what the forward gives.
+- fused optimizers: every state tensor has its param's shape and dtype,
+  `max_exp_avg_sqs` is empty without amsgrad, each state step has one
+  element, `grad_scale` and `found_inf` are one float32 element; AMP's
+  scalars are one float32 element and `growth_tracker` one int32 element.
+
+`binary_cross_entropy` gets a runtime validator (`bce`, E2): input and
+target values must be in [0, 1] before the kernel launches.
+
+The byte paths view a contiguous tensor's storage directly
+(`as_strided((numel,), (1,))`, no copy) instead of `reshape(-1)`.
+
+The parity harness runs no reference kernel on CUDA for a call the worker
+refuses: the CUDA BCE kernel's assert on such a call ended the test
+process's CUDA context. False rejections are checked on the CPU.
+
+**Alternatives.** Rejecting `binary_cross_entropy` on CUDA sessions would
+break `F.binary_cross_entropy`; checking only input values would leave the
+target assert. Copying every tensor before converting it to bytes would fix
+the strided read too, at one extra copy of every returned value.
+
+**Consequences.** The new rejections are `SHAPE_MISMATCH/V4_META`, and
+`RUNTIME_CHECK/E2_RUNTIME` for BCE values. The parity test's `KNOWN` table
+grows with the newly covered ops' safe disagreements (I3, and a few calls
+the worker fails closed at E3 because PyTorch's meta and CPU kernels
+disagree on an auxiliary output's shape). A new test requires every seed of
+a strictly checked op, a call PyTorch itself makes, to pass V4, since the
+parity test does not report false rejections for those ops.

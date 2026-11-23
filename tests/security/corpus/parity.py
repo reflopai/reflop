@@ -24,8 +24,8 @@ import math
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 from helpers import NAME, I, decode, make_session, tensor_binding, tnode
+from reflop_worker import natives
 from reflop_worker._pb import compute_pb2 as cpb
 from reflop_worker._pb import graph_pb2 as gpb
 from reflop_worker.dtypes import TORCH_TO_PB
@@ -175,6 +175,8 @@ def encode(sess, call: Call):
                 gargs.append(gpb.Arg(i=v))
             elif isinstance(v, float):
                 gargs.append(gpb.Arg(f=v))
+            elif isinstance(v, complex):
+                gargs.append(gpb.Arg(complex=gpb.ComplexValue(real=v.real, imag=v.imag)))
             else:
                 raise Unencodable(type(v))
         elif core == "Scalar[]":
@@ -224,11 +226,11 @@ def native_args(call: Call, device="cpu"):
             # meta probe below would allocate on the CPU.
             v = torch.device(device)
         elif isinstance(v, torch.Tensor):
-            v = v.to(device)
+            v = v.to(device, copy=True)  # in-place ops must not change the seed
             if k == 0 and call.transposed:
                 v = v.transpose(0, -1).contiguous().transpose(0, -1)
         elif isinstance(v, list):
-            v = [x.to(device) if isinstance(x, torch.Tensor) else x for x in v]
+            v = [x.to(device, copy=True) if isinstance(x, torch.Tensor) else x for x in v]
         out.append(v)
     return out
 
@@ -259,7 +261,7 @@ def native(call: Call, device="cpu"):
     margs = native_args(call, "meta")
     pos, kw = _kw(call, margs)
     try:
-        m = flat_tensors(spec.fn(*pos, **kw))
+        m = flat_tensors(_run(spec, pos, kw, "meta"))
         if any(t.numel() > MAX_NATIVE_NUMEL for t in m):
             return TOO_BIG
     except Exception:  # noqa: BLE001
@@ -267,9 +269,19 @@ def native(call: Call, device="cpu"):
             return TOO_BIG
     pos, kw = _kw(call, native_args(call, device))
     try:
-        return [t.cpu() for t in flat_tensors(spec.fn(*pos, **kw))]
+        return [t.cpu() for t in flat_tensors(_run(spec, pos, kw, device))]
     except Exception:  # noqa: BLE001 - PyTorch rejects this call
         return NATIVE_REJECTS
+
+
+def _run(spec, pos, kw, device):
+    """The reference: PyTorch's kernel, or for a reflop-native op the
+    worker's own implementation (natives.py), which runs PyTorch kernels."""
+    if natives.is_native(spec):
+        if device == "meta":
+            return natives.meta(spec.name, pos, kw)
+        return natives.call(spec.name, pos, kw, torch.device(device))
+    return spec.fn(*pos, **kw)
 
 
 def _max_int(v):
@@ -336,7 +348,7 @@ def worker(sess, call: Call, outs):
 DUMMY = [(torch.float32, (7, 11, 13))]
 # Ops the worker checks more strictly than PyTorch does, on purpose: their
 # CPU kernels accept inconsistent shapes and then read or write out of
-# bounds, so the worker requires the shapes autograd passes (ADR-040/042).
+# bounds, so the worker requires the shapes autograd passes (ADR-040/042/043).
 STRICT = {
     "aten._adaptive_avg_pool2d_backward.default", "aten._adaptive_avg_pool3d_backward.default",
     "aten.adaptive_max_pool2d_backward.default", "aten.adaptive_max_pool3d_backward.default",
@@ -347,7 +359,24 @@ STRICT = {
     "aten._embedding_bag.default", "aten._embedding_bag_backward.default",
     "aten._embedding_bag_dense_backward.default", "aten.embedding_dense_backward.default",
     "aten.select_backward.default", "aten.diagonal_backward.default", "aten.slice_backward.default",
+    # ADR-032: the CTC backward kernels read their inputs unchecked
+    "aten._ctc_loss_backward.default", "aten._ctc_loss_backward.Tensor",
+    # ADR-043
+    "aten._cdist_backward.default", "aten._pdist_backward.default", "aten._fft_r2c.default",
+    "aten._fft_c2r.default", "aten._fft_c2c.default", "aten.native_batch_norm.default",
+    "aten._native_batch_norm_legit.default", "aten._native_batch_norm_legit.no_stats",
+    "aten._native_batch_norm_legit_functional.default", "aten._native_batch_norm_legit_no_training.default",
+    "aten.native_batch_norm_backward.default", "aten.native_layer_norm.default",
+    "aten.native_layer_norm_backward.default", "aten.native_group_norm.default",
+    "aten.native_group_norm_backward.default", "aten.grid_sampler_2d.default",
+    "aten.grid_sampler_2d_backward.default", "aten.grid_sampler_3d.default", "aten.grid_sampler_3d_backward.default",
+    "reflop.fused_adam.default", "reflop.fused_adamw.default", "reflop.fused_sgd.default",
+    "reflop.fused_adagrad.default", "reflop.amp_unscale_and_check.default", "reflop.amp_update_scale.default",
 }
+# Ops whose later outputs are partly never written by the kernel (their
+# values are whatever the allocator held): compare the first n only.
+# _ctc_loss: log_alpha past 2 * target_length + 1 (follow-up in BUGS.md).
+PARTIAL_OUTPUTS = {"aten._ctc_loss.default": 1, "aten._ctc_loss.Tensor": 1}
 # Runtime checks that run before any kernel launch (I4): a call PyTorch
 # rejects may pass V4 when the reason depends on the data.
 BEFORE_KERNEL = (cpb.STAGE_E1_BINDINGS, cpb.STAGE_E2_RUNTIME)
@@ -360,12 +389,15 @@ def check(sess, call: Call, device="cpu", mark=lambda s: None):
     the call without launching a kernel, before the native kernel runs. A
     rejection by a runtime check (E1/E2: index bounds, I4) is always
     acceptable: PyTorch's CPU kernels skip some of those checks and read out
-    of bounds instead. A STRICT op's native kernel is not run on a call the
-    worker refuses: it may crash on it."""
+    of bounds instead. A STRICT op's native kernel, and any kernel on CUDA,
+    is not run on a call the worker refuses: it may crash on it."""
     outs, err = infer_outputs(sess, call)
     if err is not None:
         mark("rejected")
-        if call.op in STRICT:
+        # On CUDA a kernel run on input the worker refused can trip a device
+        # assert and end the process's CUDA context; false rejections are
+        # checked on the CPU.
+        if call.op in STRICT or device != "cpu":
             return None
         want = native(call, device)
         if isinstance(want, list):
@@ -391,7 +423,8 @@ def check(sess, call: Call, device="cpu", mark=lambda s: None):
     if SPEC[call.op].flags & FLAG_UNINIT:
         return None
     tol = 1e-5 if device == "cpu" else 1e-3
-    for w, g in zip(want, got):
+    n = PARTIAL_OUTPUTS.get(call.op, len(want))
+    for w, g in zip(want[:n], got[:n]):
         if w.dtype.is_floating_point or w.dtype.is_complex:
             if not torch.allclose(g, w, rtol=tol, atol=tol / 10, equal_nan=True):
                 return "values differ"
@@ -477,6 +510,8 @@ def _retensor(t: torch.Tensor, shape, dtype=None, lo_hi=None):
         return torch.rand(shape, generator=g) > 0.5
     if dtype.is_floating_point:
         return torch.randn(shape, generator=g).to(dtype)
+    if dtype.is_complex:
+        return torch.randn(shape, generator=g, dtype=dtype)
     lo, hi = lo_hi if lo_hi else ((int(t.min()), int(t.max())) if t.numel() else (0, 1))
     return torch.randint(lo, hi + 1, shape, generator=g).to(dtype)
 
@@ -551,125 +586,11 @@ def _tensor_mutations(seed, k, t, name):
     return res
 
 
-# ------------------------------------------------------------------ seed programs
-
-
-def _g(*shape, seed=0, dtype=torch.float32, grad=False):
-    t = torch.randn(shape, generator=torch.Generator().manual_seed(seed + 7 * len(shape))).to(dtype)
-    return t.requires_grad_() if grad else t
-
-
-def _bk(f, *shapes):
-    """f(*inputs) forward and backward on fresh leaf tensors."""
-    def p():
-        xs = [_g(*s, seed=i, grad=True) for i, s in enumerate(shapes)]
-        y = f(*xs)
-        ys = flat_tensors(y)
-        sum(z.float().sum() for z in ys if z.requires_grad).backward()
-    return p
-
-
-def _fw(f, *shapes):
-    return lambda: f(*[_g(*s, seed=i) for i, s in enumerate(shapes)])
-
-
-IDX = torch.tensor([[0, 2], [1, 1], [3, 0]])
-
-
-def _bag_dense_backward(mode):
-    w, idx, off = _g(6, 4), torch.tensor([1, 2, 4, 5, 4, 3]), torch.tensor([0, 2, 4])
-    out, o2b, bag_size, maxi = A._embedding_bag.default(w, idx, off, False, mode)
-    A._embedding_bag_dense_backward.default(torch.ones_like(out), idx, o2b, bag_size, maxi, 6, False, mode, None, -1)
-
-PROGRAMS = [
-    # reductions over dims
-    _bk(lambda x: (x.sum(1), x.mean((0, 2), keepdim=True), x.prod(1), x.amax(-1), x.amin(0),
-                   x.var(1), x.std(0, correction=0), x.logsumexp(2), x.norm(dim=1),
-                   torch.linalg.vector_norm(x, 3, dim=(0, 1)), x.nansum(1), x.cumsum(1), x.cumprod(2),
-                   x.logcumsumexp(0), torch.var_mean(x, 1)[0], torch.std_mean(x, 2)[1]), (3, 4, 5)),
-    _fw(lambda x: (x.argmax(1), x.argmin(), x.max(1), x.min(0), x.sort(1), x.topk(2, 1), x.kthvalue(2, 2),
-                   x.median(1), x.nanmedian(0), x.mode(1), x.cummax(1), x.cummin(0), x.aminmax(dim=1),
-                   (x > 0).any(1), (x > 0).all(0), (x > 0).any((0, 1)), (x > 0).all((1,)),
-                   torch.nonzero_static(x > 0, size=5)), (3, 4, 5)),
-    _bk(lambda x: (x.softmax(1), x.log_softmax(-1), F.glu(x, 1)), (3, 4, 5)),
-    # conv, pool, padding, upsample
-    _bk(lambda x, w: F.conv2d(x, w, padding=1, stride=2), (2, 3, 6, 6), (4, 3, 3, 3)),
-    _bk(lambda x, w: F.conv1d(x, w, groups=2, dilation=2), (2, 4, 9), (6, 2, 3)),
-    _bk(lambda x, w: F.conv_transpose2d(x, w, stride=2), (1, 2, 4, 4), (2, 3, 3, 3)),
-    _bk(lambda x: (F.max_pool2d(x, 2), F.avg_pool2d(x, 3, 1, 1), F.adaptive_avg_pool2d(x, 2),
-                   F.adaptive_max_pool2d(x, 3), F.avg_pool1d(x[0], 2), F.adaptive_avg_pool1d(x[0], 3)),
-        (2, 3, 6, 6)),
-    _bk(lambda x: (F.max_pool3d(x, 2), F.avg_pool3d(x, 2), F.adaptive_avg_pool3d(x, 2),
-                   F.adaptive_max_pool3d(x, 2)), (1, 2, 4, 4, 4)),
-    _fw(lambda x: F.max_unpool2d(*F.max_pool2d(x, 2, return_indices=True), 2), (1, 2, 4, 4)),
-    _fw(lambda x: F.max_unpool3d(*F.max_pool3d(x, 2, return_indices=True), 2), (1, 1, 4, 4, 4)),
-    _bk(lambda x: (F.pad(x, (1, 2, 0, 1)), F.pad(x, (1, 1, 1, 1), mode="reflect"),
-                   F.pad(x, (2, 2, 0, 1), mode="replicate"), F.pad(x[0], (1, 2), mode="reflect")), (1, 2, 4, 4)),
-    _bk(lambda x: (F.pad(x, (1, 1, 1, 1, 1, 1), mode="reflect"), F.pad(x, (1, 0, 1, 0, 0, 1), mode="replicate")),
-        (1, 1, 3, 3, 3)),
-    _bk(lambda x: (F.interpolate(x, scale_factor=2), F.interpolate(x, size=(5, 7), mode="bilinear"),
-                   F.interpolate(x, size=(3, 5), mode="bicubic", align_corners=True),
-                   F.interpolate(x, size=(5, 5), mode="nearest-exact"),
-                   F.interpolate(x, size=(6, 3), mode="bilinear", antialias=True)), (1, 2, 3, 4)),
-    _bk(lambda x: (F.interpolate(x, size=5), F.interpolate(x, size=7, mode="linear"),
-                   F.interpolate(x, size=6, mode="nearest-exact")), (1, 2, 4)),
-    _bk(lambda x: (F.interpolate(x, size=(3, 4, 5)), F.interpolate(x, size=(3, 3, 3), mode="trilinear"),
-                   F.interpolate(x, size=(2, 3, 4), mode="nearest-exact")), (1, 1, 2, 2, 2)),
-    _fw(lambda x: (A.upsample_nearest2d.default(x, [4, 6]), A.upsample_bilinear2d.default(x, [4, 6], False),
-                   A.upsample_nearest1d.default(x[0], [5]), A.upsample_linear1d.default(x[0], [5], True),
-                   A.upsample_bicubic2d.default(x, [5, 5], False),
-                   A._upsample_nearest_exact2d.default(x, [5, 5]),
-                   A._upsample_nearest_exact1d.default(x[0], [6]),
-                   A._upsample_bilinear2d_aa.default(x, [2, 2], False)), (1, 2, 3, 4)),
-    _fw(lambda x: (A.upsample_nearest3d.default(x, [3, 4, 5]), A.upsample_trilinear3d.default(x, [3, 3, 3], False),
-                   A._upsample_nearest_exact3d.default(x, [3, 3, 3])), (1, 1, 2, 2, 2)),
-    _bk(lambda x: F.affine_grid(x, [2, 3, 4, 5], align_corners=False), (2, 2, 3)),
-    _bk(lambda x: F.fold(F.unfold(x, 2, stride=1, padding=1), (5, 5), 2, stride=1, padding=1), (1, 2, 5, 5)),
-    _bk(lambda x, w, b: torch._weight_norm(w, b, 0) @ x, (3, 2), (4, 3), (4, 1)),
-    # shape and views
-    _bk(lambda x: (x.select(1, 2), x[:, 1:3], x[..., ::2], x.view(12, 5), x.expand(2, 3, 4, 5), x.permute(2, 0, 1),
-                   x.unsqueeze(1), x[:, :1].squeeze(1), x[:1, :1].squeeze((0, 1)), x.diagonal(1, 0, 2),
-                   x.split([1, 3], 1), x.split(2, 2), x.chunk(2, 0), x.flip(0, 2), x.repeat(1, 2, 1),
-                   x.transpose(0, 2), x.unfold(2, 2, 1), x.narrow(1, 1, 2), x.unbind(1), x.tile(2, 1),
-                   x.roll(1, 2), x.roll((1, -1), (0, 1)), x.rot90(1, (1, 2)), x.tril(1), x.triu(-1),
-                   x.as_strided((2, 2), (5, 1), 3), torch.diag_embed(x, 1, 0, 2),
-                   x.repeat_interleave(2, 1)), (3, 4, 5)),
-    _bk(lambda a, b: (torch.cat([a, b], 1), torch.stack([a, b], 2)), (2, 3), (2, 3)),
-    _fw(lambda x: (A.unsqueeze_copy.default(x, 1), A.view_copy.default(x, [4, 15]),
-                   A.permute_copy.default(x, [1, 2, 0]), A.expand_copy.default(x[:1], [2, 4, 5]),
-                   A.transpose_copy.int(x, 0, 1), A.squeeze_copy.dims(x[:1], [0]),
-                   A.slice_copy.Tensor(x, 1, 1, 3, 1), A.select_copy.int(x, 2, 1),
-                   A.split_with_sizes_copy.default(x, [2, 2], 1), A.unbind_copy.int(x, 0),
-                   A.diagonal_copy.default(x, 0, 1, 2), A.unfold_copy.default(x, 1, 2, 2),
-                   A._unsafe_view.default(x, [60])), (3, 4, 5)),
-    _fw(lambda x: (A.full.default([2, 3], 1.5), A.zeros.default([3]), A.ones.default([2, 2]),
-                   A.new_zeros.default(x, [2]), A.new_ones.default(x, [3, 1]), A.new_full.default(x, [2], 2.0),
-                   A.arange.default(5), A.arange.start(1, 6), A.arange.start_step(0, 10, 3),
-                   A.linspace.default(0, 1, 5), A.logspace.default(0, 2, 4, 10.0),
-                   A.empty.memory_format([2, 3]), A.empty_strided.default([2, 3], [3, 1]),
-                   A.new_empty.default(x, [4]), A.new_empty_strided.default(x, [2, 2], [2, 1])), (3, 4)),
-    # indexing
-    _bk(lambda x: (x.gather(1, IDX), x.index_select(1, IDX[0]), x[IDX[:, 0]], x[:, IDX[0]],
-                   x.take(IDX), torch.zeros(3, 5).scatter_add(1, IDX, x[:3, :2]),
-                   torch.zeros(3, 5).scatter(1, IDX, x[:3, :2]), x.scatter(1, IDX, 1.5),
-                   x[:3].scatter_reduce(1, IDX, x[:3, :2], "amax"), x.index_add(1, IDX[0], x[:, :2]),
-                   x.index_copy(0, IDX[:2, 0], x[:2]), x.index_fill(1, IDX[0], -1.0),
-                   x.index_fill(1, IDX[0], torch.tensor(2.0)),
-                   x.index_put((IDX[:, 0], IDX[:, 1]), torch.ones(3), accumulate=True)), (4, 5)),
-    _bk(lambda w: F.embedding(IDX, w, padding_idx=0), (6, 4)),
-    _bk(lambda w: F.embedding_bag(IDX.reshape(-1), w, torch.tensor([0, 2, 4]), mode="mean"), (6, 4)),
-    _bk(lambda w: F.embedding_bag(IDX.reshape(-1), w, torch.tensor([0, 2, 4]), mode="sum"), (6, 4)),
-    _fw(lambda x: (A._unsafe_index.Tensor(x, [IDX[:, 0]]),
-                   A._unsafe_index_put.default(x, [IDX[:, 0]], torch.ones(3, 5), False)), (4, 5)),
-    lambda: _bag_dense_backward(1),
-    lambda: _bag_dense_backward(2),
-    # misc
-    _bk(lambda a, b, w: (torch.lerp(a, b, 0.3), torch.lerp(a, b, w.sigmoid())), (3, 4), (3, 4), (3, 4)),
-]
-
-
 def seeds():
-    return record(PROGRAMS)
+    from parity_programs import DIRECT, PROGRAMS
+
+    return record(PROGRAMS) + DIRECT()
+
 
 
 def all_cases():
@@ -692,5 +613,5 @@ if __name__ == "__main__":  # discovery: print every disagreement
             bad[c.op].append(f"{c.label}: {why}")
     for op, items in sorted(bad.items()):
         print(f"== {op} ({len(items)}): {sorted({kind_of(w) for w in items})}")
-        for it in items[:12]:
+        for it in items:
             print("   ", it)

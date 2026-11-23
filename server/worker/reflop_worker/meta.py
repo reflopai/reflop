@@ -246,6 +246,149 @@ def _embedding_dense_backward(node, pos, kw):
     return node.op.fn(*pos, **kw)
 
 
+def _cdist_backward(node, pos, kw):
+    # grad_output and cdist are what the forward gives for x1 and x2 (batch dims
+    # broadcast); the CPU kernel reads all three with each other's sizes
+    # (ADR-043).
+    a = validators._named(node, pos, kw)
+    x1, x2 = a["x1"], a["x2"]
+    if x2.dtype != x1.dtype:
+        raise RuntimeError(f"x1 is {x1.dtype} and x2 {x2.dtype}")
+    out = A._cdist_forward.default(x1, x2, a["p"], None)
+    _same("grad_output", a["grad_output"], out.shape, x1.dtype)
+    _same("cdist", a["cdist"], out.shape, x1.dtype)
+    return node.op.fn(*pos, **kw)
+
+
+def _pdist_backward(node, pos, kw):
+    a = validators._named(node, pos, kw)
+    x = a["self"]
+    if x.dim() != 2:
+        raise RuntimeError(f"self must be 2-d, got {x.dim()}-d")
+    n = x.shape[0]
+    want = (n * (n - 1) // 2,)
+    _same("grad_output", a["grad_output"], want, x.dtype)
+    _same("pdist", a["pdist"], want, x.dtype)
+    return node.op.fn(*pos, **kw)
+
+
+def _fft(node, pos, kw):
+    # The kernels index with dim as given: torch.fft wraps negative dims
+    # before it calls them, and a negative one crashed the CPU kernel
+    # (ADR-043). Each dim is transformed once.
+    a = validators._named(node, pos, kw)
+    rank, dims = a["self"].dim(), list(a["dim"])
+    if len(set(dims)) != len(dims) or any(not 0 <= d < rank for d in dims):
+        raise RuntimeError(f"dim {dims} must name distinct dims of a {rank}-d input, from 0")
+    return node.op.fn(*pos, **kw)
+
+
+def _batch_norm(node, pos, kw):
+    """The batch norm family (ADR-043). The kernels read weight, bias, the
+    running and the saved statistics at every channel of input.size(1); a
+    0-d or shorter weight read past its end. Each one that is given must be
+    1-d of the channel count; the saved statistics of an eval-mode forward
+    are empty. The backward's grad_out has input's shape."""
+    a = validators._named(node, pos, kw)
+    x = a["input"]
+    if x.dim() < 2:
+        raise RuntimeError(f"input must have at least 2 dims, got {x.dim()}")
+    c = x.shape[1]
+    # The parameters share one dtype: input's, or float32 for a half or
+    # bfloat16 input. On CUDA a float64 running_mean beside a float32 input
+    # was read as float32 (values of 1e17).
+    ok_dtypes = {x.dtype} | ({torch.float32} if x.dtype in (torch.float16, torch.bfloat16) else set())
+    seen = set()
+    for name in ("weight", "bias", "running_mean", "running_var", "save_mean", "save_invstd"):
+        t = a.get(name)
+        if t is None:
+            continue
+        if t.dtype not in ok_dtypes:
+            raise RuntimeError(f"{name} is {t.dtype}; input is {x.dtype}")
+        if name in ("weight", "bias", "running_mean", "running_var"):
+            seen.add(t.dtype)
+            if tuple(t.shape) != (c,):
+                raise RuntimeError(f"{name} has shape {list(t.shape)}; input has {c} channels")
+    if len(seen) > 1:
+        raise RuntimeError(f"weight, bias and the running statistics must share a dtype, got {sorted(map(str, seen))}")
+    if "grad_out" in a:
+        g = a["grad_out"]
+        if tuple(g.shape) != tuple(x.shape) or g.dtype != x.dtype:
+            raise RuntimeError(f"grad_out is {g.dtype}{list(g.shape)}; input is {x.dtype}{list(x.shape)}")
+        ok = ((c,),) if a["train"] else ((c,), (0,))
+        for name in ("save_mean", "save_invstd"):
+            t = a.get(name)
+            if t is not None and tuple(t.shape) not in ok:
+                raise RuntimeError(f"{name} has shape {list(t.shape)}; input has {c} channels")
+    return node.op.fn(*pos, **kw)
+
+
+def _layer_norm(node, pos, kw):
+    """native_layer_norm and its backward (ADR-043): weight and bias have
+    normalized_shape; the backward's grad_out has input's shape and dtype,
+    and mean and rstd are what the forward gives. The CPU backward kernel
+    crashed on a grad_out of another shape."""
+    a = validators._named(node, pos, kw)
+    x, ns = a["input"], tuple(a["normalized_shape"])
+    if not ns or tuple(x.shape[x.dim() - len(ns):]) != ns or x.dim() < len(ns):
+        raise RuntimeError(f"normalized_shape {list(ns)} is not the trailing shape of input {list(x.shape)}")
+    for name in ("weight", "bias"):
+        t = a.get(name)
+        if t is not None and tuple(t.shape) != ns:
+            raise RuntimeError(f"{name} has shape {list(t.shape)}; normalized_shape is {list(ns)}")
+    if "grad_out" in a:
+        _same("grad_out", a["grad_out"], x.shape, x.dtype)
+        _, mean, rstd = A.native_layer_norm.default(x, list(ns), None, None, 1e-5)
+        _same("mean", a["mean"], mean.shape, mean.dtype)
+        _same("rstd", a["rstd"], rstd.shape, rstd.dtype)
+    return node.op.fn(*pos, **kw)
+
+
+def _group_norm(node, pos, kw):
+    """native_group_norm and its backward (ADR-043): N, C and HxW describe
+    input, group divides C, weight and bias are (C,); the backward's
+    grad_out has input's shape and dtype, mean and rstd are (N, group) as
+    the forward gives them."""
+    a = validators._named(node, pos, kw)
+    x, n, c, hw, group = a["input"], a["N"], a["C"], a["HxW"], a["group"]
+    if x.dim() < 2 or x.shape[0] != n or x.shape[1] != c or x.numel() != n * c * hw:
+        raise RuntimeError(f"N={n}, C={c}, HxW={hw} do not describe input {list(x.shape)}")
+    if group <= 0 or c % group:
+        raise RuntimeError(f"group {group} does not divide C={c}")
+    for name in ("weight", "bias"):
+        t = a.get(name)
+        if t is not None and tuple(t.shape) != (c,):
+            raise RuntimeError(f"{name} has shape {list(t.shape)}; C is {c}")
+    if "grad_out" in a:
+        _same("grad_out", a["grad_out"], x.shape, x.dtype)
+        _, mean, rstd = A.native_group_norm.default(x, None, None, n, c, hw, group, 1e-5)
+        _same("mean", a["mean"], mean.shape, mean.dtype)
+        _same("rstd", a["rstd"], rstd.shape, rstd.dtype)
+    return node.op.fn(*pos, **kw)
+
+
+def _grid_sampler(spatial):
+    """grid_sampler_2d/3d and their backward (ADR-043): the kernels switch on
+    interpolation_mode and padding_mode without a default; an unknown mode
+    computed from uninitialized values. The backward's grad_output is what
+    the forward gives."""
+    modes = (0, 1, 2) if spatial == 2 else (0, 1)
+    forward = A.grid_sampler_2d.default if spatial == 2 else A.grid_sampler_3d.default
+
+    def infer(node, pos, kw):
+        a = validators._named(node, pos, kw)
+        if a["interpolation_mode"] not in modes or a["padding_mode"] not in (0, 1, 2):
+            raise RuntimeError(f"interpolation_mode {a['interpolation_mode']} or padding_mode "
+                               f"{a['padding_mode']} is not one PyTorch defines")
+        if "grad_output" in a:
+            x = a["input"]
+            out = forward(x, a["grid"], a["interpolation_mode"], a["padding_mode"], a["align_corners"])
+            _same("grad_output", a["grad_output"], out.shape, x.dtype)
+        return node.op.fn(*pos, **kw)
+
+    return infer
+
+
 A = torch.ops.aten
 
 # aten ops that PyTorch ships without a meta kernel, or with one that checks
@@ -280,6 +423,25 @@ OVERRIDES = {
     "aten._embedding_bag_backward.default": _embedding_bag_backward,
     "aten._embedding_bag_dense_backward.default": _embedding_bag_backward,
     "aten.embedding_dense_backward.default": _embedding_dense_backward,
+    "aten._cdist_backward.default": _cdist_backward,
+    "aten._pdist_backward.default": _pdist_backward,
+    "aten._fft_r2c.default": _fft,
+    "aten._fft_c2r.default": _fft,
+    "aten._fft_c2c.default": _fft,
+    "aten.native_batch_norm.default": _batch_norm,
+    "aten._native_batch_norm_legit.default": _batch_norm,
+    "aten._native_batch_norm_legit.no_stats": _batch_norm,
+    "aten._native_batch_norm_legit_functional.default": _batch_norm,
+    "aten._native_batch_norm_legit_no_training.default": _batch_norm,
+    "aten.native_batch_norm_backward.default": _batch_norm,
+    "aten.native_layer_norm.default": _layer_norm,
+    "aten.native_layer_norm_backward.default": _layer_norm,
+    "aten.native_group_norm.default": _group_norm,
+    "aten.native_group_norm_backward.default": _group_norm,
+    "aten.grid_sampler_2d.default": _grid_sampler(2),
+    "aten.grid_sampler_2d_backward.default": _grid_sampler(2),
+    "aten.grid_sampler_3d.default": _grid_sampler(3),
+    "aten.grid_sampler_3d_backward.default": _grid_sampler(3),
     "aten.select_scatter.default": _scatter(lambda o, a: o.select(a["dim"], a["index"])),
     "aten.slice_scatter.default": _scatter(
         lambda o, a: torch.ops.aten.slice.Tensor(o, a["dim"], a["start"], a["end"], a["step"])),

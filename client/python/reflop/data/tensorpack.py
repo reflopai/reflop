@@ -37,7 +37,8 @@ def _tensor_bytes(t: torch.Tensor) -> bytes:
     if n == 0:
         return b""
     buf = bytearray(n)
-    torch.frombuffer(buf, dtype=torch.uint8).copy_(t.reshape(-1).view(torch.uint8))
+    # as_strided: reshape(-1) keeps the stride of a size-1 dim (x[::12]).
+    torch.frombuffer(buf, dtype=torch.uint8).copy_(t.as_strided((t.numel(),), (1,)).view(torch.uint8))
     return bytes(buf)
 
 

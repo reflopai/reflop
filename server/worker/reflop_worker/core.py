@@ -24,7 +24,7 @@ from .graph import Builder
 from .handles import HandleTable, check_new
 from .meta import infer
 from .ops_generated import OPS
-from .safetensors import MAX_HEADER, RESERVED, SafetensorsError, parse_header, resolved
+from .safetensors import MAX_HEADER, RESERVED, SafetensorsError, flat, parse_header, resolved
 
 # Tier 2 capability keys and how to detect them on a device.
 CAPABILITY_KEYS = ("linalg", "complex", "fp8", "rnn_fused", "ctc", "cdist_backward")
@@ -120,7 +120,7 @@ def device_info(device: torch.device, gd: gpb.Device) -> kpb.DeviceInfo:
 def _host_copy(t: torch.Tensor) -> torch.Tensor:
     """The tensor's bytes as a flat uint8 tensor on the host (one copy for a
     device tensor, as .cpu() always made)."""
-    return resolved(t).detach().contiguous().cpu().reshape(-1).view(torch.uint8)
+    return flat(resolved(t).detach().contiguous().cpu()).view(torch.uint8)
 
 
 def _chunk_bytes(flat: torch.Tensor, off: int, n: int) -> bytes:
@@ -415,13 +415,13 @@ class Session:
                 dt, shape, b, e = hdr[k]
                 t = torch.empty(shape, dtype=dt, device=self.device)
                 if e > b:
-                    flat = t.reshape(-1).view(torch.uint8)
+                    dst = t.reshape(-1).view(torch.uint8)
                     for off in range(0, e - b, len(staging)):
                         m = min(len(staging), e - b - off)
                         got = os.preadv(fd, [memoryview(staging)[:m]], start + b + off)
                         if got != m:
                             raise ReflopError(cpb.ERROR_PROTOCOL, "snapshot file is truncated")
-                        flat[off:off + m].copy_(stage[:m])
+                        dst[off:off + m].copy_(stage[:m])
                 out[h] = t
             states = {}
             for k, (_dt, _shape, b, e) in rng.items():

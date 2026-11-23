@@ -125,6 +125,14 @@ def resolved(t: torch.Tensor) -> torch.Tensor:
     return t
 
 
+def flat(t: torch.Tensor) -> torch.Tensor:
+    """A contiguous tensor's elements as a 1-d view (no copy). PyTorch calls a
+    tensor contiguous whatever the strides of its size-1 dims, and reshape(-1)
+    keeps such a stride (x[::12] of 10 elements has stride 12), which
+    view(torch.uint8) refuses; view the storage directly instead."""
+    return t.as_strided((t.numel(),), (1,))
+
+
 def tensor_bytes(t: torch.Tensor) -> bytes:
     """Raw little-endian bytes of a tensor without numpy (not in the runtime)."""
     t = resolved(t).detach().contiguous().cpu()
@@ -132,7 +140,7 @@ def tensor_bytes(t: torch.Tensor) -> bytes:
     if n == 0:
         return b""
     buf = bytearray(n)
-    torch.frombuffer(buf, dtype=torch.uint8).copy_(t.reshape(-1).view(torch.uint8))
+    torch.frombuffer(buf, dtype=torch.uint8).copy_(flat(t).view(torch.uint8))
     return bytes(buf)
 
 

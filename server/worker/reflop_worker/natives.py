@@ -146,30 +146,68 @@ def meta(name: str, pos, kw):
         return torch.empty((n,), dtype=dt, device="meta")
     if short in ("fused_adam", "fused_adamw"):
         params, grads, m, v, mx, st = a[:6]
-        _same_lists(params, grads, m, v, st)
+        amsgrad = a[11]
+        _like_params(params, grads, m, v, *((mx,) if amsgrad else ()))
+        if not amsgrad and mx:
+            raise ValueError("max_exp_avg_sqs must be empty without amsgrad")
+        _steps(params, st)
+        _scales(a[13:15])
         return _meta_like(params), _meta_like(m), _meta_like(v), _meta_like(mx), _meta_like(st)
     if short == "fused_sgd":
         params, grads, mb = a[:3]
-        _same_lists(params, grads)
+        _like_params(params, grads, *((mb,) if mb else ()))
+        _scales(a[10:12])
         return _meta_like(params), _meta_like(mb)
     if short == "fused_adagrad":
         params, grads, ss, st = a[:4]
-        _same_lists(params, grads, ss, st)
+        _like_params(params, grads, ss)
+        _steps(params, st)
+        _scales(a[9:11])
         return _meta_like(params), _meta_like(ss), _meta_like(st)
     if short == "amp_unscale_and_check":
-        grads, fi, _inv = a
+        grads, fi, inv = a
+        _one_float(fi, "found_inf")
+        _one_float(inv, "inv_scale")
         return _meta_like(grads), torch.empty_like(fi, device="meta")
     if short == "amp_update_scale":
+        scale, tracker, fi = a[:3]
+        _one_float(scale, "scale")
+        _one_float(fi, "found_inf")
+        if tracker.numel() != 1 or tracker.dtype != torch.int32:
+            raise ValueError("growth_tracker must be one int32 element")
         return torch.empty_like(a[0], device="meta"), torch.empty_like(a[1], device="meta")
     raise NotImplementedError(name)
 
 
-def _same_lists(*lists):
-    n = len(lists[0])
+# The fused kernels walk every list with params[i]'s size and dtype; PyTorch
+# checks the lists' lengths only (ADR-043).
+
+
+def _like_params(params, *lists):
     for lst in lists:
-        if len(lst) != n:
+        if len(lst) != len(params):
             raise ValueError("tensor lists must have equal lengths")
-    for i in range(n):
-        shapes = {tuple(lst[i].shape) for lst in lists[:2]}
-        if len(shapes) != 1:
-            raise ValueError("param and grad shapes differ")
+    for i, p in enumerate(params):
+        for lst in lists:
+            if tuple(lst[i].shape) != tuple(p.shape) or lst[i].dtype != p.dtype:
+                raise ValueError(f"tensor {i} is {lst[i].dtype}{list(lst[i].shape)}; its param is "
+                                 f"{p.dtype}{list(p.shape)}")
+
+
+def _steps(params, steps):
+    if len(steps) != len(params):
+        raise ValueError("state_steps must have one tensor per param")
+    for t in steps:
+        if t.numel() != 1:
+            raise ValueError("each state step must have one element")
+
+
+def _scales(ts):
+    for t in ts:
+        if t is not None:
+            _one_float(t, "grad_scale and found_inf")
+
+
+def _one_float(t, what):
+    if t.numel() != 1 or t.dtype != torch.float32:
+        raise ValueError(f"{what} must be one float32 element, got {t.dtype}{list(t.shape)}")

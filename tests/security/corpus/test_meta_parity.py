@@ -4,7 +4,7 @@ same values; every call PyTorch rejects, the worker rejects before a kernel
 runs (#21, ADR-042).
 
 The cases are seeds recorded from small PyTorch programs and their one-
-argument mutations (parity.py), about 13,000 per device. Disagreements that
+argument mutations (parity.py), about 23,000 per device. Disagreements that
 are known and safe (the kernel raises after V4 passed, or the worker is
 stricter than PyTorch) are listed in KNOWN per op and kind; anything else
 fails, and so does a KNOWN entry that no longer occurs, so the list only
@@ -30,21 +30,50 @@ KNOWN = {
     "aten._adaptive_avg_pool2d_backward.default": {"I3"},
     "aten._adaptive_avg_pool3d.default": {"I3"},
     "aten._adaptive_avg_pool3d_backward.default": {"I3"},
+    "aten._addmm_activation.default": {"I3"},
+    "aten._cdist_forward.default": {"I3"},
+    # Tensor lengths: the client sends int lists (ADR-032); no meta kernel.
+    "aten._ctc_loss.Tensor": {"false-rejection"},
     "aten._embedding_bag.default": {"worker-failed"},
     "aten._embedding_bag_backward.default": {"I3"},
     "aten._embedding_bag_dense_backward.default": {"I3"},
+    "aten._fft_c2r.default": {"I3"},
+    # A tensor of scalars must be on the CPU in PyTorch; V4 sees it on meta.
+    "aten._foreach_addcdiv.Tensor": {"false-rejection"},
+    "aten._foreach_addcmul.Tensor": {"false-rejection"},
+    "aten._native_batch_norm_legit.default": {"I3", "worker-failed"},
+    "aten._native_batch_norm_legit.no_stats": {"I3"},
+    "aten._native_batch_norm_legit_functional.default": {"I3", "worker-failed"},
+    "aten._native_batch_norm_legit_no_training.default": {"worker-failed"},
+    "aten._pdist_forward.default": {"I3"},
+    "aten._prelu_kernel.default": {"I3"},
+    "aten._prelu_kernel_backward.default": {"I3", "worker-failed"},
     "aten._unsafe_index_put.default": {"I3"},
+    "aten.addbmm.default": {"I3"},
+    "aten.addmm.default": {"I3"},
     "aten.affine_grid_generator.default": {"I3", "false-rejection"},
     "aten.avg_pool2d.default": {"I3"},
     "aten.avg_pool2d_backward.default": {"I3"},
+    "aten.binary_cross_entropy.default": {"I3", "false-rejection", "worker-failed"},
+    "aten.binary_cross_entropy_backward.default": {"I3", "false-rejection", "worker-failed"},
+    "aten.binary_cross_entropy_with_logits.default": {"I3", "false-rejection"},
     "aten.bitwise_not.default": {"I3"},
+    "aten.bucketize.Tensor": {"I3"},
+    "aten.complex.default": {"I3"},
     "aten.convolution.default": {"I3"},
     "aten.convolution_backward.default": {"I3"},
     # sparse=True: the worker supports dense gradients only (deliberate).
     "aten.embedding.default": {"false-rejection"},
     # The worker allocates dense, non-overlapping layouts only (deliberate).
     "aten.empty_strided.default": {"false-rejection"},
+    "aten.gelu_backward.default": {"I3"},
     "aten.glu_backward.default": {"I3"},
+    "aten.grid_sampler_2d.default": {"I3"},
+    "aten.grid_sampler_2d_backward.default": {"I3"},
+    "aten.grid_sampler_3d.default": {"I3"},
+    "aten.grid_sampler_3d_backward.default": {"I3"},
+    "aten.huber_loss.default": {"false-rejection", "worker-failed"},
+    "aten.huber_loss_backward.default": {"I3", "false-rejection"},
     "aten.im2col.default": {"I3"},
     "aten.index.Tensor": {"I3"},
     "aten.index_add.default": {"I3"},
@@ -53,25 +82,63 @@ KNOWN = {
     "aten.index_fill.int_Tensor": {"I3"},
     "aten.index_put.default": {"I3"},
     "aten.index_select.default": {"I3"},
+    "aten.linalg_lu_factor_ex.default": {"I3"},
+    "aten.log_sigmoid_backward.default": {"I3"},
     "aten.logsumexp.default": {"I3"},
+    "aten.masked_scatter.default": {"worker-failed"},
+    "aten.max.default": {"I3"},
     "aten.max.dim": {"I3"},
+    "aten.min.default": {"I3"},
+    "aten.mish_backward.default": {"worker-failed"},
     "aten.mm.default": {"I3"},
+    "aten.mse_loss_backward.default": {"false-rejection", "worker-failed"},
+    "aten.mv.default": {"I3"},
+    "aten.native_batch_norm.default": {"I3", "worker-failed"},
+    "aten.native_group_norm.default": {"I3"},
+    "aten.native_group_norm_backward.default": {"I3"},
+    "aten.native_layer_norm.default": {"I3"},
+    "aten.native_layer_norm_backward.default": {"I3"},
     "aten.new_empty_strided.default": {"I3"},
+    "aten.nll_loss2d_backward.default": {"I3", "false-rejection"},
+    "aten.nll_loss2d_forward.default": {"I3", "false-rejection"},
+    "aten.nll_loss_backward.default": {"I3", "false-rejection"},
+    "aten.nll_loss_forward.default": {"I3", "false-rejection"},
+    "aten.pixel_unshuffle.default": {"worker-failed"},
     "aten.replication_pad2d.default": {"I3"},
     "aten.replication_pad3d.default": {"I3"},
+    "aten.searchsorted.Tensor": {"I3"},
+    "aten.smooth_l1_loss_backward.default": {"false-rejection", "worker-failed"},
+    "aten.soft_margin_loss.default": {"I3", "false-rejection", "worker-failed"},
+    "aten.soft_margin_loss_backward.default": {"false-rejection", "worker-failed"},
+    "aten.threshold_backward.default": {"worker-failed"},
     "aten.upsample_bicubic2d.default": {"I3"},
+    "aten.upsample_bicubic2d.vec": {"I3"},
     "aten.upsample_bilinear2d.default": {"I3"},
+    "aten.upsample_bilinear2d.vec": {"I3"},
     "aten.upsample_linear1d.default": {"I3"},
+    "aten.upsample_linear1d.vec": {"I3"},
     "aten.upsample_trilinear3d.default": {"I3"},
+    "aten.upsample_trilinear3d.vec": {"I3"},
     "aten.view_copy.default": {"false-rejection"},
 }
 # pin_memory=True raises after V4 passed ("No CUDA GPUs are available"
 # without CUDA, "Only dense CPU tensors can be pinned" on a CUDA session);
 # a CPU session on a machine with CUDA runs it. Not checked for staleness.
-KNOWN_ANYWHERE = {op: {"I3"} for op in ("aten.ones.default", "aten.ones_like.default", "aten.zeros.default")}
-# On CUDA, convolution_backward with an input of another shape returns a
-# grad_input of the shape grad_output implies; the worker fails closed (E3).
-KNOWN_CUDA = {"aten.convolution_backward.default": {"worker-failed"}}
+KNOWN_ANYWHERE = {op: {"I3"} for op in (
+    "aten.eye.default", "aten.eye.m", "aten.full_like.default", "aten.ones.default", "aten.ones_like.default",
+    "aten.zeros.default")}
+# Only on CUDA. convolution_backward with an input of another shape, and
+# log_sigmoid's buffer, come back in another shape than V4 validated; the
+# worker fails closed (E3).
+KNOWN_CUDA = {
+    "aten._int_mm.default": {"I3"},
+    "aten._native_batch_norm_legit_no_training.default": {"I3"},
+    "aten.channel_shuffle.default": {"I3"},
+    "aten.convolution_backward.default": {"worker-failed"},
+    "aten.log_sigmoid_backward.default": {"worker-failed"},
+    "aten.log_sigmoid_forward.default": {"worker-failed"},
+    "aten.native_batch_norm_backward.default": {"I3"},
+}
 NEVER_KNOWN = {"crash", "values", "ran", "meta-shapes"}
 
 CASES = all_cases()
