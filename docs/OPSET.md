@@ -436,7 +436,7 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 421 | `aten.arange.start` | ALLOC | alloc |  |
 | 422 | `aten.empty_like.default` | UNINIT ALLOC | alloc |  |
 | 423 | `aten.new_empty.default` | UNINIT ALLOC | alloc |  |
-| 424 | `aten.new_empty_strided.default` | UNINIT ALLOC | alloc |  |
+| 424 | `aten.new_empty_strided.default` | UNINIT ALLOC | empty_strided |  |
 | 425 | `aten.tril.default` |  |  |  |
 | 426 | `aten.triu.default` |  |  |  |
 | 427 | `aten.diag_embed.default` |  |  |  |

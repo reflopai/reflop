@@ -47,7 +47,7 @@ a kernel, or a pickled object. Anything else reaching the server is a defect.
 |---|---|---|---|
 | I1 | the server never runs client-supplied bytes as code | the worker has no code path that loads code; the op table refers to PyTorch kernels by literal name in generated source | `tests/security/static/check_worker.py` (CI) bans `eval`, `exec`, pickle family, `subprocess`, `importlib`, `torch.load`, `torch.compile`, `torch.library`, new sockets and dynamic attribute access in worker code |
 | I2 | dispatch is integer id → static table | `ops_generated.py` is generated from `opset.yaml`; no `getattr` with a runtime name | the same static check |
-| I3 | full validation before any device allocation | V1 strict decode, V2 structure (DAG order, whitelist, capability, arity), V3 schema (types, enums, dim ranges, sizes with checked arithmetic), V4 meta inference, V5 peak memory vs device size and quotas | 184 cases in `tests/security/corpus`, and the meta/kernel parity test (about 23,000 calls over 394 ops per device, ADR-042/043) |
+| I3 | full validation before any device allocation | V1 strict decode, V2 structure (DAG order, whitelist, capability, arity), V3 schema (types, enums, dim ranges, sizes with checked arithmetic), V4 meta inference, V5 peak memory vs device size and quotas | 184 cases in `tests/security/corpus`, the meta/kernel parity test (about 23,000 calls over 394 ops per device, ADR-042/043), and the structure-aware graph fuzzer (5,000 cases per CI run, 200,000 nightly, ADR-044) |
 | I4 | data-dependent indices are bounds-checked before the kernel | per-op validators (`validators.py`) run before each IDX op; value ranges of immutable server tensors are proven on the host where possible, otherwise measured on the device | an out-of-bounds case (−1, size, INT64_MAX, INT64_MIN) per IDX op in the corpus; sentinel rules (`ignore_index`, `padding_idx`) |
 | I5 | one sandboxed worker per (identity, session), no network | Landlock applied by `reflopd __sandbox-exec` before `exec`; seccomp allowlist installed after warm-up on all threads; user+network namespaces when allowed; cgroup per worker | 32 probes inside real workers (`server/worker/testprobes/`, run by `.github/workflows/isolation.yml`; see `tests/security/isolation/README.md`) and `TestWorkerSeccompFilter` |
 | I6 | client formats are data only | strict protobuf (unknown fields and enum values rejected), raw bytes with checked sizes, our own safetensors parsers in Go and Python, schema-checked JSON manifests | corpus decode and data cases; Go fuzzing of framing, safetensors and manifests |
@@ -55,7 +55,7 @@ a kernel, or a pickled object. Anything else reaching the server is a defect.
 | I8 | handles and datasets are per identity | a worker serves one session, so other sessions' handles do not exist in it; datasets live under the identity's id and are opened by reflopd, which passes file descriptors | cross-session and cross-identity tests (corpus, store tests) |
 | I9 | the client deserializes no executable formats, writes nowhere the server chooses, strips control sequences | protobuf and raw bytes only; checkpoints are safetensors; `sanitize()` on every server string | `test_client_protection.py` |
 | I10 | `opset.yaml` is the single source of truth | `codegen/gen.py` generates the worker table, the client mapping, the Go table and `docs/OPSET.md` | `gen.py --check` in CI |
-| I11 | fail closed | unknown fields, ops, dtypes, versions, devices, attributes and enum values are rejected | corpus decode, structure and schema cases |
+| I11 | fail closed | unknown fields, ops, dtypes, versions, devices, attributes and enum values are rejected | corpus decode, structure and schema cases; the graph fuzzer, which also requires every error to be structured |
 | I12 | the client sends no environment, paths, hostnames, secrets or source | the encoder serializes only graphs, tensors and protocol fields | `test_client_never_sends_environment` |
 | I13 | no uninitialized memory | `empty*` and `new_empty*` outputs are zero-filled | UNINIT cases in the corpus, which dirty the allocator first |
 
@@ -120,7 +120,9 @@ unless the Owner passes `--accept-weak-isolation`.
 Rails protect the machine, not fairness, and are always on: disk free floor
 max(10%, 20 GiB), host RAM floor 4 GiB, 4096 processes/threads per worker,
 protocol sanity limits, and a peak-memory estimate against the GPU's total
-memory. No setting turns a rail off: the minimums are 1% and 1 GiB of disk,
+memory. The estimate keeps a view's base alive as long as the view, and
+counts the copy a non-contiguous view output needs when it is returned or
+fetched (ADR-044); the graph fuzzer checks that no execute holds more. No setting turns a rail off: the minimums are 1% and 1 GiB of disk,
 512 MiB of RAM and 64 processes, going below the defaults needs `--force`,
 and every protocol limit has a range that excludes 0. If host memory cannot
 be read, worker memory is frozen and no new worker starts.

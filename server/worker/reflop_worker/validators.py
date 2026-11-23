@@ -623,7 +623,9 @@ def check_static(node, args, kwargs) -> None:
             f(node, _named(node, args, kwargs))
         except ReflopError:
             raise
-        except (IndexError, ValueError, TypeError, KeyError) as e:
+        # AttributeError: a Tensor argument may be a wrapped Python number
+        # (V3 allows it for scalar promotion), which has no .dim() (GH#4).
+        except (IndexError, ValueError, TypeError, KeyError, AttributeError) as e:
             raise invalid(f"{node.op.name}: {e}", S, node.index, node.op.id) from None
 
 
@@ -637,7 +639,7 @@ def check_runtime(node, args, kwargs) -> None:
             f(node, _named(node, args, kwargs))
         except ReflopError:
             raise
-        except (IndexError, ValueError, TypeError, KeyError) as e:
+        except (IndexError, ValueError, TypeError, KeyError, AttributeError) as e:
             raise ReflopError(cpb.ERROR_RUNTIME_CHECK, f"{node.op.name}: {e}", R, node.index,
                               node.op.id) from None
 

@@ -10190,7 +10190,7 @@ ops:
   flags:
   - UNINIT
   - ALLOC
-  validator: alloc
+  validator: empty_strided
   devices:
   - cuda
   - cpu

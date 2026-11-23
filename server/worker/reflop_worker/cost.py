@@ -77,10 +77,12 @@ def analyze(prog: Program, input_bytes: int = 0) -> None:
     flops = 0
     live = input_bytes
     peak = live
-    # Bytes for every node output; views alias their input.
+    # Bytes for every node output; views alias their input, and keep it
+    # alive as long as they live.
     out_bytes: dict = {}
+    last_use = alias_last_use(prog)
     expiring: dict[int, list] = {}
-    for r, last in prog.last_use.items():
+    for r, last in last_use.items():
         expiring.setdefault(last, []).append(r)
     for node in prog.nodes:
         ins = []
@@ -105,10 +107,44 @@ def analyze(prog: Program, input_bytes: int = 0) -> None:
         # Outputs nobody reads are dropped right away.
         for k in range(node.outputs):
             r = Ref(node.index, k)
-            if r not in prog.last_use:
+            if r not in last_use:
                 live -= out_bytes[r]
+    # A graph output that is a non-contiguous view (x.t(), x.expand(...)) is
+    # copied whole when it is returned (.contiguous() before the host copy)
+    # or later fetched; until then it costs nothing. Count that copy at the
+    # end of the graph, when every output is alive (GH#4: a 0-d tensor
+    # expanded to [2**31, 2] took 17 GB past every rail).
+    prog.view_output_bytes = view_output_bytes(prog, out_bytes)
     prog.flops = flops
-    prog.peak_bytes = peak
+    prog.peak_bytes = max(peak, live + prog.view_output_bytes)
+
+
+def alias_last_use(prog: Program) -> dict:
+    """prog.last_use with each view's base kept until the view's own last
+    use: the view shares the base's memory (GH#4). Walk backwards so chains
+    of views extend their first base."""
+    last = dict(prog.last_use)
+    for node in reversed(prog.nodes):
+        if not getattr(node.op.fn, "is_view", False):
+            continue
+        ends = [last[r] for k in range(node.outputs) if (r := Ref(node.index, k)) in last]
+        if not ends:
+            continue
+        end = max(ends)
+        for a in node.args:
+            for b in (a if isinstance(a, list) else [a]):
+                if isinstance(b, Ref) and last.get(b, -1) < end:
+                    last[b] = end
+    return last
+
+
+def view_output_bytes(prog: Program, out_bytes: dict) -> int:
+    total = 0
+    for r in dict.fromkeys(prog.outputs):
+        m = prog.metas.get(r)
+        if r.node >= 0 and out_bytes.get(r, 0) == 0 and isinstance(m, torch.Tensor) and not m.is_contiguous():
+            total += _bytes(m)
+    return total
 
 
 def input_bytes(prog: Program) -> int:

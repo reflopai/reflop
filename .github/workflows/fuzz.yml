@@ -1,0 +1,71 @@
+name: Fuzz (nightly)
+
+# Longer runs of the worker graph fuzzer (GH#4, ADR-044) and the Go fuzzers,
+# from a fresh seed each night. CI runs a short fixed-seed budget on every
+# push. A failing case is uploaded; add it to tests/security/fuzz/corpus/.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      cases:
+        description: graph fuzz cases per seed
+        default: "100000"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+jobs:
+  graph:
+    name: Worker graph fuzzer
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: environment (CPU PyTorch)
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
+            torch torchvision protobuf pytest hypothesis pyyaml cryptography safetensors
+      - name: fuzz
+        env:
+          REFLOP_FUZZ_SEED: ${{ github.run_id }},${{ github.run_number }}
+          REFLOP_FUZZ_CASES: ${{ inputs.cases || '100000' }}
+          REFLOP_FUZZ_OUT: fuzz-out
+        run: |
+          echo "seeds: $REFLOP_FUZZ_SEED"
+          REFLOP_TEST_DEVICE=cpu .venv/bin/python -m pytest -q tests/security/fuzz
+      - name: upload failing cases
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-cases
+          path: fuzz-out/
+
+  go:
+    name: Go fuzzers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: fuzz (5 minutes each)
+        run: |
+          go test -run=^$ -fuzz=FuzzUnmarshalEnvelope -fuzztime=5m ./pkg/wire
+          go test -run=^$ -fuzz=FuzzSafetensors -fuzztime=5m ./server/reflopd/internal/store
+          go test -run=^$ -fuzz=FuzzManifest -fuzztime=5m ./server/reflopd/internal/store
+      - name: upload failing inputs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-fuzz-inputs
+          path: "**/testdata/fuzz/**"

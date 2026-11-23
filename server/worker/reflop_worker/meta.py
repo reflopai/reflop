@@ -460,7 +460,10 @@ def infer(prog: Program, limits: cpb.Limits) -> None:
     metas: dict = {}
     for i, inp in enumerate(prog.inputs):
         if inp.kind == gpb.GraphInput.KIND_TENSOR:
-            metas[Ref(-1, i)] = torch.empty(inp.shape, dtype=inp.dtype, device="meta")
+            try:
+                metas[Ref(-1, i)] = torch.empty(inp.shape, dtype=inp.dtype, device="meta")
+            except RuntimeError as e:
+                raise limit(f"input {i}: {str(e)[:200]}", S) from None
         elif inp.kind == gpb.GraphInput.KIND_DATASET_REF:
             metas[Ref(-1, i)] = DatasetMeta(inp.dtype, inp.shape)
     last_use: dict = {}

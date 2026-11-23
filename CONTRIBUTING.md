@@ -46,6 +46,12 @@ would make a probe skip or pass without testing the sandbox is a failure. See
   validation by graph hash is fine.
 - Every bug fix adds a regression test; every security fix adds a case to
   `tests/security/`.
+- The worker graph fuzzer (`tests/security/fuzz`) runs a short fixed budget
+  in every test run. For a longer run, set `REFLOP_FUZZ_SEED`,
+  `REFLOP_FUZZ_CASES` and `REFLOP_FUZZ_OUT` (failing cases are written
+  there) and run it in a memory-capped scope (`systemd-run --user --scope -p
+  MemoryMax=8G -p MemorySwapMax=0 -- ...`). Add each failing case to
+  `tests/security/fuzz/corpus/`.
 - Commit messages, comments and docs are in English. Code is Apache-2.0; do not
   vendor GPL or AGPL code.
 

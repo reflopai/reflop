@@ -73,6 +73,7 @@ class Program:
     last_use: dict = field(default_factory=dict)    # Ref -> node index of last use
     flops: int = 0
     peak_bytes: int = 0
+    view_output_bytes: int = 0  # part of peak_bytes: copies of non-contiguous view outputs
 
 
 def _base(t: str) -> str:
@@ -155,6 +156,10 @@ class Builder:
             dtypes.nbytes_checked(m.shape, dt, self.limits.max_tensor_numel)
         except (ValueError, OverflowError) as e:
             raise limit(str(e), stage) from None
+        # A zero dim makes the element count 0 whatever the other dims are;
+        # their strides still have to fit (GH#4: [0, 2**62, 2**62]).
+        if math.prod(n for n in m.shape if n) > self.limits.max_tensor_numel:
+            raise limit(f"tensor shape {list(m.shape)} exceeds the element limit", stage)
         return dt, tuple(m.shape)
 
     def _input(self, i: int, gi: gpb.GraphInput) -> InputSpec:
