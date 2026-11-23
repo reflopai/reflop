@@ -10,6 +10,9 @@ dist/
 .ruff_cache/
 .hypothesis/
 
+#macOS
+.DS_Store
+
 # docs
 AGENTS.md
 BUGS.md
