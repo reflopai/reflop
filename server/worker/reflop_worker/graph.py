@@ -209,6 +209,11 @@ class Builder:
         if which is None:
             raise bad("missing value")
         if which == "none":
+            if core == "Device" and opt:
+                # The session device is the only one there is. Left as None, a
+                # factory would build its output on the CPU, in meta inference
+                # too, before any size limit is checked (ADR-042).
+                return "session-device"
             if opt or core == "Generator":
                 return None
             raise bad("None is not allowed")

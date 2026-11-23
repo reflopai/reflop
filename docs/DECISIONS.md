@@ -1174,3 +1174,88 @@ remaining ops of this kind; it is planned separately.
 `SHAPE_MISMATCH/V4_META` instead of at execute. A test runs about 2,400 cases
 per device against PyTorch's kernels and requires the same accept or reject
 decision for each one, and the same values when accepted.
+
+## ADR-042: Check backward, weight_norm and embedding_bag inputs against the forward
+
+**Context.** The meta/kernel parity test (#21) runs about 13,000 recorded
+and mutated op calls per device through the worker and through PyTorch's own
+kernels. It found kernels that read or write out of bounds on inputs V4
+accepted, because PyTorch's meta kernels check less than the kernels assume:
+
+- The pooling backward ops (`_adaptive_avg_pool2d/3d_backward`,
+  `adaptive_max_pool2d/3d_backward`, `max_pool2d/3d_with_indices_backward`,
+  `avg_pool2d/3d_backward`) index `grad_output`, `indices` and `self` with
+  each other's sizes. A `grad_output` with another batch size, or a `self`
+  with an empty dim, crashed the CPU worker (SIGSEGV or SIGABRT) or returned
+  memory it does not own.
+- `_log_softmax_backward_data` on CPU reads `output` with `grad_output`'s
+  sizes and accepts any pair.
+- `_weight_norm_interface` and its backward read `v.size(dim)` elements of
+  `g` and of the norms without checking their shapes.
+- `_embedding_bag_backward` and `_embedding_bag_dense_backward` read
+  `bag_size`, `maximum_indices`, `per_sample_weights` and `offset2bag` with
+  `grad`'s and `indices`' sizes. With an empty `offset2bag` the kernels
+  derive the bags from `offsets`, which only the forward checked. On CUDA an
+  empty embedding dim (`grad` of shape `(bags, 0)`) is an illegal memory
+  access, as is the same in `embedding_dense_backward`.
+- `_embedding_bag` with empty `offsets` but non-empty `indices` (indices and
+  no bags) crashes the CPU kernel in max mode.
+
+The worker is sandboxed per session, so a crash ends only the session that
+sent the graph. But these are reads and writes outside a tensor's memory,
+and I3/I4 require such inputs to be rejected before a kernel launches.
+
+The same run found that a `Device?` argument sent as `None` left factory ops
+(`aten.full`, `zeros`, ...) on the CPU, in meta inference too, before any
+size limit is checked: `aten.full([2**31, 3])` allocated 25 GB on the host
+while being validated.
+
+**Decision.** `meta.OVERRIDES` gains a check for each op, run before the
+op's meta kernel. Each check requires the shapes autograd passes: run the
+forward on a meta tensor of `self` (pooling), or derive the shape from the
+saved tensors (weight_norm, embedding_bag), and require `grad_output` and the
+saved tensors to have that exact shape and dtype. The rules:
+
+- pooling backward: `self` and `grad_output` have the same rank (unbatched
+  or batched), `self` has no empty non-batch dim, and `grad_output` (and
+  `indices`, int64) is exactly what the forward on `self` gives;
+  `_adaptive_avg_pool2d/3d` reject an empty non-batch dim too.
+- softmax backward: `grad_output` has `output`'s shape and dtype.
+- weight_norm: `dim` is 0 or `v.dim() - 1` (not wrapped, as the kernels
+  assert), `g` and the norms have `v.size(dim)` along `dim` and 1 elsewhere,
+  `g` has `v`'s dtype, the norms are float32 for half and bfloat16 `v`.
+- embedding_bag backward: `grad` is `(bags, D)` with `D > 0`, `indices` 1-D,
+  `bag_size` `(bags,)`, `offsets` `(bags,)` or `(bags + 1,)`, `offset2bag`
+  `(indices,)` (empty only for `_embedding_bag_backward`, which can rebuild
+  it), `maximum_indices` `grad`'s shape in max mode, `per_sample_weights`
+  `(indices,)` in `grad`'s dtype. The runtime validator checks `offsets` as
+  the forward does (starts at 0, non-decreasing, within the indices).
+- `embedding_dense_backward`: `grad_output` is `indices.shape + (D,)` with
+  `D > 0`.
+- `_embedding_bag`: `weight` is 2-D with `D > 0`; empty `offsets` need empty
+  `indices`.
+
+V3 maps a `None` `Device?` argument to the session device, the only device a
+session has, so meta inference runs on `meta` and execution on the session
+device.
+
+**Alternatives.** Matching PyTorch exactly would accept the inconsistent
+calls PyTorch's CPU kernels run out of bounds; the worker is stricter than
+PyTorch on purpose for these ops, and every call autograd makes still
+passes. Checking only the case that crashed in each op would leave its
+neighbours (another dim, another dtype) to the next fuzzer. Rejecting a
+`None` device would break no honest client but would change an accepted
+graph shape for no gain.
+
+**Consequences.** These calls fail at registration with
+`SHAPE_MISMATCH/V4_META` (or `RUNTIME_CHECK/E2` for `offsets` values). The
+parity test (`tests/security/corpus/test_meta_parity.py`) runs on every CI
+build and fails on any kernel crash, any value difference, any call the
+worker runs and PyTorch rejects, and any new kind of disagreement. Its
+`KNOWN` table lists, per op, the disagreements that remain and are safe:
+mostly calls V4 accepts and the kernel rejects after allocating its output
+(I3, for example mixed dtypes in `mm` or `convolution`), and a few
+deliberate rejections (`sparse=True`, strided `empty_strided`). An entry
+that stops occurring fails the test, so the table only shrinks.
+`tests/security/corpus/test_kernel_bounds.py` holds one case per unsafe
+call and checks that the calls autograd makes still run.

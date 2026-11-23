@@ -175,15 +175,18 @@ def embedding_bag_static(node, a):
         raise _bad(node, "sparse gradients are not supported")
     if a["indices"].dim() != 1 or a["offsets"].dim() != 1:
         raise _bad(node, "indices and offsets must be 1-D (flatten 2-D input on the client)")
+    if a["weight"].dim() != 2 or a["weight"].shape[1] == 0:
+        raise _bad(node, "weight must be 2-D with a non-empty embedding dimension")
+    if a["offsets"].shape[0] == 0 and a["indices"].shape[0] != 0:
+        # No bags to put the indices in; the CPU kernel writes out of bounds
+        # (ADR-042).
+        raise _bad(node, "offsets is empty but indices is not")
     psw = a.get("per_sample_weights")
     if psw is not None and tuple(psw.shape) != tuple(a["indices"].shape):
         raise _bad(node, "per_sample_weights must have the same shape as indices")
 
 
-def embedding_bag_runtime(node, a):
-    idx, off = a["indices"], a["offsets"]
-    bounds(node, idx, 0, a["weight"].shape[0])
-    n = idx.numel()
+def _offsets(node, off, n, include_last_offset=False):
     if off.numel() == 0:
         return
     if int(off[0]) != 0:
@@ -191,12 +194,22 @@ def embedding_bag_runtime(node, a):
     if off.numel() > 1 and bool((off[1:] < off[:-1]).any()):
         raise _oob(node, "offsets must be non-decreasing")
     last = int(off[-1])
-    if last > n or (a.get("include_last_offset") and last != n):
+    if last > n or (include_last_offset and last != n):
         raise _oob(node, f"offsets exceed the number of indices ({n})")
+
+
+def embedding_bag_runtime(node, a):
+    idx = a["indices"]
+    bounds(node, idx, 0, a["weight"].shape[0])
+    _offsets(node, a["offsets"], idx.numel(), a.get("include_last_offset"))
 
 
 def embedding_bag_backward_runtime(node, a):
     bounds(node, a["indices"], 0, a["num_weights"])
+    if "offsets" in a:
+        # With an empty offset2bag the kernels derive the bags from offsets
+        # (ADR-042).
+        _offsets(node, a["offsets"], a["indices"].numel())
     o2b = a.get("offset2bag")
     if o2b is not None:
         bounds(node, o2b, 0, max(a["grad"].shape[0], 1), what="offset2bag")
