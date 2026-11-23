@@ -413,6 +413,17 @@ def reduction_static(node, a):
         raise _bad(node, "reduction must be 0, 1 or 2")
 
 
+def bce_runtime(node, a):
+    # The CUDA kernel asserts 0 <= x <= 1 for input and target on the
+    # device: one value outside (or NaN) ends the CUDA context and the
+    # session. The CPU kernel raises for the same values (ADR-043).
+    for name in ("self", "target"):
+        x = a[name]
+        if x.numel() and not bool(((x >= 0) & (x <= 1)).all()):
+            raise ReflopError(cpb.ERROR_RUNTIME_CHECK, f"{node.op.name}: every {name} value must be in [0, 1]", R,
+                              node.index, node.op.id)
+
+
 def attention_static(node, a):
     p = a.get("dropout_p")
     if isinstance(p, float) and not 0.0 <= p < 1.0:
@@ -542,7 +553,7 @@ STATIC = {
     "embedding_bag_backward": embedding_bag_backward_static, "pool_indices": pool_indices_static,
     "nll_loss": nll_loss_static, "take": take_static, "multinomial": multinomial_static,
     "as_strided": as_strided_static, "empty_strided": empty_strided_static, "to_copy": to_copy_static,
-    "cdist": cdist_static, "reduction": reduction_static, "attention": attention_static,
+    "cdist": cdist_static, "reduction": reduction_static, "bce": reduction_static, "attention": attention_static,
     "int_mm": int_mm_static, "linalg": linalg_static, "scaled_mm": scaled_mm_static,
     "cudnn_rnn": cudnn_rnn_static, "ctc": ctc_static, "foreach_lengths": foreach_lengths_static,
     "fused_optim": fused_optim_static, "dataset_gather": dataset_gather_static, "alloc": alloc_static,
@@ -556,7 +567,7 @@ RUNTIME = {
     "take": take_runtime, "int_divisor_nonzero": int_divisor_nonzero_runtime,
     "shift_amount": shift_amount_runtime, "masked_scatter": masked_scatter_runtime,
     "multinomial": multinomial_runtime, "as_strided": as_strided_runtime, "ctc": ctc_runtime,
-    "dataset_gather": dataset_gather_runtime, "bounds_check": bounds_check_runtime,
+    "dataset_gather": dataset_gather_runtime, "bounds_check": bounds_check_runtime, "bce": bce_runtime,
 }
 
 # Every validator named in the opset must exist (checked at import and in CI).

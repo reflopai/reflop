@@ -33,7 +33,7 @@ import torch
 from ._pb import compute_pb2 as cpb
 from ._pb import worker_pb2 as wpb
 from .errors import ReflopError
-from .safetensors import RESERVED, SafetensorsError, check_key, header
+from .safetensors import RESERVED, SafetensorsError, check_key, flat, header
 
 RING = 64 << 20
 META_KEY = RESERVED + "meta"
@@ -231,21 +231,21 @@ class Writer:
                 src = t.detach()
                 if not src.is_contiguous():
                     src = src.contiguous()
-                flat = src.reshape(-1).view(torch.uint8)
+                flat_src = flat(src).view(torch.uint8)
                 for off in range(0, n, RING):
                     m = min(RING, n - off)
                     slot = k % 2
                     if pending is not None and pending[0] == slot:
                         flush_pending()
                         pending = None
-                    ring.views[slot][:m].copy_(flat[off:off + m], non_blocking=cuda and ring.pinned)
+                    ring.views[slot][:m].copy_(flat_src[off:off + m], non_blocking=cuda and ring.pinned)
                     if cuda:
                         evs[slot].record(stream)
                     if pending is not None:
                         flush_pending()
                     pending = (slot, m, i if off + m >= n else -1)
                     k += 1
-                del src, flat, t
+                del src, flat_src, t
             if pending is not None:
                 flush_pending()
         if cuda:

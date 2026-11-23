@@ -176,3 +176,94 @@ def test_factory_without_device_uses_the_session_device(sess):
     small = Call("aten.full.default", [[2, 3], 1.5, None, None, None, None])
     kind, got = worker(sess, small, [(torch.float32, (2, 3))])
     assert kind == "ran" and torch.equal(got[0], torch.full((2, 3), 1.5))
+
+
+# ADR-043: found once the parity test covered losses, norms, distances, FFT,
+# grid sampling and the fused optimizers.
+
+
+def unsafe_043():
+    a, b = r(2, 4, 3), r(2, 5, 3)
+    cd = A._cdist_forward.default(a, b, 2.0, None)
+    x2 = r(5, 3)
+    pd = A._pdist_forward.default(x2, 2.0)
+    x, w = r(4, 3, 5), r(3)
+    g3, x3 = r(1, 2, 3, 3, 3), r(1, 2, 3, 4, 5)
+    grid3 = r(1, 3, 3, 3, 3).tanh()
+    p, gr = [r(3, 4), r(5)], [r(3, 4), r(5)]
+    z = [torch.zeros(3, 4), torch.zeros(5)]
+    st = [torch.ones(()), torch.ones(())]
+    adam = [p, gr, z, z, [], st, 1e-3, 0.9, 0.999, 0.0, 1e-8, False, False, None, None]
+    return [
+        ("cdist backward: grad_output with an empty dim",
+         Call("aten._cdist_backward.default", [r(2, 4, 0), a, b, 2.0, cd])),
+        ("cdist backward: x1 with another feature size",
+         Call("aten._cdist_backward.default", [r(*cd.shape), r(2, 4, 4), b, 2.0, cd])),
+        ("pdist backward: empty grad_output", Call("aten._pdist_backward.default", [r(0), x2, 2.0, pd])),
+        ("pdist backward: pdist shorter", Call("aten._pdist_backward.default", [r(10), x2, 2.0, pd[:9]])),
+        ("rfft: a negative dim", Call("aten._fft_r2c.default", [r(3, 6), [-2, 1], 0, True])),
+        ("irfft: a negative dim",
+         Call("aten._fft_c2r.default", [torch.randn(3, 4, dtype=torch.complex64), [-2, 1], 2, 6])),
+        ("batch_norm: a 0-d weight", Call("aten.native_batch_norm.default",
+                                          [x, r(), None, torch.zeros(3), torch.ones(3), True, 0.1, 1e-5])),
+        ("batch_norm: float64 running_mean beside float32 input",
+         Call("aten.native_batch_norm.default", [x, w, None, torch.zeros(3, dtype=torch.float64), torch.ones(3),
+                                                 True, 0.1, 1e-5])),
+        ("grid_sampler_3d backward: an unknown interpolation mode",
+         Call("aten.grid_sampler_3d_backward.default", [g3, x3, grid3, -1, 0, False, [True, True]])),
+        ("layer_norm backward: grad_out with an empty dim",
+         Call("aten.native_layer_norm_backward.default",
+              [r(4, 3, 0), r(4, 3, 5), [5], r(4, 3, 1), r(4, 3, 1), r(5), r(5), [True, True, True]])),
+        ("fused adam: exp_avgs shorter than the param",
+         Call("reflop.fused_adam.default", [p, gr, [torch.zeros(3, 3), z[1]], z, [], st, *adam[6:]])),
+        ("fused adam: a state step of two elements",
+         Call("reflop.fused_adam.default", [p, gr, z, z, [], [torch.ones(2), st[1]], *adam[6:]])),
+        ("fused adamw: max_exp_avg_sqs shorter, amsgrad",
+         Call("reflop.fused_adamw.default", [p, gr, z, z, [torch.zeros(2), z[1]], st, *adam[6:11], True, False,
+                                             None, None])),
+        ("fused sgd: momentum buffer shorter",
+         Call("reflop.fused_sgd.default", [p, gr, [torch.zeros(3, 3), z[1]], 0.0, 0.9, 0.1, 0.0, False, False,
+                                           False, None, None])),
+        ("fused adagrad: state_sums of another dtype",
+         Call("reflop.fused_adagrad.default", [p, gr, [z[0].double(), z[1]], st, 1e-2, 0.0, 0.0, 1e-10, False,
+                                               None, None])),
+        ("amp unscale: an empty found_inf",
+         Call("reflop.amp_unscale_and_check.default", [gr, torch.zeros(0), torch.tensor([0.5])])),
+        ("binary_cross_entropy: input outside [0, 1]",
+         Call("aten.binary_cross_entropy.default", [r(4, 5), torch.rand(4, 5), None, 1])),
+        ("binary_cross_entropy: target outside [0, 1]",
+         Call("aten.binary_cross_entropy.default", [torch.rand(4, 5), r(4, 5), None, 1])),
+    ]
+
+
+UNSAFE_043 = unsafe_043()
+
+
+@pytest.mark.parametrize("case", UNSAFE_043, ids=[c[0] for c in UNSAFE_043])
+def test_rejected_before_any_kernel_043(sess, case):
+    test_rejected_before_any_kernel(sess, case)
+
+
+def test_strict_ops_accept_what_autograd_passes(sess):
+    # STRICT ops may refuse more than PyTorch, so a false rejection there is
+    # not reported by the parity test; their seeds (calls PyTorch itself
+    # makes) must all pass.
+    from parity import STRICT, seeds
+
+    deliberate = {"aten._ctc_loss_backward.Tensor"}  # lengths go as int lists (ADR-032)
+    refused = []
+    for c in seeds():
+        if c.op in STRICT and c.op not in deliberate:
+            _, err = infer_outputs(sess, c)
+            if err is not None:
+                refused.append(f"{c.op}: {err.message[:200]}")
+    assert not refused, "\n".join(refused)
+
+
+def test_one_element_strided_views_read_back(sess):
+    # reshape(-1) keeps the stride of a size-1 dim; reading x[::12] failed
+    # with "self.stride(-1) must be 1 to view Float as Byte".
+    for size, step in ((10, 12), (5, 7), (1, 3)):
+        call = Call("aten.slice.Tensor", [torch.arange(float(size)), 0, None, None, step])
+        kind, got = worker(sess, call, [(torch.float32, (1,))])
+        assert kind == "ran" and got[0].tolist() == [0.0], (kind, got)

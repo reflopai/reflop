@@ -259,7 +259,7 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 244 | `aten.smooth_l1_loss_backward.default` | RESTRICTED | reduction |  |
 | 245 | `aten.huber_loss.default` | RESTRICTED | reduction |  |
 | 246 | `aten.huber_loss_backward.default` | RESTRICTED | reduction |  |
-| 247 | `aten.binary_cross_entropy.default` | RESTRICTED | reduction |  |
+| 247 | `aten.binary_cross_entropy.default` | RESTRICTED | bce |  |
 | 248 | `aten.binary_cross_entropy_backward.default` | RESTRICTED | reduction |  |
 | 249 | `aten.binary_cross_entropy_with_logits.default` | RESTRICTED | reduction |  |
 | 250 | `aten.soft_margin_loss.default` | RESTRICTED | reduction |  |

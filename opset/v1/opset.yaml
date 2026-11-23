@@ -5865,7 +5865,7 @@ ops:
   category: loss
   flags:
   - RESTRICTED
-  validator: reduction
+  validator: bce
   devices:
   - cuda
   - cpu
