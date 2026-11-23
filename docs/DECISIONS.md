@@ -1106,3 +1106,37 @@ reFLOP tensor, `is_conj()` is `False` where PyTorch reports `True`, and
 first. Other clients can still send `aten._conj` and get plain values back.
 The fix is in both the client and the worker. An updated client works with
 an older reflopd.
+
+## ADR-040: Validate view backward ops against `input_sizes`
+
+**Context.** `select_backward`, `diagonal_backward` and `slice_backward` take
+`grad_output`, `input_sizes` and the forward view's arguments. V3 checked
+every dim-like argument against the rank of the first tensor input, which here
+is `grad_output`. For `select_backward` and `diagonal_backward` that tensor has
+one dim fewer than the input, so valid graphs were rejected: a `select` or
+`.real`/`.imag` on any dim past the first, and most `diagonal` dims, could not
+be differentiated. PyTorch's meta kernels for the three ops return
+`empty(input_sizes)` and check nothing else. V4 passed graphs with an
+out-of-range index, identical diagonal dims or a `grad_output` of the wrong
+shape. The device kernels then allocated `zeros(input_sizes)` and raised on
+the host, which breaks I3.
+
+**Decision.** For an op with an `input_sizes` list, V3 checks the dims against
+`len(input_sizes)`. `meta.OVERRIDES` gives the three ops a V4 meta function.
+It builds a meta tensor of `input_sizes`, runs the forward view on it
+(`select`, `diagonal` or `slice`, which check dim, index and offset), and
+requires `grad_output` to have that view's exact shape. The output limits
+apply to the result as before.
+
+**Alternatives.** Adding the three ops to `DIM_PLUS_ONE` would fix the
+rejection for `select_backward` and `diagonal_backward`, but it ties the
+check to `grad_output`'s rank and leaves V4 checking nothing. PyTorch's
+kernels broadcast a smaller `grad_output`; the exact shape is stricter than
+that, but autograd always gives the exact shape.
+
+**Consequences.** Training that reads one position of a dim, such as
+`x[:, -1]`, works on reFLOP. A malformed graph for these ops fails at
+registration instead of after an allocation. The forward scatter ops
+(`select_scatter`, `slice_scatter`, `diagonal_scatter`,
+`as_strided_scatter`) have the same unchecked meta kernels and are left for a
+separate change (`docs/THREAT_MODEL.md`, residual risks).

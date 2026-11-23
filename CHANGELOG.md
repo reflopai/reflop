@@ -15,6 +15,15 @@
 - The in-process worker (`reflop.device(local=...)`, `reflop verify`) runs with
   the dispatch state of a worker process. Its results no longer change when a
   flush starts inside PyTorch dispatch, as `.cpu()` does.
+- Backward through `select` and `diagonal` works on every dim. reflopd checked
+  the dims of `select_backward` and `diagonal_backward` against `grad_output`,
+  which has fewer dims than the input. So `x[:, 0].sum().backward()`,
+  `x[..., -1]`, `.real`, `.imag` and most `diagonal(dim1, dim2)` grads were
+  rejected with `INVALID_GRAPH`. Owners: update reflopd.
+- reflopd now rejects a `select_backward`, `diagonal_backward` or
+  `slice_backward` with an out-of-range index, identical diagonal dims, or a
+  `grad_output` that does not fit `input_sizes` at registration. Before, these
+  graphs registered, and the kernel allocated its output before it raised.
 
 ## 0.2.7 (2026-11-22)
 
