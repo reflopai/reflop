@@ -49,9 +49,38 @@ def _ctc_loss_backward(node, pos, kw):
     return torch.empty(tuple(lp.shape), dtype=lp.dtype, device="meta")
 
 
-# aten ops that PyTorch ships without a meta kernel; each one checks its
-# inputs itself.
-OVERRIDES = {"aten._ctc_loss_backward.default": _ctc_loss_backward}
+def _view_backward(view):
+    """select_backward, diagonal_backward and slice_backward.
+
+    PyTorch's meta kernels for these return empty(input_sizes) and check
+    nothing; the device kernels allocate zeros(input_sizes) and only then
+    find a bad index, identical diagonal dims or a grad_output that does not
+    fit. Run the forward view on a meta tensor of input_sizes instead (it
+    checks dim, index and offset) and require grad_output to have the view's
+    exact shape, as autograd gives it."""
+
+    def infer(node, pos, kw):
+        a = validators._named(node, pos, kw)
+        grad = a["grad_output"]
+        base = torch.empty(a["input_sizes"], dtype=grad.dtype, device="meta")
+        want = tuple(view(base, a).shape)
+        if tuple(grad.shape) != want:
+            raise RuntimeError(f"grad_output has shape {list(grad.shape)}; this view of input_sizes "
+                               f"{list(a['input_sizes'])} has shape {list(want)}")
+        return torch.empty(a["input_sizes"], dtype=grad.dtype, device="meta")
+
+    return infer
+
+
+# aten ops that PyTorch ships without a meta kernel, or with one that checks
+# nothing; each one checks its inputs itself.
+OVERRIDES = {
+    "aten._ctc_loss_backward.default": _ctc_loss_backward,
+    "aten.select_backward.default": _view_backward(lambda b, a: b.select(a["dim"], a["index"])),
+    "aten.diagonal_backward.default": _view_backward(lambda b, a: b.diagonal(a["offset"], a["dim1"], a["dim2"])),
+    "aten.slice_backward.default": _view_backward(
+        lambda b, a: torch.ops.aten.slice.Tensor(b, a["dim"], a["start"], a["end"], a["step"])),
+}
 
 
 def infer(prog: Program, limits: cpb.Limits) -> None:

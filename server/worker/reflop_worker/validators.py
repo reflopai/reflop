@@ -557,7 +557,8 @@ DIM_PLUS_ONE = ("aten.unsqueeze", "aten.stack", "aten.unsqueeze_copy", "aten.dia
 
 def check_dims(node, args, kwargs) -> None:
     """V3 for every op: dim-like arguments must address a real dimension of
-    the first tensor input (§9.2: "dim within rank")."""
+    the first tensor input (§9.2: "dim within rank"). For ops that take an
+    input_sizes list, the dims address that input instead."""
     named = _named(node, args, kwargs)
     first = next((v for v in named.values() if isinstance(v, torch.Tensor)), None)
     if first is None:
@@ -565,7 +566,15 @@ def check_dims(node, args, kwargs) -> None:
         first = lst[0] if lst else None
     if first is None:
         return
-    rank = max(first.dim(), 1)
+    ndim = first.dim()
+    sizes = named.get("input_sizes")
+    if isinstance(sizes, list):
+        # select_backward, diagonal_backward and slice_backward: grad_output
+        # can have fewer dims than the input it is the gradient of. The meta
+        # kernel (V4) still checks index, offset and shapes against
+        # input_sizes before anything is allocated.
+        ndim = len(sizes)
+    rank = max(ndim, 1)
     if node.op.name.startswith(DIM_PLUS_ONE):
         rank += 1
     for spec in node.op.args:
@@ -575,7 +584,7 @@ def check_dims(node, args, kwargs) -> None:
         vals = v if isinstance(v, list) else [v]
         for d in vals:
             if isinstance(d, int) and not isinstance(d, bool) and not -rank <= d < rank:
-                raise invalid(f"{node.op.name}: {spec.name}={d} is out of range for a {first.dim()}-d input",
+                raise invalid(f"{node.op.name}: {spec.name}={d} is out of range for a {ndim}-d input",
                               cpb.STAGE_V3_SCHEMA, node.index, node.op.id)
 
 

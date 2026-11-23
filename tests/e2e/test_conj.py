@@ -128,8 +128,6 @@ def test_conj_autograd(dev):
     close(rz.grad, z.grad)
 
 
-@pytest.mark.xfail(strict=True, reason="select_backward's dim is validated against grad_output's rank, not "
-                   "input_sizes (fails for real float tensors too)")
 @pytest.mark.parametrize("part", ["real", "imag"])
 def test_conj_part_autograd(dev, part):
     z = cplx(5).requires_grad_(True)
