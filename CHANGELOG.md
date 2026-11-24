@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.11 (2026-11-24)
 
 - New GPU pairings use short names like `nvidia-mx450` and `nvidia-h100-2`.
   Change a saved name with `reflop rename <old> <new>`.
