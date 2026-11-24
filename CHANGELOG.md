@@ -1,7 +1,19 @@
 # Changelog
 
-## Unreleased
+## 0.2.9 (2026-11-24)
 
+This patch strengthens worker validation and fixes in-process CUDA checkpoint
+corruption and explicit session selection. The wire protocol and supported
+operator list are unchanged.
+
+- The worker checks more operator arguments before allocating outputs and
+  validates additional inputs before launching their kernels.
+- Graph memory estimates account for storage held alive by views and for
+  copies made when returning non-contiguous views.
+- CI compares worker validation with native PyTorch kernels and fuzzes graph
+  registration and execution. A longer fuzz run is scheduled nightly.
+- Serialization handles one-element strided tensors in TensorPack uploads
+  and worker results and snapshots.
 - Reopening an in-process CUDA session no longer corrupts snapshots or
   checkpoints. Closing or replacing the local worker now waits for the
   writer and unregisters its staging buffers before releasing them.
