@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-25)
 
 The worker checks more of what a Guest sends (ADR-049 to ADR-051). Update
 the daemon and the client together: an older client works with this daemon,

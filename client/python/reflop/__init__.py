@@ -30,7 +30,7 @@ from .capture import CaptureError, capture
 from .errors import OutOfMemoryError, ReflopError, ReflopRemoteError, SessionLostError
 from .trace import UnsupportedOperatorError
 
-__version__ = "0.2.11"
+__version__ = "0.3.0"
 
 __all__ = [
     "device", "capture", "CaptureError", "fetch", "placement", "seed", "step_boundary", "synchronize", "close", "stats", "usage",
