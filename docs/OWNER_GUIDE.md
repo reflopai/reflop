@@ -138,6 +138,20 @@ command to run.
 
 Authentication is required on every bind. TLS 1.3 protects the traffic.
 
+If pairing reports “connection refused,” check `reflopd status` and make sure
+the daemon is listening on the address and port in the invite. If you use
+UFW and it blocks the connection, allow inbound TCP on the daemon's port.
+For the default port, run this on the Owner's machine.
+
+```sh
+sudo ufw allow 7460/tcp
+```
+
+Use the port from `--listen` if you changed it. To limit access to a specific
+Guest, use `sudo ufw allow proto tcp from <guest-ip> to any port 7460`.
+If you're using SSH pipe mode, Guests only need to reach the SSH port.
+[Ubuntu's firewall guide](https://ubuntu.com/server/docs/how-to/security/firewalls/)
+
 ## SSH pipe mode
 
 If `sshd` already runs and you would rather not open a port, Guests can reach

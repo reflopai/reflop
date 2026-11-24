@@ -98,6 +98,9 @@ unless the Owner passes `--accept-weak-isolation`.
   belongs to that same pairing. Existing host-wide identities retain their
   prior access. A GPU UUID identifies a card and the pinned daemon key
   authenticates the endpoint.
+- Pairing aliases live on the Guest. `reflop status` checks the pinned
+  daemon key and authenticates the saved identity before reporting the
+  advertised device as online. The check opens no compute session (ADR-048).
 - Unpair (ADR-025): accepted only after authentication, and it revokes only
   the connection's own identity. A Guest can give up its own access, never
   another's, and it deletes no data; deletion is the Owner's `reflopd

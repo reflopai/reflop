@@ -28,6 +28,11 @@ reflop pair reflop1-…
 reflop status
 ```
 
+`reflop status` shows which pairings are online. Use
+`reflop rename <old> <new>` to change a local pairing name such as
+`nvidia-h100`. If TLS pairing reports “connection refused,” check the
+daemon and firewall on the Owner's machine. [Owner network setup](https://github.com/reflopai/reflop/blob/main/docs/OWNER_GUIDE.md#network-exposure)
+
 Then move your model to the reFLOP device:
 
 ```python

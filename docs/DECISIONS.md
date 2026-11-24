@@ -1491,3 +1491,25 @@ same Guest. Index-based grants could change scope when the GPU order changes.
 GPU invites require updated clients. Clients choose a default for future
 sessions with `reflop use`. Selecting explicit CPU placement still uses the
 pairing's own identity.
+
+## ADR-048: Local GPU names and authenticated status
+
+**Context.** GPU pairing names repeat the address shown by `reflop status`.
+Guests also need to know whether a paired GPU is available and change its
+name after pairing.
+
+**Decision.** Derive new GPU aliases from the reported model and add numeric
+suffixes starting at `-2` when a name is already in use. The address stays
+in its own column. `reflop rename` updates the saved alias and the default
+in a single configuration write. The status list checks each pairing using
+the existing pinned handshake and reads the advertised devices without
+opening a compute session.
+
+**Alternatives.** Including the address in the alias made it longer.
+A port check alone could pass even when the pairing was revoked or the
+GPU was unavailable. Opening a compute session could start a worker.
+
+**Consequences.** Previously saved aliases still work. Renaming changes
+the name used by Guest commands and scripts. An offline row can mean that
+the endpoint is unreachable, authentication failed, or the paired GPU is
+absent from the device list.

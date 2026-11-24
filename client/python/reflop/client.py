@@ -14,6 +14,7 @@ import collections
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import shlex
 import shutil
@@ -24,11 +25,13 @@ import subprocess
 import threading
 import time
 
+from google.protobuf.message import DecodeError
+
 from . import _debug, _sshhost, keys
 from ._pb import auth_pb2 as apb
 from ._pb import compute_pb2 as cpb
 from ._pb import graph_pb2 as gpb
-from .config import GPU_UUID, ClientConfig, ServerEntry, config_lock
+from .config import GPU_UUID, ClientConfig, ServerEntry, config_lock, validate_pairing_name
 from .connection import Connection
 from .errors import NotPairedError, ReflopError, ReflopRemoteError, ServerKeyMismatch, SessionLostError, sanitize
 
@@ -128,13 +131,21 @@ def spki_fingerprint(der_cert: bytes) -> bytes:
     return hashlib.sha256(spki).digest()
 
 
-def dial_tls(addresses: list[str], fingerprint: bytes, timeout: float = 15.0) -> Framer:
+class TLSConnectionRefused(ReflopError):
+    def __init__(self, message: str, ports: list[int]) -> None:
+        super().__init__(message)
+        self.ports = tuple(dict.fromkeys(ports))
+
+
+def dial_tls(addresses: list[str], fingerprint: bytes, timeout: float = 15.0,
+             *, read_timeout: float | None = None) -> Framer:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE  # replaced by the pinned SPKI check below
     ctx.set_alpn_protocols(["reflop/1"])
     last: Exception | None = None
+    refused_ports = []
     for addr in addresses:
         host, _, port = addr.rpartition(":")
         host = host.strip("[]")
@@ -150,7 +161,7 @@ def dial_tls(addresses: list[str], fingerprint: bytes, timeout: float = 15.0) ->
                     "This could be an impersonation attempt; nothing was sent. If the Owner reinstalled reflopd, "
                     "pair again with a new invite.")
             _debug.log(f"TLS: connected to {addr}, server key matches the pinned key")
-            tls.settimeout(None)
+            tls.settimeout(read_timeout)
             tls.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             f = tls.makefile("rwb", buffering=1 << 20)
 
@@ -168,7 +179,12 @@ def dial_tls(addresses: list[str], fingerprint: bytes, timeout: float = 15.0) ->
         except OSError as e:
             _debug.log(f"TLS: {addr}: {e}")
             last = e
-    raise ReflopError(f"could not reach the server ({', '.join(addresses)}): {last}")
+            if isinstance(e, ConnectionRefusedError):
+                refused_ports.append(int(port))
+    message = f"could not reach the server ({', '.join(addresses)}): {last}"
+    if refused_ports:
+        raise TLSConnectionRefused(message, refused_ports)
+    raise ReflopError(message)
 
 
 def ssh_command(target: str, keyfile, fingerprint_hex: str, host_keys: list[str],
@@ -238,17 +254,28 @@ class SshStderr:
 
 
 def dial_ssh(target: str, key, fingerprint_hex: str, host_keys: list[str], port: int | None = None,
-             *, key_id: str = "") -> Framer:
+             *, key_id: str = "", timeout: float | None = None) -> Framer:
     cmd = ssh_command(target, keys.ssh_key_file(key, key_id), fingerprint_hex, host_keys, port, key_id=key_id)
     _debug.log(f"ssh: starting {shlex.join(cmd)}")
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    timer = None
+    if timeout is not None:
+        timer = threading.Timer(timeout, p.kill)
+        timer.daemon = True
+        timer.start()
 
     def close():
+        if timer is not None:
+            timer.cancel()
+            p.kill()
+            p.wait()
+            p.stdout.close()
         try:
             p.stdin.close()
         except OSError:
             pass
-        p.terminate()
+        if timer is None:
+            p.terminate()
 
     fr = Framer(p.stdout, p.stdin, close)
     fr.stderr_tail = SshStderr(p.stderr)
@@ -338,8 +365,8 @@ def pair(code: str, name: str | None = None) -> ServerEntry:
     with config_lock():
         cfg = ClientConfig.load()
         _check_not_paired(cfg, fp.hex(), inv.gpu_uuid)
-        if name is not None and (not name.strip() or name.startswith("-") or sanitize(name, 80) != name):
-            raise ReflopError("invalid pairing name")
+        if name is not None:
+            validate_pairing_name(name)
         name = name or _default_name(inv, cfg)
         if name in cfg.servers:
             raise ReflopError(f"the pairing name {name!r} is already in use; pick another --name")
@@ -436,22 +463,78 @@ def _check_not_paired(cfg: ClientConfig, fingerprint_hex: str, gpu_uuid: str = "
                 f"run `reflopd unpair {s.identity}`; then ask them for a new invite.")
 
 
-def _default_name(inv, cfg) -> str:
+def _default_name(inv: apb.InviteCode, cfg: ClientConfig) -> str:
     base = "gpu"
-    if inv.addresses:
+    separator = ""
+    if inv.gpu_uuid:
+        words = re.findall(r"[a-z0-9]+", sanitize(inv.gpu_name, 80).lower())
+        if words and words[0] in ("nvidia", "geforce", "quadro", "tesla"):
+            model = [word for word in words if not re.fullmatch(
+                r"nvidia|geforce|quadro|tesla|[0-9]+gb|hbm[0-9]*e?|pcie|sxm[0-9]*", word)]
+            words = ["nvidia", *(model or [inv.gpu_uuid[-8:]])]
+        base = "-".join(words)[:64].rstrip("-") or f"gpu-{inv.gpu_uuid[-8:]}"
+        separator = "-"
+    elif inv.addresses:
         host = inv.addresses[0].split("@")[-1].rsplit(":", 1)[0].strip("[]")
         if host and host not in ("127.0.0.1", "localhost", "::1"):
             base = "".join(ch for ch in host if ch.isalnum() or ch in "-_.")[:32] or "gpu"
-    if inv.gpu_uuid:
-        model = "-".join("".join(ch.lower() if ch.isalnum() else " " for ch in inv.gpu_name).split())
-        base = f"{base}-{model[:32] or inv.gpu_uuid[-8:]}"
     name, i = base, 2
     while name in cfg.servers:
-        name, i = f"{base}{i}", i + 1
+        name, i = f"{base}{separator}{i}", i + 1
     return name
 
 
 # ---------------------------------------------------------------- connection
+
+
+def _authenticated_framer(entry: ServerEntry, key, fp: bytes, *, timeout: float | None = None):
+    _debug.log(f"connecting to {entry.name} ({entry.transport}, {', '.join(entry.addresses)})")
+    ssh = entry.transport == "ssh"
+    if ssh:
+        fr = dial_ssh(entry.addresses[0], key, entry.fingerprint, entry.ssh_host_keys,
+                      entry.ssh_port, key_id=entry.key_id, timeout=timeout)
+    elif timeout is not None:
+        fr = dial_tls(entry.addresses, fp, timeout, read_timeout=timeout)
+    else:
+        fr = dial_tls(entry.addresses, fp)
+    try:
+        try:
+            hr = _hello(fr)
+            if not hmac.compare_digest(hr.server_key_fingerprint, fp):
+                raise ServerKeyMismatch("the server's key does not match the pinned key")
+            _debug.log("handshake: server key matches the pinned key")
+            try:
+                auth = _authenticate(fr, key, hr.server_nonce, fp)
+            except ReflopRemoteError as e:
+                if e.code != cpb.ERROR_UNAUTHENTICATED:
+                    raise
+                raise NotPairedError(e.code, not_paired_message(entry)) from None
+            _verify_pairing(auth, entry.gpu_uuid, entry.identity_id)
+        except (EOFError, OSError):
+            if not ssh:
+                raise
+            raise ssh_closed(
+                entry.addresses[0], fr,
+                f" If sshd rejected this machine's key, the Owner has probably unpaired you: run `reflop unpair "
+                f"{entry.name}` to forget this server. `reflop doctor` checks the connection.") from None
+    except BaseException:
+        fr.close()
+        raise
+    _debug.log(f"authenticated as {sanitize(auth.identity_name, 64)!r}")
+    return fr, auth
+
+
+def pairing_online(entry: ServerEntry) -> bool:
+    """Check the pairing's advertised devices with a short authentication probe."""
+    try:
+        key = keys.pairing_key(entry.key_id) if entry.key_id else keys.load_existing()
+        fr, auth = _authenticated_framer(entry, key, bytes.fromhex(entry.fingerprint), timeout=3.0)
+        fr.close()
+    except (ReflopError, OSError, EOFError, ValueError, DecodeError) as e:
+        _debug.log(f"status: {entry.name}: {e}")
+        return False
+    return any(d.device.kind == gpb.DEVICE_CUDA or (not entry.gpu_uuid and d.device.kind == gpb.DEVICE_CPU)
+               for d in auth.capabilities.devices)
 
 
 class RemoteConnection(Connection):
@@ -486,39 +569,7 @@ class RemoteConnection(Connection):
         return peer
 
     def _open(self) -> None:
-        _debug.log(f"connecting to {self.entry.name} ({self.entry.transport}, {', '.join(self.entry.addresses)})")
-        if self.entry.transport == "ssh":
-            self.fr = dial_ssh(self.entry.addresses[0], self.key, self.entry.fingerprint, self.entry.ssh_host_keys,
-                               self.entry.ssh_port, key_id=self.entry.key_id)
-        else:
-            self.fr = dial_tls(self.entry.addresses, self.fp)
-        try:
-            hr = _hello(self.fr)
-            if not hmac.compare_digest(hr.server_key_fingerprint, self.fp):
-                self.fr.close()
-                raise ServerKeyMismatch("the server's key does not match the pinned key")
-            _debug.log("handshake: server key matches the pinned key")
-            try:
-                self.auth = _authenticate(self.fr, self.key, hr.server_nonce, self.fp)
-            except ReflopRemoteError as e:
-                self.fr.close()
-                if e.code != cpb.ERROR_UNAUTHENTICATED:
-                    raise
-                raise NotPairedError(e.code, not_paired_message(self.entry)) from None
-            try:
-                _verify_pairing(self.auth, self.entry.gpu_uuid, self.entry.identity_id)
-            except ReflopError:
-                self.fr.close()
-                raise
-        except (EOFError, OSError):
-            self.fr.close()
-            if self.entry.transport != "ssh":
-                raise
-            raise ssh_closed(
-                self.entry.addresses[0], self.fr,
-                f" If sshd rejected this machine's key, the Owner has probably unpaired you: run `reflop unpair "
-                f"{self.entry.name}` to forget this server. `reflop doctor` checks the connection.") from None
-        _debug.log(f"authenticated as {sanitize(self.auth.identity_name, 64)!r}")
+        self.fr, self.auth = _authenticated_framer(self.entry, self.key, self.fp)
         lim = self.auth.capabilities.limits
         self.fr.max_frame = frame_limit(lim.max_frame_bytes)
         if lim.max_fetch_bytes:

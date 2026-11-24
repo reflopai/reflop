@@ -840,6 +840,7 @@ The client never builds CUDA code, so the server's CUDA, driver and PyTorch vers
 | `reflop init` | Hello, cache capabilities, measure bandwidth/RTT/local performance, write `.reflop.toml` |
 | `reflop data build / push / ls / rm` | TensorPacks (§10) |
 | `reflop status` / `reflop usage` / `reflop doctor` | Diagnostics, compute used on the server |
+| `reflop rename <old> <new>` | Change a local pairing name (ADR-048) |
 | `reflop update` / `reflop version` | Update the client from a signed release (ADR-010, ADR-021) |
 | `reflop run python train.py` | Runs **locally** with reFLOP auto-enabled (shim mode, best effort, M6). Output and docs state clearly that the program runs on the client. |
 | `reflop verify` | Cross-check small graphs against local CPU |

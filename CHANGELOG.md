@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- New GPU pairings use short names like `nvidia-mx450` and `nvidia-h100-2`.
+  Change a saved name with `reflop rename <old> <new>`.
+- `reflop status` shows whether each pairing is online in a compact table.
+- When a TLS connection is refused during pairing, the client shows how to
+  allow the refused port through UFW on the Owner's machine.
+
 ## 0.2.10 (2026-11-24)
 
 - Owners can list cards with `reflopd gpu list`, choose which ones to share

@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sys
 import time
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 
 from .. import _debug
 from .._pb import compute_pb2 as cpb
@@ -21,6 +25,7 @@ the server, which runs whitelisted tensor operators and nothing else.
   reflop pair <invite-code>         add a GPU pairing
   reflop unpair [name]              forget a pairing and give up its access
   reflop status                     list pairings
+  reflop rename <old> <new>         change a pairing's local name
   reflop use <name>                 choose the default pairing
   reflop usage                      compute you have used on the server
   reflop data push ./pack --name d  upload a dataset once
@@ -35,9 +40,19 @@ def _p(*a) -> None:
 
 
 def cmd_pair(a) -> int:
-    from ..client import pair
+    from ..client import TLSConnectionRefused, pair
 
-    e = pair(a.code, a.name)
+    try:
+        e = pair(a.code, a.name)
+    except TLSConnectionRefused as exc:
+        if _debug.enabled():
+            raise
+        sys.stderr.write(f"reflop: {sanitize(str(exc))}\n")
+        sys.stderr.write("Warning: Check that reflopd is listening on the Owner's address and port and that "
+                         "the firewall allows it. With UFW, run on the Owner's machine:\n")
+        for port in exc.ports:
+            sys.stderr.write(f"  sudo ufw allow {port}/tcp\n")
+        return 1
     card = f" ({e.gpu_name or e.gpu_uuid})" if e.gpu_uuid else ""
     _p(f"paired with {e.name}{card} as {e.identity!r} ({e.transport}, {sanitize(', '.join(e.addresses))})")
     _p(f"server key pinned: {e.fingerprint[:16]}…")
@@ -114,6 +129,30 @@ def cmd_use(a) -> int:
     return 0
 
 
+def cmd_rename(a) -> int:
+    from ..config import ClientConfig, config_lock, validate_pairing_name
+
+    validate_pairing_name(a.new_name)
+    with config_lock():
+        cfg = ClientConfig.load()
+        if a.old_name not in cfg.servers:
+            raise ValueError(f"no pairing named {a.old_name!r} (see `reflop status`)")
+        if a.old_name == a.new_name:
+            return 0
+        if a.new_name in cfg.servers:
+            raise ValueError(f"the pairing name {a.new_name!r} is already in use")
+        cfg.servers = {
+            (a.new_name if name == a.old_name else name):
+            (replace(server, name=a.new_name) if name == a.old_name else server)
+            for name, server in cfg.servers.items()
+        }
+        if cfg.default == a.old_name:
+            cfg.default = a.new_name
+        cfg.save()
+    _p(f"renamed {a.old_name!r} to {a.new_name!r}")
+    return 0
+
+
 def cmd_key(a) -> int:
     from .. import keys
 
@@ -144,19 +183,70 @@ def _caps_summary(caps) -> list[str]:
     return out
 
 
+def _char_width(char: str) -> int:
+    if unicodedata.category(char) in ("Mn", "Me"):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in ("F", "W") else 1
+
+
+def _display_width(text: str) -> int:
+    return sum(map(_char_width, text))
+
+
+def _table_cell(text: str, width: int) -> str:
+    used = _display_width(text)
+    if used > width:
+        used = 0
+        for i, char in enumerate(text):
+            n = _char_width(char)
+            if used + n >= width:
+                text = text[:i] + "…"
+                used += 1
+                break
+            used += n
+    return text + " " * (width - used)
+
+
+def _print_status_table(rows: list[tuple[str, str, str, str, str]]) -> None:
+    header = (" ", "NAME", "STATUS", "GPU", "ADDRESS")
+    minimums = [len(label) for label in header[1:]]
+    widths = [max(len(label), *(_display_width(row[i]) for row in rows))
+              for i, label in enumerate(header) if i]
+    interactive = sys.stdout.isatty()
+    if interactive:
+        # Reserve two columns for the default marker and one per gap.
+        available = max(sum(minimums), shutil.get_terminal_size().columns - 5)
+        while sum(widths) > available:
+            i = max(range(len(widths)), key=lambda i: widths[i] - minimums[i])
+            widths[i] -= 1
+    color = interactive and not os.environ.get("NO_COLOR")
+    for mark, *values in (header, *rows):
+        cells = [_table_cell(value, width) for value, width in zip(values, widths, strict=True)]
+        if color and values[1] in ("online", "offline"):
+            status_color = 32 if values[1] == "online" else 31
+            cells[1] = f"\x1b[{status_color}m{values[1]}\x1b[0m" + cells[1][len(values[1]):]
+        _p(f"{mark} " + " ".join(cells).rstrip())
+
+
 def cmd_status(a) -> int:
     if a.server is None:
+        from ..client import pairing_online
         from ..config import ClientConfig
 
         cfg = ClientConfig.load()
         if not cfg.servers:
             _p("no pairings (reflop pair <invite-code>)")
             return 0
-        _p("  NAME              GPU                          ADDRESS")
-        for name, entry in cfg.servers.items():
-            mark = "*" if name == cfg.default else " "
-            card = entry.gpu_name or entry.gpu_uuid or "host-wide"
-            _p(f"{mark} {name:<17} {card:<28} {sanitize(', '.join(entry.addresses))}")
+        rows = []
+        with ThreadPoolExecutor(max_workers=8) as probes:
+            for (name, entry), online in zip(cfg.servers.items(), probes.map(pairing_online, cfg.servers.values()),
+                                             strict=True):
+                card = entry.gpu_name or entry.gpu_uuid or "host-wide"
+                label = "".join(char if char.isprintable() else " " for char in sanitize(name))
+                rows.append(("*" if name == cfg.default else " ", label,
+                             "online" if online else "offline", " ".join(sanitize(card).split()),
+                             " ".join(sanitize(", ".join(entry.addresses)).split())))
+        _print_status_table(rows)
         if not cfg.default:
             _p("choose a default with reflop use <name>")
         return 0
@@ -534,6 +624,10 @@ def main(argv: list[str] | None = None) -> int:
                    help="also store the private key as ~/.config/reflop/id_ed25519 (needed by libreflop on macOS)")
     p.set_defaults(fn=cmd_key)
     sub.add_parser("status", help="list pairings, or show live details with --server").set_defaults(fn=cmd_status)
+    p = sub.add_parser("rename", help="change a pairing's local name")
+    p.add_argument("old_name")
+    p.add_argument("new_name")
+    p.set_defaults(fn=cmd_rename)
     p = sub.add_parser("use", help="choose the default pairing")
     p.add_argument("name")
     p.set_defaults(fn=cmd_use)

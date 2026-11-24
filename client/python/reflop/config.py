@@ -16,7 +16,14 @@ import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .errors import ReflopError, sanitize
+
 GPU_UUID = re.compile(r"gpu-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
+
+
+def validate_pairing_name(name: str) -> None:
+    if not name.strip() or name.startswith("-") or not name.isprintable() or sanitize(name, 80) != name:
+        raise ReflopError("invalid pairing name")
 
 
 def config_dir() -> Path:
@@ -28,7 +35,7 @@ def config_dir() -> Path:
 
 @contextlib.contextmanager
 def config_lock():
-    """Serialize pairing and default changes across CLI processes."""
+    """Serialize changes to pairings and the default across CLI processes."""
     directory = config_dir()
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(directory / "servers.lock", os.O_CREAT | os.O_RDWR, 0o600)
