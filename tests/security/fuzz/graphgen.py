@@ -20,6 +20,7 @@ Every case comes from (seed, index) alone, so a failure replays exactly.
 from __future__ import annotations
 
 import math
+import os
 import random
 from dataclasses import dataclass, field
 
@@ -269,7 +270,8 @@ class _Pool:
     def __init__(self) -> None:
         from parity import all_cases
 
-        self.calls = [c for c in all_cases() if not SPEC[c.op].name.startswith("reflop.")]
+        cuda = os.environ.get("REFLOP_FUZZ_DEVICE") == "cuda"
+        self.calls = [c for c in all_cases(cuda=cuda) if not SPEC[c.op].name.startswith("reflop.")]
         self.seeds = [c for c in self.calls if c.label == "seed"]
 
 
@@ -302,6 +304,12 @@ def composed_case(r: random.Random, sess) -> Case:
         node_base = len(g.nodes)
         remap_inputs = {}
         for k, t in enumerate(inputs):
+            if isinstance(t, float):  # a lifted float (Call.lifted)
+                remap_inputs[k] = len(g.inputs)
+                g.inputs.append(gpb.GraphInput(kind=gpb.GraphInput.KIND_SCALAR,
+                                               meta=gpb.TensorMeta(dtype=gpb.DTYPE_FLOAT64)))
+                sources.append(t)
+                continue
             match = [p for p in produced if p[2] == t.dtype and p[3] == tuple(t.shape)]
             if match and r.random() < 0.6:
                 remap_inputs[k] = r.choice(match)

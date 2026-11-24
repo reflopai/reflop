@@ -2,9 +2,10 @@
 """Stage V5: cost and peak-memory estimates (PLAN.md §9.2, §9.6).
 
 The FLOP estimate feeds the optional per-execute FLOP quota and the audit
-log. The peak-memory estimate (liveness analysis over meta sizes) is
-checked against the device's total memory: a graph that cannot fit fails
-fast, before any allocation.
+log. The peak-memory estimate (liveness analysis over meta sizes, plus the
+WORKSPACE a few kernels allocate beyond their outputs) is checked against
+the device's total memory: a graph that cannot fit fails fast, before any
+allocation.
 """
 
 from __future__ import annotations
@@ -71,6 +72,21 @@ def node_flops(node, ins: list, outs: list) -> int:
     return sum(_numel(t) for t in outs)
 
 
+def _affine_grid_workspace(node, outs) -> int:
+    # The kernels build a base grid with one more coordinate than the output
+    # from one linspace per spatial size, and an empty grid still builds its
+    # linspaces: [2, 1, 0, 2**31] asked for 8 GB past the quota.
+    out, spatial = outs[0], node.args[1][2:]
+    k = len(spatial)
+    n = math.prod(out.shape[:-1]) * (k + 1) + sum(s for s in spatial if s > 1)
+    return n * out.element_size()
+
+
+# Bytes a kernel allocates for the call's duration besides its outputs,
+# where they are not bounded by the outputs' size.
+WORKSPACE = {"aten.affine_grid_generator.default": _affine_grid_workspace}
+
+
 def analyze(prog: Program, input_bytes: int = 0) -> None:
     """Fill prog.flops and prog.peak_bytes."""
     metas = prog.metas
@@ -100,7 +116,8 @@ def analyze(prog: Program, input_bytes: int = 0) -> None:
             b = 0 if is_view else _bytes(m)
             out_bytes[Ref(node.index, k)] = b
             live += b
-        peak = max(peak, live)
+        w = WORKSPACE.get(node.op.name)
+        peak = max(peak, live + (w(node, outs) if w else 0))
         for r in expiring.get(node.index, []):
             if r.node >= 0:
                 live -= out_bytes.get(r, 0)

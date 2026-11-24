@@ -18,6 +18,8 @@ import struct
 
 import torch
 
+from .dtypes import numel_checked
+
 MAX_HEADER = 1 << 20
 DTYPES = {
     "BOOL": torch.bool, "U8": torch.uint8, "I8": torch.int8, "I16": torch.int16, "I32": torch.int32,
@@ -95,9 +97,11 @@ def parse_header(buf, total_len: int, max_numel: int = 1 << 40) -> tuple[int, di
                                                                     for o in offs)):
             raise SafetensorsError(f"tensor {name!r}: bad data_offsets")
         b, e = offs
-        numel = math.prod(shape) if shape else 1
-        if numel > max_numel:
-            raise SafetensorsError(f"tensor {name!r}: too many elements")
+        try:
+            # Bounds the non-zero dims too, so that every dim fits in int64.
+            numel = numel_checked(shape, max_numel)
+        except OverflowError:
+            raise SafetensorsError(f"tensor {name!r}: too many elements") from None
         size = numel * torch.empty((), dtype=dt).element_size()
         if not 0 <= b <= e <= data_len or e - b != size:
             raise SafetensorsError(f"tensor {name!r}: data_offsets out of bounds or inconsistent with shape")

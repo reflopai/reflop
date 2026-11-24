@@ -9,6 +9,10 @@ one from a fresh seed:
 
     REFLOP_FUZZ_SEED=<n> REFLOP_FUZZ_CASES=<n> REFLOP_FUZZ_OUT=<dir> pytest tests/security/fuzz
 
+REFLOP_FUZZ_DEVICE=cuda runs the same cases on CUDA, each seed in child
+processes (isolated.py), and replays the corpus with its graphs moved to
+CUDA. CI has no GPU; run it on an Owner machine.
+
 Before each case its replay file is written to REFLOP_FUZZ_OUT (if set),
 so a case that crashes the process is on disk. Add a failing case to
 corpus/ as a regression; every file there replays on every run."""
@@ -18,34 +22,28 @@ from __future__ import annotations
 import os
 
 import pytest
-from fuzzrun import CORPUS, artifact_dir, decode, frames, load, run_frames, save, still_serving
+from fuzzrun import CORPUS, decode, frames, fuzz_device, fuzz_graphs, load, retarget, run_frames, still_serving
 from graphgen import case, make_session
+from isolated import run_isolated
 
 SEEDS = [int(s) for s in os.environ.get("REFLOP_FUZZ_SEED", "1,2,3,4").split(",")]
 CASES = int(os.environ.get("REFLOP_FUZZ_CASES", "1250"))
+DEVICE = fuzz_device()
 
 
 @pytest.fixture(scope="module")
 def sess():
-    return make_session("cpu")
+    return make_session(DEVICE)
 
 
 @pytest.mark.parametrize("seed", SEEDS)
-def test_fuzz(sess, seed):
-    out = artifact_dir()
-    failures = []
-    for i in range(CASES):
-        c = case(seed, i, sess)
-        if out is not None:
-            save(c, out / "current.bin")
-        findings = run_frames(sess, frames(c), c)
-        if not findings and i % 50 == 0:
-            gone = still_serving(sess)
-            findings = [gone] if gone else []
-        if findings:
-            failures.append(f"seed {seed} case {i} ({c.kind}): " + "; ".join(findings))
-            if out is not None:
-                save(c, out / f"seed{seed}-case{i}.bin")
+def test_fuzz(request, seed):
+    if DEVICE != "cpu":
+        failures = run_isolated("graph", DEVICE, seed, CASES)
+        assert not failures, "\n".join(failures[:20])
+        return
+    sess = request.getfixturevalue("sess")
+    failures = fuzz_graphs(sess, seed, 0, CASES)
     assert not failures, "\n".join(failures[:20])
     assert still_serving(sess) is None
 
@@ -55,7 +53,7 @@ CORPUS_FILES = sorted(CORPUS.glob("*.bin"))
 
 @pytest.mark.parametrize("path", CORPUS_FILES, ids=[p.stem for p in CORPUS_FILES])
 def test_corpus(sess, path):
-    assert run_frames(sess, load(path)) == []
+    assert run_frames(sess, retarget(load(path), sess.gdevice)) == []
     assert still_serving(sess) is None
 
 

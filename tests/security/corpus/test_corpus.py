@@ -62,13 +62,23 @@ def test_unknown_op_id(sess):
     ok_after(sess)
 
 
-@pytest.mark.parametrize("name", ["aten.resize_.default", "aten._local_scalar_dense.default", "aten.sym_size.int"])
+# The fused CUDA attention kernels and _cudnn_rnn crash the worker on
+# inputs a Guest controls (SIGFPE, segfaults, illegal and misaligned
+# addresses), so they are BANNED (ADR-051).
+FUSED_CUDA = [f"aten._scaled_dot_product_{k}_attention{b}.default" for k in ("flash", "efficient", "cudnn")
+              for b in ("", "_backward")] + ["aten._cudnn_rnn.default", "aten._cudnn_rnn_backward.default"]
+
+
+@pytest.mark.parametrize("name", ["aten.resize_.default", "aten._local_scalar_dense.default", "aten.sym_size.int",
+                                  *FUSED_CUDA])
 def test_banned_and_client_ops(sess, name):
     if name not in NAME:
         pytest.skip(f"{name} not in opset")
     g = graph(sess, [(torch.float32, (2,))], [("aten.neg.default", [tin(0)])], [(torch.float32, (2,))])
     g.nodes[0].op_id = NAME[name]
-    expect(register(sess, g).error, E.ERROR_INVALID_GRAPH)
+    err = register(sess, g).error
+    expect(err, E.ERROR_INVALID_GRAPH, E.STAGE_V2_STRUCTURE)
+    assert "must never be sent" in err.message
 
 
 def test_forward_reference(sess):
@@ -329,6 +339,30 @@ def test_empty_strided_overlap(sess):
     expect(register(sess, g).error, E.ERROR_INVALID_GRAPH)
 
 
+def _empty_strided(sess, size, stride):
+    return graph(sess, [], [("aten.empty_strided.default", [INTS(*size), INTS(*stride), NONE, NONE,
+                                                            gpb.Arg(device=sess.gdevice), NONE])],
+                 [(torch.float32, tuple(size))])
+
+
+@pytest.mark.parametrize("size,stride", [((2, 0), (1, 1)), ((0, 3), (3, 1)), ((3, 0), (1, 3)), ((3, 0, 2), (2, 2, 1)),
+                                         ((0, 0), (1, 1)), ((0,), (1,))])
+def test_empty_strided_empty_tensor(sess, size, stride):
+    # Strides PyTorch gives empty tensors (and their transposes) (#25 E).
+    r = run(sess, _empty_strided(sess, size, stride), [])
+    assert isinstance(r, cpb.ExecuteResult), r
+    assert tuple(decode(r.returned[0]).shape) == size
+
+
+@pytest.mark.parametrize("size,stride", [((2, 0), (-1, 1)), ((0, 3), (3, 2)), ((2, 0), (2**62, 1)),
+                                         ((0, 3), (1, 2**62))])
+def test_empty_strided_empty_tensor_bad_stride(sess, size, stride):
+    # PyTorch takes any stride when a size is 0; views of the result then
+    # start at unbounded offsets.
+    expect(register(sess, _empty_strided(sess, size, stride)).error, E.ERROR_INVALID_GRAPH)
+    ok_after(sess)
+
+
 def test_embedding_bag_offsets(sess):
     def g_(n_off):
         return graph(sess, [(torch.float32, (5, 3)), (torch.int64, (4,)), (torch.int64, (n_off,))],
@@ -346,6 +380,19 @@ def test_masked_scatter_short_source(sess):
     g = graph(sess, [(torch.float32, (4,)), (torch.bool, (4,)), (torch.float32, (1,))],
               [("aten.masked_scatter.default", [tin(0), tin(1), tin(2)])], [(torch.float32, (4,))])
     expect(run(sess, g, [torch.zeros(4), torch.tensor([True, True, False, True]), torch.ones(1)]), E.ERROR_RUNTIME_CHECK)
+
+
+def test_masked_scatter_mask_broadcasts_self(sess):
+    # self (1, 4) and mask (3, 1) broadcast to (3, 4); the mask selects 8.
+    def g_(n):
+        return graph(sess, [(torch.float32, (1, 4)), (torch.bool, (3, 1)), (torch.float32, (n,))],
+                     [("aten.masked_scatter.default", [tin(0), tin(1), tin(2)])], [(torch.float32, (3, 4))])
+    x, m = torch.ones(1, 4), torch.tensor([[True], [False], [True]])
+    r = run(sess, g_(8), [x, m, torch.arange(8.0)])
+    assert isinstance(r, cpb.ExecuteResult), r
+    assert torch.equal(decode(r.returned[0]), x.masked_scatter(m, torch.arange(8.0)))
+    expect(run(sess, g_(7), [x, m, torch.arange(7.0)]), E.ERROR_RUNTIME_CHECK)
+    ok_after(sess)
 
 
 @pytest.mark.parametrize("op", ["aten.remainder.Tensor", "aten.fmod.Tensor", "aten.floor_divide.default"])
@@ -379,6 +426,193 @@ def test_multinomial_negative_probs(sess):
     expect(run(sess, g, [torch.tensor([0.5, -1.0, 0.5])]), E.ERROR_RUNTIME_CHECK)
 
 
+@pytest.mark.parametrize("p", [1.5, -0.25, float("nan")])
+@pytest.mark.parametrize("op", ["aten.bernoulli.default", "aten.bernoulli.Tensor"])
+def test_bernoulli_probability_out_of_range(sess, op, p):
+    # The CUDA kernel asserts on the device and ends the CUDA context (#25 B,
+    # found by the CUDA fuzz run); the CPU kernel raises after allocating.
+    probs = torch.tensor([0.5, p, 0.0, 1.0])
+    if op == "aten.bernoulli.default":
+        g = graph(sess, [(torch.float32, (4,))], [(op, [tin(0), NONE])], [(torch.float32, (4,))])
+        r = run(sess, g, [probs])
+    else:
+        g = graph(sess, [(torch.float32, (4,)), (torch.float32, (4,))], [(op, [tin(0), tin(1), NONE])],
+                  [(torch.float32, (4,))])
+        r = run(sess, g, [torch.zeros(4), probs])
+    expect(r, E.ERROR_RUNTIME_CHECK, E.STAGE_E2_RUNTIME)
+    ok_after(sess)
+
+
+def test_bernoulli_in_range_ok(sess):
+    g = graph(sess, [(torch.float32, (4,))], [("aten.bernoulli.default", [tin(0), NONE])], [(torch.float32, (4,))])
+    r = run(sess, g, [torch.tensor([0.0, 1.0, 0.0, 1.0])])
+    assert decode(r.returned[0]).tolist() == [0.0, 1.0, 0.0, 1.0]
+
+
+def test_bernoulli_empty_self_skips_p(sess):
+    # The kernels return an empty self without reading p.
+    g = graph(sess, [(torch.float32, (0,)), (torch.float32, (1,))],
+              [("aten.bernoulli.Tensor", [tin(0), tin(1), NONE])], [(torch.float32, (0,))])
+    r = run(sess, g, [torch.zeros(0), torch.tensor([5.0])])
+    assert decode(r.returned[0]).shape == (0,)
+
+
+@pytest.mark.parametrize("std", [-1.0, float("nan")])
+@pytest.mark.parametrize("op", ["aten.normal.float_Tensor", "aten.normal.Tensor_Tensor"])
+def test_normal_negative_std(sess, op, std):
+    # The CUDA kernels check std >= 0 with _assert_async, which ends the CUDA
+    # context (#25 B).
+    stds = torch.tensor([1.0, std, 0.0])
+    if op == "aten.normal.float_Tensor":
+        g = graph(sess, [(torch.float32, (3,))], [(op, [F(0.0), tin(0), NONE])], [(torch.float32, (3,))])
+        r = run(sess, g, [stds])
+    else:
+        g = graph(sess, [(torch.float32, (3,)), (torch.float32, (3,))], [(op, [tin(0), tin(1), NONE])],
+                  [(torch.float32, (3,))])
+        r = run(sess, g, [torch.zeros(3), stds])
+    expect(r, E.ERROR_RUNTIME_CHECK, E.STAGE_E2_RUNTIME)
+    ok_after(sess)
+
+
+def test_normal_zero_std_ok(sess):
+    g = graph(sess, [(torch.float32, (3,))], [("aten.normal.float_Tensor", [F(2.0), tin(0), NONE])],
+              [(torch.float32, (3,))])
+    assert decode(run(sess, g, [torch.zeros(3)]).returned[0]).tolist() == [2.0, 2.0, 2.0]
+
+
+def test_expand_to_negative_size(sess):
+    # PyTorch's expand of a size-0 tensor returns shape [0, 4, -5] (CUDA fuzz
+    # run, seed 17); the worker let the ValueError escape Session.handle.
+    g = graph(sess, [(torch.float32, (1,))], [("aten.expand.default", [tin(0), INTS(0, 4, -5), B(True)])],
+              [(torch.float32, (0, 4, 0))])
+    expect(register(sess, g).error, E.ERROR_SHAPE_MISMATCH, E.STAGE_V4_META)
+    ok_after(sess)
+
+
+@pytest.mark.parametrize("op,shape,args,out", [
+    # The CPU kernel sized its weights buffer from 1 / scale and overflowed
+    # it (SIGSEGV, worker gone).
+    ("aten._upsample_bilinear2d_aa.default", (1, 1, 3, 3), [tin(0), INTS(4, 4), B(False), F(1e-10), F(1e-10)],
+     (1, 1, 4, 4)),
+    ("aten._upsample_bilinear2d_aa_backward.default", (1, 1, 4, 4),
+     [tin(0), INTS(4, 4), INTS(1, 1, 3, 3), B(False), F(1e-10), F(1e-10)], (1, 1, 3, 3)),
+    # The nearest kernels clamp out / scale from above only.
+    ("aten.upsample_nearest2d.default", (1, 1, 3, 3), [tin(0), INTS(4, 4), F(1e-30), F(1.0)], (1, 1, 4, 4)),
+    ("aten.upsample_nearest1d_backward.default", (1, 1, 4), [tin(0), INTS(4), INTS(1, 1, 3), F(5e-324)],
+     (1, 1, 3)),
+    ("aten.upsample_trilinear3d.default", (1, 1, 3, 3, 3),
+     [tin(0), INTS(4, 4, 4), B(False), F(1.0), F(1.0), F(0.1)], (1, 1, 4, 4, 4)),
+])
+def test_upsample_scale_out_of_range(sess, op, shape, args, out):
+    g = graph(sess, [(torch.float32, shape)], [(op, args)], [(torch.float32, out)])
+    err = register(sess, g).error
+    expect(err, E.ERROR_SHAPE_MISMATCH, E.STAGE_V4_META)
+    assert "out of range" in err.message
+    ok_after(sess)
+
+
+@pytest.mark.parametrize("mode,size,sf", [
+    ("nearest", (3, 3), 1.7), ("bilinear", (5, 4), 0.6), ("bicubic", (3, 3), 2.0), ("nearest", (7, 20), 0.15),
+])
+def test_upsample_scales_from_interpolate_run(sess, mode, size, sf):
+    # F.interpolate's own calls: scale s with out = floor(in * s).
+    x = torch.randn(1, 2, *size)
+    want = torch.nn.functional.interpolate(x, scale_factor=sf, mode=mode)
+    op = {"nearest": "aten.upsample_nearest2d.default", "bilinear": "aten.upsample_bilinear2d.default",
+          "bicubic": "aten.upsample_bicubic2d.default"}[mode]
+    oh, ow = want.shape[2:]
+    args = [tin(0), INTS(oh, ow)] + ([] if mode == "nearest" else [B(False)]) + [F(sf), F(sf)]
+    g = graph(sess, [(torch.float32, x.shape)], [(op, args)], [(torch.float32, want.shape)])
+    r = run(sess, g, [x])
+    assert isinstance(r, cpb.ExecuteResult), r
+    torch.testing.assert_close(decode(r.returned[0]), want)
+
+
+def DT(dt):
+    return gpb.Arg(dtype=dt)
+
+
+@pytest.mark.parametrize("op,shape,args,out", [
+    ("aten.full.default", None, lambda d: [INTS(4), F(3e39), NONE, NONE, gpb.Arg(device=d), NONE],
+     (torch.float32, (4,))),
+    ("aten.full.default", None, lambda d: [INTS(4), I(65505), DT(gpb.DTYPE_FLOAT16), NONE, gpb.Arg(device=d), NONE],
+     (torch.float16, (4,))),
+    ("aten.full_like.default", (torch.uint8, (4,)), lambda d: [tin(0), F(-0.5), NONE, NONE, NONE, NONE, NONE],
+     (torch.uint8, (4,))),
+    ("aten.fill.Scalar", (torch.int8, (4,)), lambda d: [tin(0), I(128)], (torch.int8, (4,))),
+    ("aten.constant_pad_nd.default", (torch.float16, (4,)), lambda d: [tin(0), INTS(1, 1), F(1e5)],
+     (torch.float16, (6,))),
+])
+def test_fill_value_overflow(sess, op, shape, args, out):
+    # The kernels convert the value after allocating the output (I3).
+    g = graph(sess, [shape] if shape else [], [(op, args(sess.gdevice))], [out])
+    err = register(sess, g).error
+    expect(err, E.ERROR_SHAPE_MISMATCH, E.STAGE_V4_META)
+    assert "without overflow" in err.message
+    ok_after(sess)
+
+
+def test_fill_value_in_range_runs(sess):
+    # uint8 takes a negative int down to -255 (two's complement), as PyTorch does.
+    g = graph(sess, [], [("aten.full.default", [INTS(2), I(-255), DT(gpb.DTYPE_UINT8), NONE,
+                                                gpb.Arg(device=sess.gdevice), NONE])], [(torch.uint8, (2,))])
+    r = run(sess, g, [])
+    assert decode(r.returned[0]).tolist() == [1, 1]
+
+
+# ---------------------------------------------------------------- scalar graph inputs (ADR-011)
+
+
+def _scalar_graph(sess, kinds, nodes, out_meta):
+    g = gpb.Graph(opset_version=1, device=sess.gdevice)
+    for k in kinds:
+        if k in ("int", "float"):
+            g.inputs.append(gpb.GraphInput(kind=gpb.GraphInput.KIND_SCALAR, meta=meta(
+                torch.int64 if k == "int" else torch.float64, ())))
+        else:
+            g.inputs.append(gpb.GraphInput(kind=gpb.GraphInput.KIND_TENSOR, meta=meta(*k)))
+    for name, args in nodes:
+        g.nodes.append(gpb.Node(op_id=NAME[name], args=args))
+    g.outputs.append(gpb.ValueRef(node_output=gpb.NodeOutput(node=len(nodes) - 1, output=0)))
+    for dt, shape in out_meta:
+        g.output_meta.append(meta(dt, shape))
+    return g
+
+
+@pytest.mark.parametrize("op,args", [
+    ("aten.arange.default", [tin(0), NONE, NONE, NONE, NONE]),
+    ("aten.arange.start", [I(0), tin(0), NONE, NONE, NONE, NONE]),
+    ("aten.arange.start_step", [I(0), I(10), tin(0), NONE, NONE, NONE, NONE]),
+    ("aten.full.default", [INTS(4), tin(0), NONE, NONE, NONE, NONE]),
+])
+def test_scalar_input_refused_for_allocating_op(sess, op, args):
+    # Meta inference sees a placeholder (1) for a scalar input: arange's end
+    # bound to 10**7 at execute allocated 10**7 elements where V5 had counted
+    # one, and the shape check came only after the kernel.
+    g = _scalar_graph(sess, ["int"], [(op, args)], [(torch.int64, (1,))])
+    err = register(sess, g).error
+    expect(err, E.ERROR_INVALID_GRAPH, E.STAGE_V3_SCHEMA)
+    assert "literal values" in err.message
+    ok_after(sess)
+
+
+def test_scalar_input_still_binds_non_allocating_op(sess):
+    # A lifted Python float (the client's weak-scalar path) keeps working and
+    # uses the bound value, not the placeholder.
+    g = _scalar_graph(sess, [(torch.float32, (3,)), "float"], [("aten.mul.Tensor", [tin(0), tin(1)])],
+                      [(torch.float32, (3,))])
+    r = register(sess, g)
+    assert r.WhichOneof("body") == "graph_registered", r
+    ex = cpb.Execute(graph_hash=r.graph_registered.graph_hash)
+    ex.bindings.append(tensor_binding(torch.tensor([1.0, 2.0, 3.0])))
+    b = cpb.Binding()
+    b.scalar.f = 2.5
+    ex.bindings.append(b)
+    ex.outputs.append(cpb.OutputSpec(kind=cpb.OutputSpec.KIND_RETURN))
+    e = call(sess, cpb.Envelope(request_id=2, execute=ex))[0]
+    assert decode(e.execute_result.returned[0]).tolist() == [2.5, 5.0, 7.5]
+
+
 # ---------------------------------------------------------------- uninitialized memory (I13)
 
 
@@ -400,6 +634,37 @@ def test_empty_like_is_zero(sess):
               [(torch.float32, (32,))])
     r = run(sess, g, [torch.full((32,), 5.0)])
     assert decode(r.returned[0]).abs().sum().item() == 0.0
+
+
+def test_ctc_log_alpha_unwritten(sess):
+    """_ctc_loss leaves log_alpha unwritten past each input length and past
+    2 * target_length + 1 (#25 D); the worker fills it with -inf."""
+    il, tl = [6, 3, 0], [2, 1, 0]
+    shape = (3, 6, 5)
+    junk = graph(sess, [(torch.float32, shape)], [("aten.mul.Tensor", [tin(0), F(7.0)])], [(torch.float32, shape)])
+    run(sess, junk, [torch.full(shape, 3.0)])
+    lp = torch.randn(6, 3, 5).log_softmax(2)
+    tg = torch.tensor([[1, 2, 3], [4, 1, 1], [2, 2, 2]])
+    g = graph(sess, [(torch.float32, (6, 3, 5)), (torch.int64, (3, 3))],
+              [("aten._ctc_loss.default", [tin(0), tin(1), INTS(*il), INTS(*tl), I(0), B(False)])],
+              [(torch.float32, (3,)), (torch.float32, shape)], outputs=[(0, 0), (0, 1)])
+    r = run(sess, g, [lp, tg])
+    assert isinstance(r, cpb.ExecuteResult), r
+    nll, la = decode(r.returned[0]), decode(r.returned[1])
+    want_nll, want_la = torch.ops.aten._ctc_loss.default(lp, tg, il, tl, 0, False)
+    assert torch.allclose(nll, want_nll, atol=1e-5)
+    for b in range(3):
+        written = la[b, :il[b], :2 * tl[b] + 1]
+        assert torch.allclose(written, want_la[b, :il[b], :2 * tl[b] + 1], atol=1e-5)
+        rest = torch.ones(shape[1:], dtype=torch.bool)
+        rest[:il[b], :2 * tl[b] + 1] = False
+        assert (la[b][rest] == float("-inf")).all(), la[b]
+    # The backward reads only the written region: the filled log_alpha gives
+    # the same gradient.
+    grad = torch.ones(3)
+    bw = torch.ops.aten._ctc_loss_backward.default
+    assert torch.allclose(bw(grad, lp, tg, il, tl, want_nll, want_la, 0, False),
+                          bw(grad, lp, tg, il, tl, want_nll, la, 0, False), atol=1e-5)
 
 
 # ---------------------------------------------------------------- resources
@@ -428,6 +693,23 @@ def test_quota_exceeded_is_not_oom():
     g = graph(s, [], [("aten.full.default", [INTS(1024, 1024), F(1.0), NONE, NONE, gpb.Arg(device=s.gdevice), NONE])],
               [(torch.float32, (1024, 1024))])
     expect(register(s, g).error, E.ERROR_QUOTA, E.STAGE_V5_SAFETY)
+
+
+def test_empty_affine_grid_counts_its_linspaces():
+    # The kernel builds a linspace per spatial size even for an empty grid,
+    # so V5 counts it (cost.WORKSPACE): 4 MiB here, over the 1 MiB quota.
+    s = make_session("cpu")
+    s.init.device_memory_quota_bytes = 1 << 20
+
+    def grid(size, out):
+        return graph(s, [(torch.float32, (size[0], 2, 3))],
+                     [("aten.affine_grid_generator.default", [tin(0), INTS(*size), B(False)])], [(torch.float32, out)])
+
+    err = register(s, grid([2, 1, 0, 1 << 20], (2, 0, 1 << 20, 2))).error
+    expect(err, E.ERROR_QUOTA, E.STAGE_V5_SAFETY)
+    assert f"~{2 * 2 * 3 * 4 + 4 * (1 << 20)} bytes" in err.message  # theta, and the linspace
+    r = run(s, grid([0, 1, 4, 4], (0, 4, 4, 2)), [torch.zeros(0, 2, 3)])
+    assert decode(r.returned[0]).shape == (0, 4, 4, 2)
 
 
 def test_alloc_beyond_numel_limit(sess):

@@ -59,10 +59,10 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 49 | `aten.div.Scalar_mode` | ENUM RESTRICTED | int_divisor_nonzero |  |
 | 50 | `aten.div.Tensor_mode` | ENUM RESTRICTED | int_divisor_nonzero |  |
 | 51 | `aten.atan2.out` | FUNC |  |  |
-| 52 | `aten.eq.Scalar` |  |  |  |
-| 53 | `aten.eq.Tensor` |  |  |  |
-| 54 | `aten.ne.Scalar` |  |  |  |
-| 55 | `aten.ne.Tensor` |  |  |  |
+| 52 | `aten.eq.Scalar` | FP8 |  |  |
+| 53 | `aten.eq.Tensor` | FP8 |  |  |
+| 54 | `aten.ne.Scalar` | FP8 |  |  |
+| 55 | `aten.ne.Tensor` | FP8 |  |  |
 | 56 | `aten.lt.Scalar` |  |  |  |
 | 57 | `aten.lt.Tensor` |  |  |  |
 | 58 | `aten.le.Scalar` |  |  |  |
@@ -71,8 +71,8 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 61 | `aten.gt.Tensor` |  |  |  |
 | 62 | `aten.ge.Scalar` |  |  |  |
 | 63 | `aten.ge.Tensor` |  |  |  |
-| 64 | `aten.isinf.default` |  |  |  |
-| 65 | `aten.isnan.default` |  |  |  |
+| 64 | `aten.isinf.default` | FP8 |  |  |
+| 65 | `aten.isnan.default` | FP8 |  |  |
 | 66 | `aten.logical_and.default` |  |  |  |
 | 67 | `aten.logical_or.default` |  |  |  |
 | 68 | `aten.logical_xor.default` |  |  |  |
@@ -84,7 +84,7 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 74 | `aten.bitwise_xor.Scalar` |  |  |  |
 | 75 | `aten.bitwise_xor.Tensor` |  |  |  |
 | 76 | `aten.bitwise_not.default` |  |  |  |
-| 77 | `aten.where.self` |  |  |  |
+| 77 | `aten.where.self` | FP8 |  |  |
 | 78 | `aten.clamp.default` |  |  |  |
 | 79 | `aten.clamp.Tensor` |  |  |  |
 | 80 | `aten.relu.default` |  |  |  |
@@ -140,7 +140,7 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 130 | `aten.max_pool2d_with_indices.default` |  |  |  |
 | 131 | `aten.max_pool3d_with_indices.default` |  |  |  |
 | 132 | `aten.max_pool2d_with_indices_backward.default` | IDX | pool_indices |  |
-| 133 | `aten.constant_pad_nd.default` | ALLOC | alloc |  |
+| 133 | `aten.constant_pad_nd.default` | ALLOC FP8 | alloc |  |
 | 134 | `aten.reflection_pad1d.default` | ALLOC | alloc |  |
 | 135 | `aten.reflection_pad2d.default` | ALLOC | alloc |  |
 | 136 | `aten.reflection_pad3d.default` | ALLOC | alloc |  |
@@ -150,46 +150,46 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 140 | `aten.upsample_nearest2d.vec` | ALLOC | alloc |  |
 | 141 | `aten.col2im.default` | ALLOC | alloc |  |
 | 142 | `aten.grid_sampler_2d.default` | ALLOC | alloc |  |
-| 143 | `aten.index.Tensor` | IDX | advanced_index |  |
-| 144 | `aten.index_put.default` | IDX | advanced_index |  |
-| 145 | `aten.index_select.default` | IDX | dim_index |  |
-| 146 | `aten.gather.default` | IDX | dim_index |  |
-| 147 | `aten.scatter.src` | IDX | dim_index |  |
-| 148 | `aten.scatter.value` | IDX | dim_index |  |
+| 143 | `aten.index.Tensor` | IDX FP8 | advanced_index |  |
+| 144 | `aten.index_put.default` | IDX FP8 | advanced_index |  |
+| 145 | `aten.index_select.default` | IDX FP8 | dim_index |  |
+| 146 | `aten.gather.default` | IDX FP8 | dim_index |  |
+| 147 | `aten.scatter.src` | IDX FP8 | dim_index |  |
+| 148 | `aten.scatter.value` | IDX FP8 | dim_index |  |
 | 149 | `aten.scatter_add.default` | IDX | dim_index |  |
 | 150 | `aten.scatter_reduce.two` | IDX ENUM | dim_index |  |
-| 151 | `aten.embedding.default` | IDX | embedding |  |
+| 151 | `aten.embedding.default` | IDX FP8 | embedding |  |
 | 152 | `aten.embedding_dense_backward.default` | IDX | embedding_backward |  |
 | 153 | `aten._embedding_bag.default` | IDX RESTRICTED | embedding_bag |  |
 | 154 | `aten.masked_scatter.default` | RESTRICTED | masked_scatter |  |
-| 155 | `aten.select.int` |  |  |  |
-| 156 | `aten.select_scatter.default` |  |  |  |
-| 157 | `aten.slice.Tensor` |  |  |  |
-| 158 | `aten.slice_scatter.default` |  |  |  |
+| 155 | `aten.select.int` | FP8 |  |  |
+| 156 | `aten.select_scatter.default` | FP8 |  |  |
+| 157 | `aten.slice.Tensor` | FP8 |  |  |
+| 158 | `aten.slice_scatter.default` | FP8 |  |  |
 | 159 | `aten.nonzero.default` | DDS CLIENT |  |  |
-| 160 | `aten.view.default` |  |  |  |
-| 161 | `aten.expand.default` |  |  |  |
-| 162 | `aten.permute.default` |  |  |  |
-| 163 | `aten.squeeze.dim` |  |  |  |
-| 164 | `aten.squeeze.dims` |  |  |  |
-| 165 | `aten.unsqueeze.default` |  |  |  |
-| 166 | `aten.diagonal.default` |  |  |  |
-| 167 | `aten.alias.default` |  |  |  |
-| 168 | `aten.split_with_sizes.default` |  |  |  |
-| 169 | `aten.cat.default` |  |  |  |
-| 170 | `aten.flip.default` |  |  |  |
-| 171 | `aten.clone.default` |  |  |  |
-| 172 | `aten.repeat.default` | ALLOC | alloc |  |
-| 173 | `aten.as_strided.default` | RESTRICTED | as_strided |  |
-| 174 | `aten.full.default` | ALLOC | alloc |  |
-| 175 | `aten.full_like.default` | ALLOC | alloc |  |
-| 176 | `aten.scalar_tensor.default` | ALLOC | alloc |  |
+| 160 | `aten.view.default` | FP8 |  |  |
+| 161 | `aten.expand.default` | FP8 |  |  |
+| 162 | `aten.permute.default` | FP8 |  |  |
+| 163 | `aten.squeeze.dim` | FP8 |  |  |
+| 164 | `aten.squeeze.dims` | FP8 |  |  |
+| 165 | `aten.unsqueeze.default` | FP8 |  |  |
+| 166 | `aten.diagonal.default` | FP8 |  |  |
+| 167 | `aten.alias.default` | FP8 |  |  |
+| 168 | `aten.split_with_sizes.default` | FP8 |  |  |
+| 169 | `aten.cat.default` | FP8 |  |  |
+| 170 | `aten.flip.default` | FP8 |  |  |
+| 171 | `aten.clone.default` | FP8 |  |  |
+| 172 | `aten.repeat.default` | ALLOC FP8 | alloc |  |
+| 173 | `aten.as_strided.default` | RESTRICTED FP8 | as_strided |  |
+| 174 | `aten.full.default` | ALLOC FP8 | alloc |  |
+| 175 | `aten.full_like.default` | ALLOC FP8 | alloc |  |
+| 176 | `aten.scalar_tensor.default` | ALLOC FP8 | alloc |  |
 | 177 | `aten.arange.start_step` | ALLOC | alloc |  |
-| 178 | `aten.fill.Scalar` | ALLOC | alloc |  |
-| 179 | `aten.empty.memory_format` | UNINIT ALLOC | alloc |  |
-| 180 | `aten.empty_strided.default` | UNINIT ALLOC RESTRICTED | empty_strided |  |
-| 181 | `aten._to_copy.default` | RESTRICTED | to_copy |  |
-| 182 | `aten.copy.default` | RESTRICTED | to_copy |  |
+| 178 | `aten.fill.Scalar` | ALLOC FP8 | alloc |  |
+| 179 | `aten.empty.memory_format` | UNINIT ALLOC FP8 | alloc |  |
+| 180 | `aten.empty_strided.default` | UNINIT ALLOC RESTRICTED FP8 | empty_strided |  |
+| 181 | `aten._to_copy.default` | RESTRICTED FP8 | to_copy |  |
+| 182 | `aten.copy.default` | RESTRICTED FP8 | to_copy |  |
 | 183 | `aten._cdist_forward.default` | RESTRICTED | cdist |  |
 | 184 | `aten._pdist_forward.default` | RESTRICTED | cdist |  |
 | 185 | `aten._fft_r2c.default` |  |  | complex |
@@ -240,12 +240,12 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 225 | `aten._weight_norm_interface.default` |  |  |  |
 | 226 | `aten._weight_norm_interface_backward.default` |  |  |  |
 | 227 | `aten.native_batch_norm.default` |  |  |  |
-| 228 | `aten._scaled_dot_product_flash_attention.default` | RNG RESTRICTED | attention |  |
-| 229 | `aten._scaled_dot_product_flash_attention_backward.default` | RNG RESTRICTED | attention |  |
-| 230 | `aten._scaled_dot_product_efficient_attention.default` | RNG RESTRICTED | attention |  |
-| 231 | `aten._scaled_dot_product_efficient_attention_backward.default` | RNG RESTRICTED | attention |  |
-| 232 | `aten._scaled_dot_product_cudnn_attention.default` | RNG RESTRICTED | attention |  |
-| 233 | `aten._scaled_dot_product_cudnn_attention_backward.default` | RNG RESTRICTED | attention |  |
+| 228 | `aten._scaled_dot_product_flash_attention.default` | BANNED |  |  |
+| 229 | `aten._scaled_dot_product_flash_attention_backward.default` | BANNED |  |  |
+| 230 | `aten._scaled_dot_product_efficient_attention.default` | BANNED |  |  |
+| 231 | `aten._scaled_dot_product_efficient_attention_backward.default` | BANNED |  |  |
+| 232 | `aten._scaled_dot_product_cudnn_attention.default` | BANNED |  |  |
+| 233 | `aten._scaled_dot_product_cudnn_attention_backward.default` | BANNED |  |  |
 | 234 | `aten._scaled_dot_product_attention_math.default` | RNG RESTRICTED | attention |  |
 | 235 | `aten._scaled_dot_product_flash_attention_for_cpu.default` | RNG RESTRICTED | attention |  |
 | 236 | `aten._scaled_dot_product_flash_attention_for_cpu_backward.default` | RNG RESTRICTED | attention |  |
@@ -318,11 +318,11 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 303 | `aten.grid_sampler_3d_backward.default` | ALLOC | alloc |  |
 | 304 | `aten.affine_grid_generator.default` | ALLOC | alloc |  |
 | 305 | `aten.im2col.default` | ALLOC | alloc |  |
-| 306 | `aten.pixel_shuffle.default` | ALLOC | alloc |  |
-| 307 | `aten.pixel_unshuffle.default` | ALLOC | alloc |  |
-| 308 | `aten.channel_shuffle.default` | ALLOC | alloc |  |
+| 306 | `aten.pixel_shuffle.default` | ALLOC FP8 | alloc |  |
+| 307 | `aten.pixel_unshuffle.default` | ALLOC FP8 | alloc |  |
+| 308 | `aten.channel_shuffle.default` | ALLOC FP8 | alloc |  |
 | 309 | `aten.roll.default` | ALLOC | alloc |  |
-| 310 | `aten.rot90.default` | ALLOC | alloc |  |
+| 310 | `aten.rot90.default` | ALLOC FP8 | alloc |  |
 | 311 | `aten.index_add.default` | IDX | dim_index |  |
 | 312 | `aten.index_copy.default` | IDX | dim_index |  |
 | 313 | `aten.index_fill.int_Scalar` | IDX | dim_index |  |
@@ -333,8 +333,8 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 318 | `aten.bucketize.Tensor` |  |  |  |
 | 319 | `aten.nonzero_static.default` |  |  |  |
 | 320 | `aten.take.default` | IDX | take |  |
-| 321 | `aten._unsafe_index.Tensor` | IDX | advanced_index |  |
-| 322 | `aten._unsafe_index_put.default` | IDX | advanced_index |  |
+| 321 | `aten._unsafe_index.Tensor` | IDX FP8 | advanced_index |  |
+| 322 | `aten._unsafe_index_put.default` | IDX FP8 | advanced_index |  |
 | 323 | `aten._embedding_bag_backward.default` | IDX RESTRICTED | embedding_bag_backward |  |
 | 324 | `aten._embedding_bag_dense_backward.default` | IDX RESTRICTED | embedding_bag_backward |  |
 | 325 | `aten.embedding_renorm.default` | IDX FUNC | embedding_renorm |  |
@@ -381,7 +381,7 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 366 | `aten.copysign.Tensor` |  |  |  |
 | 367 | `aten.copysign.Scalar` |  |  |  |
 | 368 | `aten.hypot.default` |  |  |  |
-| 369 | `aten.isfinite.default` |  |  |  |
+| 369 | `aten.isfinite.default` | FP8 |  |  |
 | 370 | `aten.signbit.default` |  |  |  |
 | 371 | `aten.fmax.default` |  |  |  |
 | 372 | `aten.fmin.default` |  |  |  |
@@ -408,7 +408,7 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 393 | `aten.clamp_min.Tensor` |  |  |  |
 | 394 | `aten.clamp_max.Tensor` |  |  |  |
 | 395 | `aten.true_divide.Tensor` |  |  |  |
-| 396 | `aten.positive.default` |  |  |  |
+| 396 | `aten.positive.default` | FP8 |  |  |
 | 397 | `aten.rsub.Scalar` |  |  |  |
 | 398 | `aten.rsub.Tensor` |  |  |  |
 | 399 | `aten.floor_divide.default` | RESTRICTED | int_divisor_nonzero |  |
@@ -421,81 +421,81 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 406 | `aten.__rshift__.Scalar` | RESTRICTED | shift_amount |  |
 | 407 | `aten.__lshift__.Tensor` | RESTRICTED | shift_amount |  |
 | 408 | `aten.__rshift__.Tensor` | RESTRICTED | shift_amount |  |
-| 409 | `aten.zeros.default` | ALLOC | alloc |  |
-| 410 | `aten.ones.default` | ALLOC | alloc |  |
-| 411 | `aten.zeros_like.default` | ALLOC | alloc |  |
-| 412 | `aten.ones_like.default` | ALLOC | alloc |  |
-| 413 | `aten.eye.default` | ALLOC | alloc |  |
-| 414 | `aten.eye.m` | ALLOC | alloc |  |
+| 409 | `aten.zeros.default` | ALLOC FP8 | alloc |  |
+| 410 | `aten.ones.default` | ALLOC FP8 | alloc |  |
+| 411 | `aten.zeros_like.default` | ALLOC FP8 | alloc |  |
+| 412 | `aten.ones_like.default` | ALLOC FP8 | alloc |  |
+| 413 | `aten.eye.default` | ALLOC FP8 | alloc |  |
+| 414 | `aten.eye.m` | ALLOC FP8 | alloc |  |
 | 415 | `aten.linspace.default` | ALLOC | alloc |  |
 | 416 | `aten.logspace.default` | ALLOC | alloc |  |
-| 417 | `aten.new_zeros.default` | ALLOC | alloc |  |
-| 418 | `aten.new_ones.default` | ALLOC | alloc |  |
-| 419 | `aten.new_full.default` | ALLOC | alloc |  |
+| 417 | `aten.new_zeros.default` | ALLOC FP8 | alloc |  |
+| 418 | `aten.new_ones.default` | ALLOC FP8 | alloc |  |
+| 419 | `aten.new_full.default` | ALLOC FP8 | alloc |  |
 | 420 | `aten.arange.default` | ALLOC | alloc |  |
 | 421 | `aten.arange.start` | ALLOC | alloc |  |
-| 422 | `aten.empty_like.default` | UNINIT ALLOC | alloc |  |
-| 423 | `aten.new_empty.default` | UNINIT ALLOC | alloc |  |
-| 424 | `aten.new_empty_strided.default` | UNINIT ALLOC | empty_strided |  |
+| 422 | `aten.empty_like.default` | UNINIT ALLOC FP8 | alloc |  |
+| 423 | `aten.new_empty.default` | UNINIT ALLOC FP8 | alloc |  |
+| 424 | `aten.new_empty_strided.default` | UNINIT ALLOC FP8 | empty_strided |  |
 | 425 | `aten.tril.default` |  |  |  |
 | 426 | `aten.triu.default` |  |  |  |
-| 427 | `aten.diag_embed.default` |  |  |  |
-| 428 | `aten.narrow.default` |  |  |  |
-| 429 | `aten.unbind.int` |  |  |  |
-| 430 | `aten.stack.default` |  |  |  |
-| 431 | `aten.transpose.int` |  |  |  |
-| 432 | `aten.t.default` |  |  |  |
-| 433 | `aten.reshape.default` |  |  |  |
-| 434 | `aten._unsafe_view.default` |  |  |  |
-| 435 | `aten.unfold.default` |  |  |  |
-| 436 | `aten.contiguous.default` |  |  |  |
-| 437 | `aten.lift_fresh_copy.default` |  |  |  |
-| 438 | `aten.detach.default` |  |  |  |
-| 439 | `aten.tile.default` |  |  |  |
-| 440 | `aten.movedim.int` |  |  |  |
-| 441 | `aten.expand_as.default` |  |  |  |
-| 442 | `aten.flatten.using_ints` |  |  |  |
-| 443 | `aten.split.Tensor` |  |  |  |
-| 444 | `aten.chunk.default` |  |  |  |
-| 445 | `aten.squeeze.default` |  |  |  |
-| 446 | `aten.view_as.default` |  |  |  |
-| 447 | `aten.select_backward.default` |  |  |  |
-| 448 | `aten.slice_backward.default` |  |  |  |
-| 449 | `aten.diagonal_backward.default` |  |  |  |
-| 450 | `aten.diagonal_scatter.default` |  |  |  |
-| 451 | `aten.as_strided_scatter.default` |  |  |  |
-| 452 | `aten.unsqueeze_copy.default` |  |  |  |
-| 453 | `aten.view_copy.default` |  |  |  |
-| 454 | `aten.permute_copy.default` |  |  |  |
-| 455 | `aten.expand_copy.default` |  |  |  |
-| 456 | `aten.t_copy.default` |  |  |  |
-| 457 | `aten.transpose_copy.int` |  |  |  |
-| 458 | `aten.squeeze_copy.dims` |  |  |  |
-| 459 | `aten.alias_copy.default` |  |  |  |
-| 460 | `aten.slice_copy.Tensor` |  |  |  |
-| 461 | `aten.select_copy.int` |  |  |  |
-| 462 | `aten.detach_copy.default` |  |  |  |
-| 463 | `aten.split_with_sizes_copy.default` |  |  |  |
-| 464 | `aten.unbind_copy.int` |  |  |  |
-| 465 | `aten.diagonal_copy.default` |  |  |  |
-| 466 | `aten.unfold_copy.default` |  |  |  |
-| 467 | `aten.repeat_interleave.self_int` | ALLOC | alloc |  |
+| 427 | `aten.diag_embed.default` | FP8 |  |  |
+| 428 | `aten.narrow.default` | FP8 |  |  |
+| 429 | `aten.unbind.int` | FP8 |  |  |
+| 430 | `aten.stack.default` | FP8 |  |  |
+| 431 | `aten.transpose.int` | FP8 |  |  |
+| 432 | `aten.t.default` | FP8 |  |  |
+| 433 | `aten.reshape.default` | FP8 |  |  |
+| 434 | `aten._unsafe_view.default` | FP8 |  |  |
+| 435 | `aten.unfold.default` | FP8 |  |  |
+| 436 | `aten.contiguous.default` | FP8 |  |  |
+| 437 | `aten.lift_fresh_copy.default` | FP8 |  |  |
+| 438 | `aten.detach.default` | FP8 |  |  |
+| 439 | `aten.tile.default` | FP8 |  |  |
+| 440 | `aten.movedim.int` | FP8 |  |  |
+| 441 | `aten.expand_as.default` | FP8 |  |  |
+| 442 | `aten.flatten.using_ints` | FP8 |  |  |
+| 443 | `aten.split.Tensor` | FP8 |  |  |
+| 444 | `aten.chunk.default` | FP8 |  |  |
+| 445 | `aten.squeeze.default` | FP8 |  |  |
+| 446 | `aten.view_as.default` | FP8 |  |  |
+| 447 | `aten.select_backward.default` | FP8 |  |  |
+| 448 | `aten.slice_backward.default` | FP8 |  |  |
+| 449 | `aten.diagonal_backward.default` | FP8 |  |  |
+| 450 | `aten.diagonal_scatter.default` | FP8 |  |  |
+| 451 | `aten.as_strided_scatter.default` | FP8 |  |  |
+| 452 | `aten.unsqueeze_copy.default` | FP8 |  |  |
+| 453 | `aten.view_copy.default` | FP8 |  |  |
+| 454 | `aten.permute_copy.default` | FP8 |  |  |
+| 455 | `aten.expand_copy.default` | FP8 |  |  |
+| 456 | `aten.t_copy.default` | FP8 |  |  |
+| 457 | `aten.transpose_copy.int` | FP8 |  |  |
+| 458 | `aten.squeeze_copy.dims` | FP8 |  |  |
+| 459 | `aten.alias_copy.default` | FP8 |  |  |
+| 460 | `aten.slice_copy.Tensor` | FP8 |  |  |
+| 461 | `aten.select_copy.int` | FP8 |  |  |
+| 462 | `aten.detach_copy.default` | FP8 |  |  |
+| 463 | `aten.split_with_sizes_copy.default` | FP8 |  |  |
+| 464 | `aten.unbind_copy.int` | FP8 |  |  |
+| 465 | `aten.diagonal_copy.default` | FP8 |  |  |
+| 466 | `aten.unfold_copy.default` | FP8 |  |  |
+| 467 | `aten.repeat_interleave.self_int` | ALLOC FP8 | alloc |  |
 | 468 | `aten.view_as_real.default` |  |  | complex |
 | 469 | `aten.view_as_complex.default` |  |  | complex |
 | 470 | `aten.polar.default` |  |  | complex |
 | 471 | `aten.complex.default` |  |  | complex |
-| 472 | `aten.real.default` |  |  | complex |
+| 472 | `aten.real.default` | FP8 |  | complex |
 | 473 | `aten.imag.default` |  |  | complex |
-| 474 | `aten.conj_physical.default` |  |  | complex |
+| 474 | `aten.conj_physical.default` | FP8 |  | complex |
 | 475 | `aten._conj.default` |  |  | complex |
 | 476 | `aten.angle.default` |  |  | complex |
 | 477 | `aten.bernoulli.p` | RNG ALLOC | alloc |  |
-| 478 | `aten.bernoulli.default` | RNG ALLOC | alloc |  |
+| 478 | `aten.bernoulli.default` | RNG ALLOC | probability |  |
 | 479 | `aten.uniform.default` | RNG ALLOC | alloc |  |
 | 480 | `aten.normal_functional.default` | RNG ALLOC | alloc |  |
 | 481 | `aten.normal.Tensor_float` | RNG ALLOC | alloc |  |
-| 482 | `aten.normal.float_Tensor` | RNG ALLOC | alloc |  |
-| 483 | `aten.normal.Tensor_Tensor` | RNG ALLOC | alloc |  |
+| 482 | `aten.normal.float_Tensor` | RNG ALLOC | normal_std |  |
+| 483 | `aten.normal.Tensor_Tensor` | RNG ALLOC | normal_std |  |
 | 484 | `aten.exponential.default` | RNG ALLOC | alloc |  |
 | 485 | `aten.randint.default` | RNG ALLOC | alloc |  |
 | 486 | `aten.randint.low` | RNG ALLOC | alloc |  |
@@ -505,7 +505,7 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 490 | `aten.randint_like.low_dtype` | RNG ALLOC | alloc |  |
 | 491 | `aten.native_dropout_backward.default` | RNG ALLOC | alloc |  |
 | 492 | `aten.normal.float_float` | RNG ALLOC | alloc |  |
-| 493 | `aten.bernoulli.Tensor` | RNG ALLOC | alloc |  |
+| 493 | `aten.bernoulli.Tensor` | RNG ALLOC | probability |  |
 | 494 | `aten.multinomial.default` | RNG RESTRICTED | multinomial |  |
 | 495 | `aten._foreach_add.Scalar` | RESTRICTED | foreach_lengths |  |
 | 496 | `aten._foreach_add.List` | RESTRICTED | foreach_lengths |  |
@@ -555,10 +555,10 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 540 | `aten._foreach_reciprocal.default` | RESTRICTED | foreach_lengths |  |
 | 541 | `aten._foreach_exp.default` | RESTRICTED | foreach_lengths |  |
 | 542 | `aten._foreach_zero.default` | RESTRICTED | foreach_lengths |  |
-| 572 | `reflop.dataset_gather.default` | IDX | dataset_gather |  |
+| 572 | `reflop.dataset_gather.default` | IDX FP8 | dataset_gather |  |
 | 573 | `reflop.bounds_check.default` | IDX | bounds_check |  |
-| 574 | `reflop.nonzero_count.default` |  |  |  |
-| 575 | `reflop.mask_count.default` |  |  |  |
+| 574 | `reflop.nonzero_count.default` | FP8 |  |  |
+| 575 | `reflop.mask_count.default` | FP8 |  |  |
 | 576 | `reflop.randperm_seeded.default` | ALLOC | alloc |  |
 | 577 | `reflop.fused_adam.default` | FUNC RESTRICTED | fused_optim |  |
 | 578 | `reflop.fused_adamw.default` | FUNC RESTRICTED | fused_optim |  |
@@ -587,13 +587,13 @@ Pinned PyTorch: 2.15.0. 582 operators. Flags are explained in [PLAN.md §8.3](PL
 | 556 | `aten.linalg_pinv.atol_rtol_tensor` | RESTRICTED | linalg | linalg |
 | 557 | `aten.linalg_matrix_exp.default` | RESTRICTED | linalg | linalg |
 | 558 | `aten._fft_c2c.default` |  |  | complex |
-| 559 | `aten._scaled_mm.default` | RESTRICTED | scaled_mm | fp8 |
+| 559 | `aten._scaled_mm.default` | RESTRICTED FP8 | scaled_mm | fp8 |
 | 560 | `aten._thnn_fused_lstm_cell.default` |  |  | rnn_fused |
 | 561 | `aten._thnn_fused_lstm_cell_backward_impl.default` |  |  | rnn_fused |
 | 562 | `aten._thnn_fused_gru_cell.default` |  |  | rnn_fused |
 | 563 | `aten._thnn_fused_gru_cell_backward.default` |  |  | rnn_fused |
-| 564 | `aten._cudnn_rnn.default` | RESTRICTED | cudnn_rnn | rnn_fused |
-| 565 | `aten._cudnn_rnn_backward.default` | RESTRICTED | cudnn_rnn | rnn_fused |
+| 564 | `aten._cudnn_rnn.default` | BANNED |  |  |
+| 565 | `aten._cudnn_rnn_backward.default` | BANNED |  |  |
 | 566 | `aten._ctc_loss.default` | IDX RESTRICTED | ctc | ctc |
 | 567 | `aten._ctc_loss_backward.default` | IDX RESTRICTED | ctc | ctc |
 | 568 | `aten._ctc_loss.Tensor` | IDX RESTRICTED | ctc | ctc |

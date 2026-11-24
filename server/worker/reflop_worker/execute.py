@@ -40,7 +40,7 @@ def tensor_from_bytes(data, dt: torch.dtype, shape, device, owned: bool = False)
     if need == 0:
         return torch.empty(shape, dtype=dt, device=device)
     buf = data if owned and isinstance(data, bytearray) else bytearray(data)
-    t = torch.frombuffer(buf, dtype=torch.uint8).view(dt).reshape(shape)
+    t = dtypes.canonical_bool_(torch.frombuffer(buf, dtype=torch.uint8).view(dt).reshape(shape))
     r = validators.measure(t) if dt in validators.INT_DTYPES else None  # on the host: no device sync later
     out = t.to(device)
     validators.set_range(out, r)
@@ -97,6 +97,53 @@ def oom_message(e: BaseException) -> str:
 
     m = re.search(r"Tried to allocate [0-9.]+ [KMGT]?i?B", str(e))
     return (m.group(0) if m else "allocation failed") + "; the device is shared with other sessions"
+
+
+def _ctc_log_alpha(node, pos, kw, flat) -> None:
+    """_ctc_loss leaves log_alpha unwritten past each input length and past
+    2 * target_length + 1 (the CUDA kernel skips an empty input entirely),
+    so those entries hold stale memory (I13). Fill them with -inf, the value
+    both kernels write outside the lattice; the backward reads only the
+    written region."""
+    a = validators._named(node, pos, kw)
+    la = flat[1]
+    dev = la.device
+
+    def lengths(x):
+        if isinstance(x, torch.Tensor):
+            return x.to(device=dev, dtype=torch.long).reshape(-1, 1, 1)
+        return torch.tensor(x, dtype=torch.long, device=dev).reshape(-1, 1, 1)
+
+    il, tl = lengths(a["input_lengths"]), lengths(a["target_lengths"])
+    _, t, s = la.shape
+    la.masked_fill_(torch.arange(t, device=dev).reshape(1, t, 1) >= il, float("-inf"))
+    la.masked_fill_(torch.arange(s, device=dev).reshape(1, 1, s) > 2 * tl, float("-inf"))
+
+
+# Kernel outputs fixed up after the kernel, before anything reads them.
+POST = {"aten._ctc_loss.default": _ctc_log_alpha, "aten._ctc_loss.Tensor": _ctc_log_alpha}
+
+
+def _embedding_bag_contiguous(node, pos, kw, cuda) -> None:
+    """The CPU kernel's sum-mode fast path, which returns an empty
+    offset2bag, also depends on the strides of weight and
+    per_sample_weights. Metas carry no strides the worker checks (E1), so
+    pass both contiguous: then outmeta.py predicts the shape from the
+    dtype and padding_idx alone."""
+    if cuda:
+        return
+    names = [s.name for s in node.op.args if not s.kwarg_only]
+    for name in ("weight", "per_sample_weights"):
+        if name in names:
+            i = names.index(name)
+            if isinstance(pos[i], torch.Tensor):
+                pos[i] = pos[i].contiguous()
+        elif isinstance(kw.get(name), torch.Tensor):
+            kw[name] = kw[name].contiguous()
+
+
+# Kernel arguments adjusted before the kernel runs.
+PRE = {"aten._embedding_bag.default": _embedding_bag_contiguous}
 
 
 def is_cuda_fatal(e: BaseException) -> bool:
@@ -192,6 +239,11 @@ class Executor:
                     raise ReflopError(cpb.ERROR_RESOURCE_LIMIT, f"output {o} is too large to return", E1)
             elif spec.kind != k.KIND_DISCARD:
                 raise binding_error(f"output {o}: unknown output kind")
+        # Counted here, or the commit would store some outputs and then fail (#25).
+        new = sum(spec.kind == cpb.OutputSpec.KIND_STORE for spec in ex.outputs)
+        if new and len(self.handles) + new > self.handles.max:
+            raise ReflopError(cpb.ERROR_RESOURCE_LIMIT, f"storing {new} outputs would exceed "
+                              f"{self.handles.max} live handles", E1)
         env["__scalars__"] = scalars
         return env
 
@@ -227,7 +279,7 @@ class Executor:
                 outs.append((r, m.dtype, tuple(m.shape), r in prog.last_use))
             plans.append((node, node.op.fn, natives.is_native(node.op), args, outs,
                           validators.has_runtime(node.op), bool(node.op.flags & FLAG_UNINIT),
-                          expiring.get(node.index, ())))
+                          expiring.get(node.index, ()), PRE.get(node.op.name), POST.get(node.op.name)))
         prog._compiled = plans
         return plans
 
@@ -243,7 +295,7 @@ class Executor:
         node = None
         try:
             with torch.inference_mode():
-                for node, fn, native, args, outs, check, uninit, free in plans:
+                for node, fn, native, args, outs, check, uninit, free, pre, post in plans:
                     pos, kw = [], {}
                     for is_kw, name, kind, val in args:
                         if kind == 0:
@@ -263,6 +315,8 @@ class Executor:
                             pos.append(v)
                     if check:
                         validators.check_runtime(node, pos, kw)
+                    if pre is not None:
+                        pre(node, pos, kw, dev.type == "cuda")
                     out = natives.call(node.op.name, pos, kw, dev) if native else fn(*pos, **kw)
                     if isinstance(out, torch.Tensor):
                         flat = [out]
@@ -272,10 +326,12 @@ class Executor:
                         raise ReflopError(cpb.ERROR_INTERNAL, f"{node.op.name}: produced {len(flat)} outputs, "
                                           f"validated {len(outs)}", E3, node.index, node.op.id)
                     propagate_range(node, pos, flat)
+                    if post is not None:
+                        post(node, pos, kw, flat)
                     for t, (r, dt, shape, used) in zip(flat, outs):
-                        # A few kernels give unused auxiliary outputs a different
-                        # shape than their meta kernel (e.g. _embedding_bag's
-                        # offset2bag). Anything that is consumed must match.
+                        # V4 gives every output the shape and dtype the device's
+                        # kernel returns (outmeta.py). Anything consumed must
+                        # match; an unused output that does not is never read.
                         if used and (t.dtype != dt or tuple(t.shape) != shape):
                             raise ReflopError(cpb.ERROR_INTERNAL, f"{node.op.name}: output is {t.dtype}"
                                               f"{list(t.shape)}, validated {dt}{list(shape)}", E3,

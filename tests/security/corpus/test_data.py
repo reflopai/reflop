@@ -26,6 +26,9 @@ CASES = {
     "duplicate": b"",
     "extra field": st({"x": {"dtype": "U8", "shape": [1], "data_offsets": [0, 1], "exec": "rm -rf /"}}, b"\0"),
     "negative": st({"x": {"dtype": "U8", "shape": [1], "data_offsets": [-1, 0]}}, b"\0"),
+    # No elements, but no tensor can have these dims (#25).
+    "empty, dim past int64": st({"x": {"dtype": "U8", "shape": [0, 2**63], "data_offsets": [0, 0]}}),
+    "empty, strides overflow": st({"x": {"dtype": "F32", "shape": [0, 2**40, 2**40], "data_offsets": [0, 0]}}),
 }
 
 

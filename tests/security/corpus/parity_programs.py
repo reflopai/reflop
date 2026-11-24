@@ -2,8 +2,11 @@
 """Seed programs for the meta/kernel parity test (parity.py, #21).
 
 PROGRAMS run small PyTorch computations on CPU tensors; every aten call in
-the opset they make becomes a seed. DIRECT builds seeds for ops no CPU
-program reaches through the dispatcher (reflop natives, .vec overloads)."""
+the opset they make becomes a seed. CUDA_PROGRAMS do the same on CUDA
+tensors for the kernels only CUDA dispatches to (the fused RNN cells,
+fused RMS norm); their seeds exist only where CUDA does. DIRECT builds seeds for ops no CPU program reaches
+through the dispatcher (reflop natives, .vec overloads). REFUSED lists
+calls the kernels refuse that no mutation of a seed makes."""
 
 from __future__ import annotations
 
@@ -108,6 +111,26 @@ PROGRAMS = [
                    A.linspace.default(0, 1, 5), A.logspace.default(0, 2, 4, 10.0),
                    A.empty.memory_format([2, 3]), A.empty_strided.default([2, 3], [3, 1]),
                    A.new_empty.default(x, [4]), A.new_empty_strided.default(x, [2, 2], [2, 1])), (3, 4)),
+    # factories with float values, and fills of narrow dtypes (ADR-049)
+    _fw(lambda x: (A.arange.default(2.5), A.arange.start(0.5, 3.0), A.arange.start_step(0.0, 2.0, 0.5),
+                   A.linspace.default(0.0, 1.0, 5), A.logspace.default(0.0, 2.0, 4, 2.0),
+                   A.full.default([2], 2.5, dtype=torch.float16), A.full.default([2], 1.5, dtype=torch.int8),
+                   A.full_like.default(x.to(torch.uint8), 1.5), A.new_full.default(x.half(), [2], 0.5),
+                   A.fill.Scalar(x, 0.5), A.fill.Scalar(x.to(torch.int16), 0.5),
+                   A.scalar_tensor.default(0.5, dtype=torch.float16), A.scalar_tensor.default(0.5, dtype=torch.int32),
+                   A.constant_pad_nd.default(x.half(), [1, 1], 0.5)), (3, 4)),
+    # random numbers: the decisions and output metas, not the values
+    _fw(lambda x: (A.rand.default([2, 3]), A.randn.default([2, 3]), A.randperm.default(5),
+                   A.randint.default(10, [2, 3]), A.randint.low(-5, 5, [2, 3]),
+                   A.rand_like.default(x), A.randn_like.default(x), A.randint_like.default(x, 10),
+                   A.randint_like.low_dtype(x, -3, 3), A.normal.float_float(0.0, 2.0, [2, 3]),
+                   A.bernoulli.p(x, 0.3), A.bernoulli.default(x.sigmoid()), A.bernoulli.Tensor(x, x.sigmoid()),
+                   A.uniform.default(x, -1.0, 2.0), A.normal_functional.default(x, 0.5, 2.0),
+                   A.normal.Tensor_float(x, 1.5), A.normal.float_Tensor(0.5, x.abs()),
+                   A.normal.Tensor_Tensor(x, x.abs()), A.exponential.default(x, 1.5),
+                   A.native_dropout.default(x, 0.5, True), A.native_dropout.default(x, 0.5, False),
+                   A.native_dropout_backward.default(x, x > 0, 2.0), A.multinomial.default(x.abs(), 2, False),
+                   A.multinomial.default(x.abs(), 5, True)), (3, 4)),
     # indexing
     _bk(lambda x: (x.gather(1, IDX), x.index_select(1, IDX[0]), x[IDX[:, 0]], x[:, IDX[0]],
                    x.take(IDX), torch.zeros(3, 5).scatter_add(1, IDX, x[:3, :2]),
@@ -268,6 +291,26 @@ PROGRAMS += [
 ]
 
 
+def _cells():
+    for kind in (torch.nn.LSTMCell, torch.nn.GRUCell):
+        for bias in (True, False):
+            torch.manual_seed(0)
+            m = kind(4, 5, bias=bias).cuda()
+            out = m(_g(2, 4).cuda().requires_grad_())
+            (out[0] if isinstance(out, tuple) else out).sum().backward()
+
+
+def _rms_norm():
+    for shape, dt in (((3, 8), torch.float32), ((2, 3, 8), torch.float16), ((3, 8), torch.bfloat16)):
+        x = _g(*shape).to(dt).cuda().requires_grad_()
+        w = _g(8, seed=1).to(dt).cuda().requires_grad_()
+        F.rms_norm(x, (8,), w, 1e-5).sum().backward()
+        F.rms_norm(x.detach().requires_grad_(), (shape[-1],)).sum().backward()
+
+
+CUDA_PROGRAMS = [_cells, _rms_norm]
+
+
 def DIRECT():
     """Seeds no CPU program reaches through the dispatcher."""
     from parity import Call
@@ -302,4 +345,60 @@ def DIRECT():
             Call("reflop.amp_unscale_and_check.default", [gr, torch.zeros(1), T([0.5])]),
             Call("reflop.amp_update_scale.default", [T([1024.0]), T([0], dtype=torch.int32), T([0.0]), 2.0, 0.5,
                                                      2000])]
+    # Calls the meta kernel refuses and the kernels run (outmeta.META).
+    out += [Call("aten.affine_grid_generator.default", [_g(2, 2, 3), [2, 1, 0, 4], False]),
+            Call("aten.affine_grid_generator.default", [_g(0, 3, 4), [0, 1, 2, 3, 4], True]),
+            Call("aten.view_copy.default", [_g(3, 4).t(), [12]])]
+    # FP8 ops (ADR-050) that decompose before the dispatcher, so no program
+    # records them; mutations() casts their floats to float8.
+    y, y2 = _g(3, 4), _g(3, 4, seed=1)
+    out += [Call(f"aten.{n}.default", [y]) for n in (
+        "alias", "alias_copy", "detach_copy", "isfinite", "isinf", "lift_fresh_copy", "positive", "t_copy",
+        "conj_physical", "real")]
+    out += [Call("aten.as_strided_scatter.default", [_g(4, 4), _g(2, 2, seed=1), [2, 2], [4, 1], 1]),
+            Call("aten.chunk.default", [y, 2, 1]),
+            Call("aten.contiguous.default", [y, torch.contiguous_format]),
+            Call("aten.copy.default", [y, y2, False]),
+            Call("aten.diagonal_scatter.default", [_g(4, 4), _g(3, seed=1), 1, 0, 1]),
+            Call("aten.expand_as.default", [_g(3, 1), y]),
+            Call("aten.flatten.using_ints", [x, 1, 2]),
+            Call("aten.movedim.int", [x, 1, 3]),
+            Call("aten.narrow.default", [y, 1, 1, 2]),
+            Call("aten.ne.Scalar", [y, 0.5]),
+            Call("aten.ne.Tensor", [y, y2]),
+            Call("aten.repeat_interleave.self_int", [y, 2, 1, None]),
+            Call("aten.reshape.default", [y, [2, 6]]),
+            Call("aten.select_scatter.default", [y, _g(4, seed=1), 0, 1]),
+            Call("aten.slice_scatter.default", [y, _g(3, 2, seed=1), 1, 1, 3, 1]),
+            Call("aten.squeeze.default", [_g(3, 1, 4)]),
+            Call("aten.tile.default", [y, [2, 1]]),
+            Call("aten.view_as.default", [y, _g(2, 6, seed=1)]),
+            Call("reflop.mask_count.default", [y]),
+            Call("reflop.nonzero_count.default", [y]),
+            # mat2 column-major, as b.t() gives it; a CPU session has no fp8.
+            Call("aten._scaled_mm.default", [_g(16, 32).to(torch.float8_e4m3fn),
+                                             _g(32, 16, seed=1).to(torch.float8_e4m3fn), torch.tensor(1.0),
+                                             torch.tensor(0.5), None, None, torch.bfloat16, False], transposed=1),
+            Call("aten._scaled_mm.default", [_g(16, 32).to(torch.float8_e4m3fn),
+                                             _g(32, 48, seed=1).to(torch.float8_e4m3fn), torch.ones(16, 1),
+                                             torch.ones(1, 48), _g(48, seed=2).bfloat16(), None, torch.bfloat16,
+                                             True], transposed=1)]
     return out
+
+
+def REFUSED():
+    """Calls the kernels refuse and no mutation reaches, so each rule in
+    prechecks.py has a case to refuse."""
+    from parity import Call
+
+    wb, ib, ob = _g(6, 4), torch.tensor([1, 2, 4, 5, 4, 3]), torch.tensor([0, 2, 4])
+    eb, o2b, bs, mi = A._embedding_bag.default(wb, ib, ob, False, 2)
+    per_offset = torch.cat([bs, bs[:1]])  # as the CUDA forward gives bag_size
+    yes = torch.ones(3, dtype=torch.bool)
+    return [Call("aten.threshold_backward.default", [yes, yes, 0]),
+            Call("aten.min.dim", [torch.zeros(2, 0), 1, False]),
+            Call("aten._embedding_bag_backward.default", [torch.ones_like(eb), ib, ob, o2b, per_offset, mi, 6, False,
+                                                          2, False, None, -1]),
+            Call("aten._embedding_bag_dense_backward.default", [torch.ones_like(eb), ib, o2b, per_offset, mi, 6, False,
+                                                                2, None, -1]),
+            Call("aten.affine_grid_generator.default", [_g(2, 2, 3).half(), [2, 1, 1, 4], False])]

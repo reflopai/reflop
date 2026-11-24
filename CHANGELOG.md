@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+The worker checks more of what a Guest sends (ADR-049 to ADR-051). Update
+the daemon and the client together: an older client works with this daemon,
+but on a server-CPU session this client needs this daemon for eval-mode
+BatchNorm with gradients (an older daemon fails it with an internal error).
+
+- The worker refuses during validation, before it allocates anything, the
+  operator calls that a kernel would refuse after allocating or crash on.
+  It also predicts the exact output shapes and dtypes of each device's
+  kernels, and the client records the same ones. EmbeddingBag's backward,
+  a BatchNorm as a model's first layer and `F.logsigmoid`'s backward on
+  CUDA used to fail with an internal or binding error and now match PyTorch.
+- Operators that allocate from their arguments, such as `arange`, take
+  literal values, not scalar graph inputs. The Python client already sends
+  literals.
+- Float8 tensors are accepted only by the operators whose CUDA kernels take
+  them; `docs/OPSET.md` marks them `FP8`.
+- The fused CUDA attention kernels and `_cudnn_rnn` are refused, because
+  they crash on malformed input. The Python client never sent them.
+- `_ctc_loss` no longer returns uninitialized memory in `log_alpha`.
+- Gathering from a dataset with several shards no longer copies the whole
+  dataset in host memory, and a dataset the worker refuses always closes
+  its files.
+- A snapshot or checkpoint with an invalid RNG state or too many dimensions
+  is refused before anything is restored.
+- New tests compare the worker's checks with PyTorch's kernels on CPU and
+  CUDA, and a new fuzzer drives uploads, fetches, datasets, snapshots and
+  checkpoints, nightly as well.
+
 ## 0.2.11 (2026-11-24)
 
 - New GPU pairings use short names like `nvidia-mx450` and `nvidia-h100-2`.
