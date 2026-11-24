@@ -1425,3 +1425,26 @@ refused with `OUT_OF_MEMORY` or `QUOTA` at V5 where they used to fail
 during execute. The fuzz session caps `max_fetch_bytes` at 64 MiB and the
 device quota at 256 MiB so a fuzzed size never reaches the allocator. Not
 yet fuzzed: uploads, fetches, datasets, snapshots and checkpoints.
+
+## ADR-045: Unregister in-process CUDA snapshot buffers at teardown
+
+**Context.** Snapshot and checkpoint staging uses two host buffers registered
+with CUDA. A daemon worker owns its process. An in-process worker can go away
+while its CUDA context is still alive. Reusing a freed buffer's address could
+leave a later copy targeting a stale mapping, silently corrupting saved data.
+
+**Decision.** Track each successful registration, including when only the
+first slot registers. Closing the in-process connection or replacing its
+worker waits for the writer, then unregisters the buffers on the worker's
+device before releasing them. The writer drains its copy stream even if a
+file write fails. If CUDA reports an unregister error, surface it and keep
+that buffer alive until it can be unregistered or the process ends.
+
+**Alternatives.** Relying on Python garbage collection ties cleanup to when
+the last reference disappears. Disabling pinning for local sessions avoids
+registration cleanup but changes the copy path used for diagnostics.
+
+**Consequences.** In-process close and recovery can wait for an outstanding
+write. Daemon processes still release their registrations at exit. CPU tests
+check teardown order and partial registration. CUDA tests compare snapshot
+restores and checkpoint recovery across repeated session openings.

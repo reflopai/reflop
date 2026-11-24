@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Reopening an in-process CUDA session no longer corrupts snapshots or
+  checkpoints. Closing or replacing the local worker now waits for the
+  writer and unregisters its staging buffers before releasing them.
+
 ## 0.2.8 (2026-11-23)
 
 This patch fixes complex `conj()` views and backward through `select` and

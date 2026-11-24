@@ -1,8 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """reflop.save/load, automatic checkpoints and reflop.recover (ADR-028,
-ADR-029), through the client API and the in-process worker on the CPU."""
+ADR-029), through the client API and the in-process worker."""
 
+import gc
 import time
+from contextlib import nullcontext
+from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import reflop
@@ -10,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from reflop import session as S
+from reflop_worker import checkpoint
 
 
 @pytest.fixture
@@ -181,3 +186,105 @@ def test_owner_turning_checkpoints_off_does_not_break_training(owner_interval):
     reflop.checkpoint_tag({"step": 1})  # still fine
     step(x, y)
     reflop.step_boundary()
+
+
+@pytest.mark.parametrize("replace_worker", [False, True], ids=["close", "replace"])
+def test_local_teardown_joins_before_releasing_partial_registration(owner_interval, monkeypatch, replace_worker):
+    registered = []
+    events = []
+
+    def register(ptr, _size, _flags):
+        registered.append(ptr)
+        return int(len(registered) > 1)
+
+    def unregister(ptr):
+        events.append(ptr)
+        return 0
+
+    monkeypatch.setattr(checkpoint, "RING", 4096)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: SimpleNamespace(cudaHostRegister=register,
+                                                                   cudaHostUnregister=unregister))
+    reflop.device(local="cpu")
+    sess = S.current()
+    conn = sess.conn
+    writer = conn.worker.writer
+    writer.ring = checkpoint.Ring(torch.device("cuda:0"))
+    assert not writer.ring.pinned  # second registration failed; the first is still live
+    writer.thread = SimpleNamespace(join=lambda: events.append("joined"))
+
+    if replace_worker:
+        conn.new_session()
+    else:
+        sess.close()
+    assert events == ["joined", registered[0]]
+    assert writer.ring is None
+    writer.close()
+    assert events == ["joined", registered[0]]
+
+
+def test_ring_keeps_only_failed_unregistration_for_retry(monkeypatch):
+    monkeypatch.setattr(checkpoint, "RING", 4096)
+    monkeypatch.setattr(torch.cuda, "device", lambda _device: nullcontext())
+    runtime = SimpleNamespace(cudaHostRegister=Mock(return_value=0),
+                              cudaHostUnregister=Mock(side_effect=[1, 0, 0]))
+    monkeypatch.setattr(torch.cuda, "cudart", lambda: runtime)
+    monkeypatch.setattr(torch.cuda, "check_error", Mock(side_effect=RuntimeError("unregister failed")))
+    ring = checkpoint.Ring(torch.device("cuda:0"))
+    first, second = (view.data_ptr() for view in ring.views)
+
+    try:
+        with pytest.raises(RuntimeError, match="unregister failed"):
+            ring.close()
+        assert checkpoint._registered_buffers[first] is ring.bufs[0]
+        assert second not in checkpoint._registered_buffers
+    finally:
+        ring.close()
+
+    assert first not in checkpoint._registered_buffers
+    assert [call.args[0] for call in runtime.cudaHostUnregister.call_args_list] == [first, second, first]
+
+
+def test_snapshot_drains_cuda_stream_after_write_error(monkeypatch):
+    stream = Mock()
+    monkeypatch.setattr(checkpoint, "RING", 4)
+    monkeypatch.setattr(torch.cuda, "Stream", lambda _device: stream)
+    monkeypatch.setattr(torch.cuda, "Event", Mock)
+    monkeypatch.setattr(torch.cuda, "stream", lambda _stream: nullcontext())
+    write = Mock(side_effect=[None, OSError("disk full")])
+    monkeypatch.setattr(checkpoint, "_write_all", write)
+
+    writer = checkpoint.Writer(SimpleNamespace(device=torch.device("cuda:0")))
+    writer.ring = checkpoint.Ring(torch.device("cpu"))
+    writer.ring.pinned = True
+    tensor = torch.arange(8, dtype=torch.uint8)
+    with pytest.raises(OSError, match="disk full"):
+        writer._write(-1, [("value", tensor)], b"header", object())
+    stream.synchronize.assert_called_once_with()
+
+
+@pytest.mark.parametrize("checkpointing", [False, True], ids=["snapshot", "checkpoint"])
+def test_reopening_local_cuda_preserves_saved_values(owner_interval, devname, checkpointing):
+    if devname != "cuda":
+        pytest.skip("requires CUDA")
+    owner_interval(1)
+    for i in range(5):
+        dev = reflop.device(local="cuda", checkpoint=checkpointing)
+        sess = S.current()
+        expected = torch.arange(256 * 1024, dtype=torch.float32) + i + 1
+        tensor = expected.to(dev)
+        if checkpointing:
+            reflop.checkpoint_tag({"iteration": i})
+            take_checkpoint(sess)
+            tensor.zero_()
+            reflop.synchronize()
+            sess.conn.kill_worker()
+            assert reflop.recover() == {"iteration": i}
+            restored = tensor
+        else:
+            reflop.save("weights", {"tensor": tensor})
+            restored = reflop.load("weights")["tensor"]
+        assert torch.equal(restored.cpu(), expected), f"session {i}"
+        reflop.close()
+        del sess, tensor, restored
+        gc.collect()

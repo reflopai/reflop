@@ -27,6 +27,7 @@ import json
 import os
 import threading
 import time
+from contextlib import ExitStack
 
 import torch
 
@@ -42,6 +43,9 @@ RNG_CUDA_KEY = RESERVED + "rng/cuda"
 MAX_TAG = 4096
 # Headroom the GPU keeps beyond the state's size before a cut is allowed.
 GPU_MARGIN = 256 << 20
+# Keep backing storage alive until CUDA confirms it has unmapped the pointer,
+# including when teardown raises and the session is collected.
+_registered_buffers: dict[int, bytearray] = {}
 
 
 class Skip(Exception):
@@ -62,16 +66,38 @@ class Ring:
     has no numpy and the worker uses no ctypes); CUDA pins them with
     cudaHostRegister."""
 
-    def __init__(self, cuda: bool) -> None:
+    def __init__(self, device: torch.device) -> None:
+        self.device = device
         self.bufs = [bytearray(RING) for _ in range(2)]
         self.views = [torch.frombuffer(b, dtype=torch.uint8) for b in self.bufs]
-        self.pinned = False
-        if cuda:
+        self._registered: list[int] = []
+        if device.type == "cuda":
+            with torch.cuda.device(device):
+                rt = torch.cuda.cudart()
+                for buf, view in zip(self.bufs, self.views):
+                    ptr = view.data_ptr()
+                    if int(rt.cudaHostRegister(ptr, RING, 0)) != 0:
+                        break
+                    _registered_buffers[ptr] = buf
+                    self._registered.append(ptr)
+        self.pinned = len(self._registered) == len(self.bufs)
+
+    def close(self) -> None:
+        if not self._registered:
+            return
+        with torch.cuda.device(self.device):
             rt = torch.cuda.cudart()
-            ok = True
-            for v in self.views:
-                ok = ok and int(rt.cudaHostRegister(v.data_ptr(), RING, 0)) == 0
-            self.pinned = ok
+            error = 0
+            for ptr in self._registered[:]:
+                status = int(rt.cudaHostUnregister(ptr))
+                if status == 0:
+                    self._registered.remove(ptr)
+                    del _registered_buffers[ptr]
+                elif error == 0:
+                    error = status
+            self.pinned = False
+            if error:
+                torch.cuda.check_error(error)
 
 
 class Writer:
@@ -86,6 +112,15 @@ class Writer:
 
     def busy(self) -> bool:
         return self.thread is not None and self.thread.is_alive()
+
+    def close(self) -> None:
+        """Release staging buffers after the in-process writer has finished."""
+        if self.thread is not None:
+            self.thread.join()
+            self.thread = None
+        if self.ring is not None:
+            self.ring.close()
+            self.ring = None
 
     # -------------------------------------------------------------- the cut
 
@@ -162,7 +197,7 @@ class Writer:
         with self.lock:
             self.go[rid] = (gate, verdict)
         if self.ring is None:
-            self.ring = Ring(self.sess.device.type == "cuda")
+            self.ring = Ring(self.sess.device)
         self.thread = threading.Thread(target=self._run, args=(msg, fd, items, hb, total, ev, gate, verdict, done),
                                        name="reflop-snapshot", daemon=True)
         self.thread.start()
@@ -220,8 +255,11 @@ class Writer:
             if last >= 0:
                 items[last] = None  # copied: the GPU memory of an old version can go
 
-        ctx = torch.cuda.stream(stream) if cuda else _null()
-        with ctx:
+        with ExitStack() as stack:
+            if cuda:
+                stack.enter_context(torch.cuda.stream(stream))
+                # A disk error can leave a copy in flight to the other slot.
+                stack.callback(stream.synchronize)
             for i in range(len(items)):
                 t = items[i][1]
                 n = t.numel() * t.element_size()
@@ -248,16 +286,6 @@ class Writer:
                 del src, flat_src, t
             if pending is not None:
                 flush_pending()
-        if cuda:
-            stream.synchronize()
-
-
-class _null:
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *a):
-        return False
 
 
 def _write_all(fd: int, mv: memoryview) -> None:
