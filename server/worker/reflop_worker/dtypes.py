@@ -23,18 +23,32 @@ CAPABILITY = {
 INT64_MAX = (1 << 63) - 1
 
 
+def canonical_bool_(t: torch.Tensor) -> torch.Tensor:
+    """In place, on a tensor built from guest bytes: a bool byte other than
+    0 or 1 becomes 1. C++ kernels assume bools hold 0 or 1, and kernels
+    disagree on what other bytes mean (#25)."""
+    if t.dtype == torch.bool and t.numel():
+        t.view(torch.uint8).clamp_(max=1)
+    return t
+
+
 def itemsize(dt: torch.dtype) -> int:
     return torch.empty((), dtype=dt, device="meta").element_size()
 
 
 def numel_checked(shape, max_numel: int) -> int:
-    """Product of dims with overflow and limit checks (§2.3 integer overflow)."""
-    n = 1
+    """Product of dims with overflow and limit checks (§2.3 integer overflow).
+
+    The non-zero dims are bounded too: a zero dim makes the element count 0
+    whatever the others are, but their strides must still fit in int64
+    (GH#4, #25: [0, 2**62, 2**62] makes torch.empty raise)."""
+    n = nz = 1
     for d in shape:
         if d < 0:
             raise ValueError(f"negative dimension {d}")
         n *= d
-        if n > max_numel:
+        nz *= d or 1
+        if nz > max_numel:
             raise OverflowError(f"tensor of shape {list(shape)} exceeds {max_numel} elements")
     return n
 

@@ -42,16 +42,6 @@ def detect_capabilities(device: torch.device, allowed: set[str] | None) -> list[
         major, minor = torch.cuda.get_device_capability(device)
         if (major, minor) >= (8, 9):
             caps.add("fp8")
-        try:
-            from torch.backends.cuda import is_flash_attention_available
-
-            if is_flash_attention_available():
-                caps.add("flash_attention")
-        except ImportError:
-            pass
-        caps.add("efficient_attention")
-        if torch.backends.cudnn.is_available():
-            caps.add("cudnn_attention")
     keep = set()
     for c in caps:
         if c in CAPABILITY_KEYS and allowed is not None and c not in allowed:
@@ -389,6 +379,10 @@ class Session:
         for k in msg.keys:
             if k not in hdr or k.startswith(RESERVED):
                 raise ReflopError(cpb.ERROR_PROTOCOL, f"snapshot has no tensor {k[:64]!r}")
+            if len(hdr[k][1]) > self.limits.max_dims:
+                # The same limit as an upload: every handle can be bound.
+                raise ReflopError(cpb.ERROR_RESOURCE_LIMIT, f"snapshot tensor {k[:64]!r} has {len(hdr[k][1])} "
+                                  f"dims; the limit is {self.limits.max_dims}")
         rng = {}
         if msg.restore_rng:
             want = {RNG_CPU_KEY: torch.get_rng_state().numel()}
@@ -422,13 +416,20 @@ class Session:
                         if got != m:
                             raise ReflopError(cpb.ERROR_PROTOCOL, "snapshot file is truncated")
                         dst[off:off + m].copy_(stage[:m])
-                out[h] = t
+                out[h] = dtypes.canonical_bool_(t)
             states = {}
             for k, (_dt, _shape, b, e) in rng.items():
                 raw = os.pread(fd, e - b, start + b)
                 if len(raw) != e - b:
                     raise ReflopError(cpb.ERROR_PROTOCOL, "snapshot file is truncated")
                 states[k] = torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone()
+                # set_rng_state rejects a state it cannot use (an mt19937 index
+                # out of range, a Philox offset not a multiple of 4): try it on
+                # a scratch generator first, so the commit below cannot fail.
+                try:
+                    torch.Generator(self.device if k == RNG_CUDA_KEY else "cpu").set_state(states[k])
+                except RuntimeError:
+                    raise ReflopError(cpb.ERROR_PROTOCOL, "checkpoint RNG state is not valid") from None
         except torch.OutOfMemoryError:
             out.clear()
             if self.device.type == "cuda":

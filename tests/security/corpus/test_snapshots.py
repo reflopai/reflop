@@ -189,6 +189,54 @@ def test_rng_restore_checks_size(tmp_path):
     assert len(s.handles) == 0
 
 
+def _file(p, items):
+    from reflop_worker import safetensors as st
+
+    hb, _ = st.header([(k, t.dtype, tuple(t.shape)) for k, t in items])
+    p.write_bytes(hb + b"".join(st.tensor_bytes(t) for _k, t in items))
+
+
+@pytest.mark.parametrize("off", [9, 11, 17, 19])
+def test_rng_restore_checks_state(tmp_path, off):
+    # An mt19937 state with a bad left or next field passed the size check,
+    # and torch.set_rng_state refused it after the handles were committed.
+    state = torch.get_rng_state()
+    bad = state.clone()
+    bad[off] ^= 0x80
+    p = tmp_path / "bad"
+    _file(p, [(H1.hex(), torch.ones(1)), (RNG_CPU_KEY, bad)])
+    s = session()
+    with pytest.raises(ReflopError) as e:
+        read(s, p, [H1.hex()], [H1], rng=True)
+    assert e.value.code == cpb.ERROR_PROTOCOL
+    assert len(s.handles) == 0 and torch.equal(torch.get_rng_state(), state)
+
+
+def test_restore_checks_rank(tmp_path):
+    # The file format allows 16 dims; a session may allow fewer.
+    s = session()
+    s.limits.max_dims = 4
+    p = tmp_path / "deep"
+    _file(p, [("a", torch.ones([1] * 5))])
+    with pytest.raises(ReflopError) as e:
+        read(s, p, ["a"], [H1])
+    assert e.value.code == cpb.ERROR_RESOURCE_LIMIT and len(s.handles) == 0
+
+
+@pytest.mark.parametrize("shape", [[0, 2**63], [0, 2**40, 2**40]])
+def test_restore_of_impossible_empty_shape_fails_closed(tmp_path, shape):
+    # numel 0 passed, and torch.empty raised a TypeError or RuntimeError.
+    import json
+
+    h = json.dumps({"a": {"dtype": "F32", "shape": shape, "data_offsets": [0, 0]}}).encode()
+    p = tmp_path / "empty"
+    p.write_bytes(struct.pack("<Q", len(h)) + h)
+    s = session()
+    with pytest.raises(ReflopError):
+        read(s, p, ["a"], [H1])
+    assert len(s.handles) == 0
+
+
 HELPER = ROOT / "server/reflopd/internal/suspend/helper.py"
 
 

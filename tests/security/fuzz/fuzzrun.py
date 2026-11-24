@@ -13,6 +13,9 @@ properties of GH#4 (ADR-044):
 4. Execution holds no more memory than V5 computed (`peak_memory_bytes`),
    within a small allowance for transient copies (see `allowance`).
 5. The worker keeps serving after every case.
+6. On CUDA, no request leaves an asynchronous kernel fault behind (the
+   device is synchronized after each one, so a fault is pinned to the
+   request that caused it).
 
 Cases are written as replay files (framed WorkerEnvelopes, the worker's
 own wire format) so a failure can be added to `corpus/`."""
@@ -25,6 +28,7 @@ import struct
 import weakref
 from pathlib import Path
 
+import graphgen
 import torch
 from google.protobuf.message import DecodeError
 from graphgen import Case
@@ -39,16 +43,17 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_flatten
 
 CORPUS = Path(__file__).resolve().parent / "corpus"
-KNOWN_INTERNAL = ("output is ",)  # E3: "<op>: output is <meta>, validated <meta>" (fails closed, ADR-042)
 
 
 class LiveBytes(TorchDispatchMode):
     """Bytes of tensor storage alive at once, for storages created by aten
     calls made while the mode is active (all of a worker execute: bindings,
-    node outputs, runtime checks, output copies)."""
+    node outputs, runtime checks, output copies). Storages in exclude (by
+    data pointer) existed before and are not counted."""
 
-    def __init__(self) -> None:
+    def __init__(self, exclude: set[int] | frozenset = frozenset()) -> None:
         super().__init__()
+        self.exclude = exclude
         self.live = 0
         self.peak = 0
         self._refs: dict[int, list] = {}
@@ -59,7 +64,7 @@ class LiveBytes(TorchDispatchMode):
             if isinstance(t, torch.Tensor) and t.device.type != "meta":
                 st = t.untyped_storage()
                 ptr, nb = st.data_ptr(), st.nbytes()
-                if nb == 0:
+                if nb == 0 or ptr in self.exclude:
                     continue
                 e = self._refs.get(ptr)
                 if e is None:
@@ -137,8 +142,12 @@ def frames(case: Case) -> list[bytes]:
 
 
 def save(case: Case, path: Path) -> None:
+    save_frames(frames(case), path)
+
+
+def save_frames(frs: list[bytes], path: Path) -> None:
     with open(path, "wb") as f:
-        for fr in frames(case):
+        for fr in frs:
             f.write(struct.pack(">I", len(fr)) + fr)
 
 
@@ -192,6 +201,9 @@ def run_frames(sess, frs: list[bytes], case: Case | None = None) -> list[str]:
             return [f"{which}: worker lost its device: {e}"]
         except Exception as e:  # noqa: BLE001 - property 2
             return [f"{which}: {type(e).__name__} escaped Session.handle: {str(e)[:300]}"]
+        fault = device_fault(sess)
+        if fault:
+            return [f"{which}: {fault}"]
         finals = [o for o in out if o.end]
         if len(finals) != 1:
             return [f"{which}: {len(finals)} final responses"]
@@ -199,7 +211,7 @@ def run_frames(sess, frs: list[bytes], case: Case | None = None) -> list[str]:
         body = r.WhichOneof("body")
         if body == "error":
             e = r.error
-            if e.code == cpb.ERROR_INTERNAL and not any(k in e.message for k in KNOWN_INTERNAL):
+            if e.code == cpb.ERROR_INTERNAL:
                 findings.append(f"{which}: INTERNAL error: {e.message[:300]}")
             if e.stage == cpb.STAGE_NONE and e.code not in (cpb.ERROR_PROTOCOL, cpb.ERROR_UNKNOWN_GRAPH):
                 findings.append(f"{which}: error without a stage: {cpb.ErrorCode.Name(e.code)} {e.message[:200]}")
@@ -255,6 +267,81 @@ def still_serving(sess) -> str | None:
     if out[-1].WhichOneof("body") != "execute_result":
         return f"worker stopped serving: {out[-1]}"
     return None
+
+
+def device_fault(sess) -> str | None:
+    """A kernel fault the last request left on the device (property 6)."""
+    if sess.device.type != "cuda":
+        return None
+    try:
+        torch.cuda.synchronize(sess.device)
+    except Exception as e:  # noqa: BLE001 - any failure here is the finding
+        return f"device fault: {type(e).__name__}: {str(e)[:300]}"
+    return None
+
+
+def fuzz_graphs(sess, seed: int, start: int, end: int, *, first: bool = False, progress=None) -> list[str]:
+    """Cases start..end of a seed on one session; the failures. With first,
+    stop at the first one (a CUDA child process, whose context a fault may
+    have killed). progress(i) is called before case i runs."""
+    out = artifact_dir()
+    tag = "" if sess.device.type == "cpu" else f"{sess.device.type}-"
+    failures = []
+    for i in range(start, end):
+        if progress is not None:
+            progress(i)
+        c = graphgen.case(seed, i, sess)
+        if out is not None:
+            save(c, out / f"{tag}current.bin")
+        findings = run_frames(sess, frames(c), c)
+        if not findings and i % 50 == 0:
+            gone = still_serving(sess)
+            findings = [gone] if gone else []
+        if findings:
+            failures.append(f"seed {seed} case {i} ({c.kind}): " + "; ".join(findings))
+            if out is not None:
+                save(c, out / f"{tag}seed{seed}-case{i}.bin")
+            if first:
+                break
+    return failures
+
+
+def retarget(frs: list[bytes], device: gpb.Device) -> list[bytes]:
+    """Replay frames recorded on a CPU session with their graphs (and
+    device arguments naming the CPU) moved to device, so the corpus also
+    runs on CUDA. A frame that is not a canonical WorkerEnvelope (corrupt
+    bytes, a file) is kept as it is."""
+    cpu = gpb.Device(kind=gpb.DEVICE_CPU)
+    out = []
+    for fr in frs:
+        env = wpb.WorkerEnvelope()
+        try:
+            env.ParseFromString(fr)
+        except DecodeError:
+            out.append(fr)
+            continue
+        if env.SerializeToString() != fr or env.client.WhichOneof("body") != "register_graph":
+            out.append(fr)
+            continue
+        g = env.client.register_graph.graph
+        if g.device == cpu:
+            g.device.CopyFrom(device)
+        for n in g.nodes:
+            for a in n.args:
+                if a.WhichOneof("value") == "device" and a.device == cpu:
+                    a.device.CopyFrom(device)
+        out.append(env.SerializeToString())
+    return out
+
+
+def fuzz_device() -> str:
+    """REFLOP_FUZZ_DEVICE: cpu (the default, and CI's) or cuda."""
+    d = os.environ.get("REFLOP_FUZZ_DEVICE", "cpu")
+    if d not in ("cpu", "cuda"):
+        raise ValueError(f"REFLOP_FUZZ_DEVICE={d!r}: expected cpu or cuda")
+    if d == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("REFLOP_FUZZ_DEVICE=cuda, but CUDA is not available")
+    return d
 
 
 def artifact_dir() -> Path | None:

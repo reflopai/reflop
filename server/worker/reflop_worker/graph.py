@@ -17,7 +17,7 @@ from . import dtypes
 from ._pb import compute_pb2 as cpb
 from ._pb import graph_pb2 as gpb
 from .errors import ReflopError, invalid, limit
-from .ops_generated import FLAG_BANNED, FLAG_CLIENT, OPS, OPSET_VERSION
+from .ops_generated import FLAG_ALLOC, FLAG_BANNED, FLAG_CLIENT, OPS, OPSET_VERSION
 
 SUPPORTED_OPSETS = (OPSET_VERSION,)
 
@@ -153,13 +153,10 @@ class Builder:
             raise limit(f"tensor has {len(m.shape)} dims; the limit is {self.limits.max_dims}", stage)
         dt = dtypes.PB_TO_TORCH[m.dtype]
         try:
+            # Bounds the non-zero dims as well (GH#4: [0, 2**62, 2**62]).
             dtypes.nbytes_checked(m.shape, dt, self.limits.max_tensor_numel)
         except (ValueError, OverflowError) as e:
             raise limit(str(e), stage) from None
-        # A zero dim makes the element count 0 whatever the other dims are;
-        # their strides still have to fit (GH#4: [0, 2**62, 2**62]).
-        if math.prod(n for n in m.shape if n) > self.limits.max_tensor_numel:
-            raise limit(f"tensor shape {list(m.shape)} exceeds the element limit", stage)
         return dt, tuple(m.shape)
 
     def _input(self, i: int, gi: gpb.GraphInput) -> InputSpec:
@@ -353,6 +350,12 @@ class Builder:
         if s.kind != gpb.GraphInput.KIND_SCALAR or s.scalar_kind not in kinds:
             raise invalid(f"{op.name} argument {spec.name!r}: expected a {'/'.join(kinds)} scalar input",
                           cpb.STAGE_V3_SCHEMA, ni, op.id)
+        if op.flags & FLAG_ALLOC:
+            # Meta inference sees a placeholder for a scalar input, so V4 and
+            # V5 would size this op's output from 1, not from the real value
+            # (arange's end). Allocating ops take literal values only (ADR-049).
+            raise invalid(f"{op.name} argument {spec.name!r}: an op that allocates from its arguments "
+                          "takes literal values, not scalar inputs", cpb.STAGE_V3_SCHEMA, ni, op.id)
         return ScalarRef(ref.graph_input)
 
 

@@ -1513,3 +1513,187 @@ GPU was unavailable. Opening a compute session could start a worker.
 the name used by Guest commands and scripts. An offline row can mean that
 the endpoint is unreachable, authentication failed, or the paired GPU is
 absent from the device list.
+
+## ADR-049: Close the rest of the worker input surface
+
+**Context.** The parity test (ADR-042, ADR-043) and the graph fuzzer
+(ADR-044) left gaps, listed as #25. About 90 kinds of call passed V4 and
+then failed in the kernel after it had allocated its output (I3; the parity
+test listed them in a `KNOWN` table). A few kernels returned auxiliary
+outputs in another shape than their meta kernel, which failed closed at E3
+with `INTERNAL`. `_ctc_loss` returned uninitialized memory (I13). Uploads,
+fetches, datasets, snapshots and checkpoints were not fuzzed, and neither
+harness had run on CUDA.
+
+**Decision.** V4 gets two tables keyed by op name. Both know the session's
+device.
+
+- `prechecks.py` runs before the meta kernel and refuses what that device's
+  kernel refuses. Each rule comes from running the meta, CPU and CUDA
+  kernels on the same inputs. 143 ops have a rule. The families: mixed
+  operand dtypes where the kernels need one (`mm`, `addmm`, convolution and
+  its backward, `index_*`, the losses, the norms); wrong-length
+  `output_size` in the adaptive pools; upsampling with an empty dim, or
+  with a scale far below output/input (the nearest and linear kernels read
+  past the input, and the CPU antialiased kernel overflowed a host buffer
+  at a scale of 1e-10); fill values that overflow the output dtype (c10's
+  `overflows`, which differs between devices); factory, random and
+  reduction dtypes a kernel does not have; the conversions in `linspace`,
+  `logspace` and `arange`; `pin_memory=True`; `_fused_rms_norm` and its
+  backward; the `_thnn_fused_*` cells.
+- `outmeta.py` gives an output the shape and dtype the device's kernel
+  returns where the meta kernel says otherwise. Examples: the losses
+  compute in `self`'s dtype while the meta promotes with `target` (we
+  follow the kernel); `_embedding_bag`'s auxiliary outputs; the batch norm
+  statistics in eval mode; `log_sigmoid_forward`'s buffer; the layer and
+  group norm statistics. `codegen/gen.py` copies the file to the client as
+  `reflop/_outmeta_generated.py`, and `gen.py --check` keeps the two equal.
+  The client records the same metas, so a later graph that binds one of
+  these outputs declares what the worker holds. The client no longer
+  decomposes eval-mode batch norm on CPU sessions.
+
+The other worker changes:
+
+- An `ALLOC` op refuses scalar graph inputs at V3. V4 and V5 see only a
+  placeholder for a scalar input, so `arange(end)` with `end` as an input
+  was sized as if `end` were 1. Allocating ops take literals.
+- V5 adds the workspace `affine_grid_generator` allocates besides its output
+  (`cost.WORKSPACE`). An empty grid of size `[2, 1, 0, 2**31]` asked for
+  8 GB past the quota.
+- E2 checks that `bernoulli`'s probabilities are in [0, 1] and `normal`'s
+  std is at least 0. The CUDA kernels assert both on the device, which ends
+  the CUDA context.
+- `_ctc_loss` writes `-inf` to the `log_alpha` entries its kernels leave
+  unwritten, the value they write elsewhere outside the lattice. The
+  backward reads only the written entries.
+- A bool tensor built from Guest bytes (an upload, a snapshot or checkpoint
+  restore, a dataset shard) has every non-zero byte set to 1. C++ kernels
+  assume 0 or 1, and they disagree on other bytes.
+- Uploads, safetensors headers and V4 outputs bound the product of the
+  non-zero dims, so every handle's strides fit in int64 and every stored
+  handle reads back from a snapshot.
+- An execute counts the handles it will store before it runs, so a commit
+  cannot store some outputs and then fail.
+- Datasets: every refusal is `ERROR_DATASET`, every descriptor is closed,
+  a manifest names each tensor once, and gathers and the resident copy
+  read shard by shard. They no longer concatenate the whole dataset on the
+  host.
+- A snapshot restore checks each tensor's rank against `max_dims`, and tries
+  a restored RNG state on a scratch generator first, so the commit cannot
+  fail halfway.
+- Validator fixes: `masked_scatter`'s mask broadcasts with `self`;
+  `empty_strided` accepts the strides PyTorch gives an empty tensor; `tile`'s
+  `dims` are repeat counts, not dimensions; `expand` of a size-0 tensor to a
+  negative size is a shape error.
+
+Tests:
+
+- The parity test has no `KNOWN` table. A call that V4 accepts and the
+  kernel refuses fails it. The exceptions are the calls a rule refuses on
+  purpose (`DELIBERATE`) and floats that reach the worker as scalar inputs,
+  which V4 cannot see (ADR-011). It also fails when a precheck rule refuses
+  none of its op's cases, or when a meta shape or dtype differs from the
+  kernel's. `parity_grid.py` adds dtype-by-value grids for factories, random
+  ops, reductions and fills. With mutations this is about 87,000 calls over
+  448 ops on CPU and 89,600 over 454 ops on CUDA. The seeds of CUDA-only
+  kernels (the fused cells, `_fused_rms_norm`, `_scaled_mm`) are recorded
+  in a child process, because recording them in the test process breaks
+  later CUDA work there (#28).
+- A sequence fuzzer (`seqgen.py`, `seqrun.py`) drives uploads, fetches,
+  frees, reseeds, pings, unknown graphs, datasets over real shard files,
+  snapshots and checkpoints. Its properties include ADR-044's. It adds:
+  a fetch returns the stored bytes; a failed upload releases its
+  reservation; a failed execute or restore leaves the handles as they
+  were; no descriptor or mapping outlives its case. CI runs 400 sequences.
+  The nightly workflow runs 10,000 in a job of its own.
+- `REFLOP_FUZZ_DEVICE=cuda` runs both fuzzers on CUDA. Each seed runs in a
+  child process, which is restarted after the case that killed it
+  (`isolated.py`). A device assert ends the CUDA context, and forking after
+  CUDA is initialized is not safe.
+- The fuzzers no longer allow E3's output-shape `INTERNAL` error.
+
+**Alternatives.** Running every kernel on a scratch copy first, or on the
+CPU first, would catch kernel refusals without rules. It doubles the work,
+and the CPU and CUDA kernels refuse different calls. Refusing every call
+with mixed dtypes would have been one rule, but the kernels accept many
+(scalars, integer indices, half inputs to float32 norm parameters on CPU)
+and the client sends them. For the mixed-dtype losses we kept the kernels'
+result dtype instead of refusing the call.
+
+**Consequences.** A call refused in V4 is one a kernel would have refused
+after allocating, or one in `DELIBERATE`: for 35 ops a rule refuses some
+inputs that one device's kernel would run, so that the rule is the same
+on both devices. A Guest program that passed a scalar input to an
+allocating op now gets a V3 error. The Python client records such values
+as literals. The parity test takes under a minute on both devices.
+
+An older client works with this daemon: its e2e suite passes against it.
+A client of this version on a CPU session needs a daemon of this version
+for eval-mode batch norm with gradients; an older daemon refuses that
+graph at E3. No other e2e case regresses with an older daemon.
+
+## ADR-050: Float8 on an allowlist of ops
+
+**Context.** The meta kernels accept float8 tensors almost everywhere. The
+CUDA kernels take float8 only to move, compare, index and matrix-multiply
+it. Every other op passed V4 with a float8 input and then refused it after
+allocating its output (I3). `_scaled_mm` takes many scaling layouts, and
+cuBLASLt accepts only some of them on a given GPU.
+
+**Decision.** A new opset flag, `FP8`, marks the 108 ops whose CUDA kernels
+take float8: views, copies, factories, comparisons, indexing, `cat`,
+`stack`, `where` and `_scaled_mm`. V4 refuses a float8 tensor or dtype on
+any other op (`prechecks.float8`), and refuses float8 promotion with
+another dtype, which CUDA's `result_type` refuses. `_scaled_mm` takes
+tensor-wise scaling (one scale per matrix) and row-wise scaling (one per
+row of `self` and per column of `mat2`), with the dtypes cuBLASLt takes for
+each. Other scaling is refused. A CPU session never offers float8.
+
+**Alternatives.** Checking each op's float8 support with a rule per op
+would grow with every new PyTorch release. Refusing float8 everywhere
+except `_scaled_mm` would break the casts and views a float8 program needs.
+
+**Consequences.** On CUDA the parity test also runs a float8 cast of every
+seed. It fails when an `FP8` op runs no float8 case, or when the worker
+refuses a cast that the kernel runs. Three ops whose kernels take float8
+for some arguments only (`abs`, `pow`, `native_dropout`) are not `FP8`
+ops; the test lists them. Supporting
+float8 in a new op means adding the flag and the parity cases. `docs/OPSET.md`
+lists the flag.
+
+## ADR-051: Ban the fused CUDA attention and cuDNN RNN kernels
+
+**Context.** Probing the CUDA kernels with Guest-controlled inputs (#25 B)
+crashed the worker process in eight ops:
+`_scaled_dot_product_{flash,efficient,cudnn}_attention` and their
+backwards, and `_cudnn_rnn` and its backward. `_cudnn_rnn` raised SIGFPE
+for `weight_stride0=0` and segfaulted when `batch_sizes` started with 0 or
+held `2**31`. cuDNN attention segfaulted on q, k or v one element off, or
+not contiguous. The efficient attention backward segfaulted with dropout,
+and hit an illegal address when `out`'s last dim was 0. Its forward hit a
+misaligned address when `value`'s last dim was one off. Hundreds of other
+calls passed V4 and failed after allocating. Training-mode `_cudnn_rnn`
+cannot pass V4 at all, because its reserve buffer's size is known only to
+cuDNN. The flash attention backward takes uint64 Philox state, which the
+wire format cannot carry. The Python client sends none of these ops: SDPA
+on the reflop device takes the math path, and the cuDNN RNN path needs
+`is_cuda`.
+
+**Decision.** The eight ops are `BANNED` in `opset.yaml`; their ids stay
+reserved. V2 refuses them, and so does libreflop. Their capability keys
+(`flash_attention`, `efficient_attention`, `cudnn_attention`) are gone, and
+`rnn_fused` now covers only the `_thnn_fused_*` cells. The math and CPU
+flash attention ops stay enabled.
+
+**Alternatives.** Validating flash and efficient attention and banning the
+rest: their crashes come from shape and alignment combinations inside the
+kernels, which can change with each PyTorch release, so every release would
+need the probing again. Validating all eight: there
+is no way to size `_cudnn_rnn`'s reserve buffer before running it. A later
+version could let the server pick the attention backend for an
+`scaled_dot_product_attention` node, with inputs it built itself.
+
+**Consequences.** Nothing changes for the Python client: attention already
+ran the math kernel, and LSTM and GRU layers already ran as cells. The math
+kernel is slower and uses more memory for long sequences. A C API program
+that sent these ops gets a V2 error.

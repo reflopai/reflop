@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 from torch.utils._pytree import tree_flatten
 
-from . import natives, validators
+from . import dtypes, natives, outmeta, prechecks, validators
 from ._pb import compute_pb2 as cpb
 from ._pb import graph_pb2 as gpb
 from .errors import ReflopError, invalid, limit
@@ -116,6 +116,11 @@ def _same(what, t, shape, dtype):
         raise RuntimeError(f"{what} is {t.dtype}{list(t.shape)}; the forward gives {dtype}{list(shape)}")
 
 
+def _same_shape(what, t, shape):
+    if tuple(t.shape) != tuple(shape):
+        raise RuntimeError(f"{what} has shape {list(t.shape)}; the forward gives {list(shape)}")
+
+
 def _nonempty(t, what="self"):
     # The CPU and CUDA kernels index every non-batch dim; PyTorch's meta
     # kernels for the adaptive pools do not check it.
@@ -202,7 +207,8 @@ def _embedding_bag_backward(node, pos, kw):
 
     The kernels read bag_size, maximum_indices and per_sample_weights with
     grad's and indices' sizes; PyTorch checks none of them. Require the
-    shapes the forward gives: grad (bags, D) with D > 0, bag_size (bags,),
+    shapes the forward gives: grad (bags, D) with D > 0, bag_size (bags,)
+    or (bags + 1,),
     offset2bag (indices,) (or empty, with offsets), maximum_indices (bags, D) in max mode,
     per_sample_weights (indices,) with grad's dtype."""
     a = validators._named(node, pos, kw)
@@ -213,17 +219,28 @@ def _embedding_bag_backward(node, pos, kw):
     if grad.shape[1] == 0:
         # The CUDA kernel reads out of bounds; the CPU forward rejects it.
         raise RuntimeError("grad has an empty embedding dimension")
+    if a["mode"] not in (0, 1, 2):
+        raise RuntimeError(f"mode {a['mode']} is not sum (0), mean (1) or max (2)")
     for name in ("offset2bag", "bag_size", "maximum_indices") + (("offsets",) if "offsets" in a else ()):
         if a[name].dtype not in validators.INDEX_DTYPES:
             raise RuntimeError(f"{name} must be int32 or int64, got {a[name].dtype}")
     offsets = a.get("offsets")
+    if a["mode"] != 2:
+        # The sum and mean kernels read offset2bag and bag_size as the
+        # forward returns them: in indices' dtype promoted with offsets'.
+        dt = idx.dtype if offsets is None else torch.promote_types(idx.dtype, offsets.dtype)
+        for name in ("offset2bag", "bag_size"):
+            if a[name].dtype != dt:
+                raise RuntimeError(f"{name} is {a[name].dtype}; the forward gives {dt}")
     if offsets is not None and (offsets.dim() != 1 or offsets.shape[0] not in (bags, bags + 1)):
         raise RuntimeError(f"offsets has shape {list(offsets.shape)}; grad has {bags} bags")
     # Only _embedding_bag_backward can rebuild an empty offset2bag (from
     # offsets); the dense backward reads it as is.
     if tuple(a["offset2bag"].shape) not in ((n,), (0,) if offsets is not None else (n,)):
         raise RuntimeError(f"offset2bag has shape {list(a['offset2bag'].shape)}; indices has {n} entries")
-    if tuple(a["bag_size"].shape) != (bags,):
+    # The CUDA forward gives bag_size an entry per offset (bags + 1 with
+    # include_last_offset); both kernels read the first `bags`.
+    if tuple(a["bag_size"].shape) not in ((bags,), (bags + 1,)):
         raise RuntimeError(f"bag_size has shape {list(a['bag_size'].shape)}; grad has {bags} bags")
     if a["mode"] == 2 and tuple(a["maximum_indices"].shape) != tuple(grad.shape):
         raise RuntimeError(f"maximum_indices has shape {list(a['maximum_indices'].shape)}; "
@@ -326,8 +343,9 @@ def _batch_norm(node, pos, kw):
 def _layer_norm(node, pos, kw):
     """native_layer_norm and its backward (ADR-043): weight and bias have
     normalized_shape; the backward's grad_out has input's shape and dtype,
-    and mean and rstd are what the forward gives. The CPU backward kernel
-    crashed on a grad_out of another shape."""
+    and mean and rstd have the forward's shape (prechecks.py checks their
+    dtype, which differs between devices). The CPU backward kernel crashed
+    on a grad_out of another shape."""
     a = validators._named(node, pos, kw)
     x, ns = a["input"], tuple(a["normalized_shape"])
     if not ns or tuple(x.shape[x.dim() - len(ns):]) != ns or x.dim() < len(ns):
@@ -338,9 +356,8 @@ def _layer_norm(node, pos, kw):
             raise RuntimeError(f"{name} has shape {list(t.shape)}; normalized_shape is {list(ns)}")
     if "grad_out" in a:
         _same("grad_out", a["grad_out"], x.shape, x.dtype)
-        _, mean, rstd = A.native_layer_norm.default(x, list(ns), None, None, 1e-5)
-        _same("mean", a["mean"], mean.shape, mean.dtype)
-        _same("rstd", a["rstd"], rstd.shape, rstd.dtype)
+        _same_shape("mean", a["mean"], x.shape[:x.dim() - len(ns)] + (1,) * len(ns))
+        _same_shape("rstd", a["rstd"], x.shape[:x.dim() - len(ns)] + (1,) * len(ns))
     return node.op.fn(*pos, **kw)
 
 
@@ -348,7 +365,7 @@ def _group_norm(node, pos, kw):
     """native_group_norm and its backward (ADR-043): N, C and HxW describe
     input, group divides C, weight and bias are (C,); the backward's
     grad_out has input's shape and dtype, mean and rstd are (N, group) as
-    the forward gives them."""
+    the forward gives them (prechecks.py checks their dtype)."""
     a = validators._named(node, pos, kw)
     x, n, c, hw, group = a["input"], a["N"], a["C"], a["HxW"], a["group"]
     if x.dim() < 2 or x.shape[0] != n or x.shape[1] != c or x.numel() != n * c * hw:
@@ -361,9 +378,8 @@ def _group_norm(node, pos, kw):
             raise RuntimeError(f"{name} has shape {list(t.shape)}; C is {c}")
     if "grad_out" in a:
         _same("grad_out", a["grad_out"], x.shape, x.dtype)
-        _, mean, rstd = A.native_group_norm.default(x, None, None, n, c, hw, group, 1e-5)
-        _same("mean", a["mean"], mean.shape, mean.dtype)
-        _same("rstd", a["rstd"], rstd.shape, rstd.dtype)
+        _same_shape("mean", a["mean"], (n, group))
+        _same_shape("rstd", a["rstd"], (n, group))
     return node.op.fn(*pos, **kw)
 
 
@@ -387,6 +403,11 @@ def _grid_sampler(spatial):
         return node.op.fn(*pos, **kw)
 
     return infer
+
+
+def _shared(node, pos, kw):
+    # Rules the client applies too (outmeta.META).
+    return outmeta.META[node.op.name](validators._named(node, pos, kw))
 
 
 A = torch.ops.aten
@@ -438,6 +459,7 @@ OVERRIDES = {
     "aten.native_layer_norm_backward.default": _layer_norm,
     "aten.native_group_norm.default": _group_norm,
     "aten.native_group_norm_backward.default": _group_norm,
+    **{name: _shared for name in outmeta.META},
     "aten.grid_sampler_2d.default": _grid_sampler(2),
     "aten.grid_sampler_2d_backward.default": _grid_sampler(2),
     "aten.grid_sampler_3d.default": _grid_sampler(3),
@@ -457,6 +479,7 @@ OVERRIDES = {
 
 def infer(prog: Program, limits: cpb.Limits) -> None:
     S = cpb.STAGE_V4_META
+    cuda = prog.device.kind == gpb.DEVICE_CUDA
     metas: dict = {}
     for i, inp in enumerate(prog.inputs):
         if inp.kind == gpb.GraphInput.KIND_TENSOR:
@@ -487,12 +510,15 @@ def infer(prog: Program, limits: cpb.Limits) -> None:
         validators.check_static(node, pos, kw)
         try:
             with torch.inference_mode():
+                a = validators._named(node, pos, kw)
+                prechecks.check(node.op.name, node.op.flags, a, cuda)
                 if natives.is_native(node.op):
                     out = natives.meta(node.op.name, pos, kw)
                 elif node.op.name in OVERRIDES:
                     out = OVERRIDES[node.op.name](node, pos, kw)
                 else:
                     out = node.op.fn(*pos, **kw)
+                out = outmeta.fixup(node.op.name, out, a, cuda)
         except ReflopError:
             raise
         except NotImplementedError as e:
@@ -505,9 +531,16 @@ def infer(prog: Program, limits: cpb.Limits) -> None:
         for k, m in enumerate(flat):
             if m.dim() > limits.max_dims:
                 raise limit(f"{node.op.name} output has {m.dim()} dims", S, node.index, node.op.id)
-            if m.numel() > limits.max_tensor_numel:
-                raise limit(f"{node.op.name} output has {m.numel()} elements; the limit is "
-                            f"{limits.max_tensor_numel}", S, node.index, node.op.id)
+            try:
+                # The non-zero dims too: a handle must read back from a snapshot.
+                dtypes.numel_checked(m.shape, limits.max_tensor_numel)
+            except OverflowError:
+                raise limit(f"{node.op.name} output {list(m.shape)} exceeds {limits.max_tensor_numel} elements",
+                            S, node.index, node.op.id) from None
+            except ValueError:
+                # PyTorch's expand of a size-0 tensor gives [0, 4, -5] for (0, 4, -5).
+                raise ReflopError(cpb.ERROR_SHAPE_MISMATCH, f"{node.op.name} output {list(m.shape)} has a "
+                                  "negative dimension", S, node.index, node.op.id) from None
             metas[Ref(node.index, k)] = m
         node.outputs = len(flat)
 

@@ -252,7 +252,7 @@ def test_strict_ops_accept_what_autograd_passes(sess):
 
     deliberate = {"aten._ctc_loss_backward.Tensor"}  # lengths go as int lists (ADR-032)
     refused = []
-    for c in seeds():
+    for c in seeds(refused=False):
         if c.op in STRICT and c.op not in deliberate:
             _, err = infer_outputs(sess, c)
             if err is not None:

@@ -1,8 +1,9 @@
 name: Fuzz (nightly)
 
-# Longer runs of the worker graph fuzzer (GH#4, ADR-044) and the Go fuzzers,
-# from a fresh seed each night. CI runs a short fixed-seed budget on every
-# push. A failing case is uploaded; add it to tests/security/fuzz/corpus/.
+# Longer runs of the worker graph fuzzer (GH#4, ADR-044), the worker
+# sequence fuzzer (#25, ADR-049) and the Go fuzzers, from a fresh seed each
+# night. CI runs a short fixed-seed budget on every push. A failing case is
+# uploaded; add it to tests/security/fuzz/corpus/ (sequences: corpus/seq/).
 
 on:
   schedule:
@@ -12,6 +13,9 @@ on:
       cases:
         description: graph fuzz cases per seed
         default: "100000"
+      seq_cases:
+        description: sequence fuzz cases per seed
+        default: "5000"
 
 permissions:
   contents: read
@@ -34,19 +38,52 @@ jobs:
           uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
             torch torchvision protobuf pytest hypothesis pyyaml cryptography safetensors
+      # A step timeout fails the step, so the upload below still runs; a
+      # job timeout would cancel it. current.bin is the case that hung.
       - name: fuzz
+        timeout-minutes: 50
         env:
           REFLOP_FUZZ_SEED: ${{ github.run_id }},${{ github.run_number }}
           REFLOP_FUZZ_CASES: ${{ inputs.cases || '100000' }}
           REFLOP_FUZZ_OUT: fuzz-out
         run: |
           echo "seeds: $REFLOP_FUZZ_SEED"
-          REFLOP_TEST_DEVICE=cpu .venv/bin/python -m pytest -q tests/security/fuzz
+          REFLOP_TEST_DEVICE=cpu .venv/bin/python -m pytest -q tests/security/fuzz/test_graph_fuzz.py
       - name: upload failing cases
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: fuzz-cases
+          path: fuzz-out/
+
+  sequences:
+    name: Worker sequence fuzzer
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: environment (CPU PyTorch)
+        run: |
+          uv venv --python 3.12 .venv
+          uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple --index-strategy unsafe-best-match \
+            torch torchvision protobuf pytest hypothesis pyyaml cryptography safetensors
+      # seq-current.bin is the case that hung (see the graph job).
+      - name: fuzz
+        timeout-minutes: 50
+        env:
+          REFLOP_FUZZ_SEED: ${{ github.run_id }},${{ github.run_number }}
+          REFLOP_FUZZ_SEQ_CASES: ${{ inputs.seq_cases || '5000' }}
+          REFLOP_FUZZ_OUT: fuzz-out
+        run: |
+          echo "seeds: $REFLOP_FUZZ_SEED"
+          REFLOP_TEST_DEVICE=cpu .venv/bin/python -m pytest -q tests/security/fuzz/test_seq_fuzz.py
+      - name: upload failing cases
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: seq-fuzz-cases
           path: fuzz-out/
 
   go:
@@ -59,6 +96,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: fuzz (5 minutes each)
+        timeout-minutes: 25
         run: |
           go test -run=^$ -fuzz=FuzzUnmarshalEnvelope -fuzztime=5m ./pkg/wire
           go test -run=^$ -fuzz=FuzzSafetensors -fuzztime=5m ./server/reflopd/internal/store

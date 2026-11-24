@@ -311,7 +311,9 @@ def shift_amount_runtime(node, a):
 
 def masked_scatter_runtime(node, a):
     self_, mask, src = a["self"], a["mask"], a["source"]
-    need = int(mask.expand(self_.shape).sum()) if mask.numel() else 0
+    # self and mask broadcast together (the meta kernel checked that they do).
+    shape = torch.broadcast_shapes(self_.shape, mask.shape)
+    need = int(mask.expand(shape).sum()) if mask.numel() else 0
     if src.numel() < need:
         raise ReflopError(cpb.ERROR_RUNTIME_CHECK,
                           f"{node.op.name}: source has {src.numel()} elements but the mask selects {need}", R,
@@ -385,7 +387,10 @@ def empty_strided_static(node, a):
     size, stride = a["size"], a["stride"]
     if len(size) != len(stride):
         raise _bad(node, "size and stride must have the same length")
-    dims = sorted((s, n) for n, s in zip(size, stride) if n != 1)
+    # A size of 0 counts as 1, as in the strides PyTorch gives an empty
+    # tensor ((2, 0) is (1, 1)); other strides of an empty tensor stay
+    # rejected, so every stride stays within V2's element bound.
+    dims = sorted((s, max(n, 1)) for n, s in zip(size, stride) if max(n, 1) != 1)
     expect = 1
     for s, n in dims:
         if s != expect:
@@ -424,6 +429,32 @@ def bce_runtime(node, a):
                               node.index, node.op.id)
 
 
+def _comparable(x):
+    # float8 tensors have no comparison kernels.
+    return x.float() if x.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) else x
+
+
+def probability_runtime(node, a):
+    # bernoulli draws with probabilities self (default) or p (Tensor). The
+    # CUDA kernel asserts 0 <= p <= 1 on the device, which ends the CUDA
+    # context; the CPU kernel raises after allocating. Neither reads p for an
+    # empty self. V4 has refused complex p (prechecks._bernoulli).
+    name = "p" if "p" in a else "self"
+    p = _comparable(a[name])
+    if a["self"].numel() and not bool(((p >= 0) & (p <= 1)).all()):
+        raise ReflopError(cpb.ERROR_RUNTIME_CHECK, f"{node.op.name}: every {name} value must be in [0, 1]", R,
+                          node.index, node.op.id)
+
+
+def normal_std_runtime(node, a):
+    # CHECK_NORMAL_TENSOR_STD: std.min() >= 0. The CUDA kernels check it with
+    # _assert_async, which ends the CUDA context. NaN fails it too.
+    std = _comparable(a["std"])
+    if std.numel() and not bool((std >= 0).all()):
+        raise ReflopError(cpb.ERROR_RUNTIME_CHECK, f"{node.op.name}: every std value must be >= 0", R,
+                          node.index, node.op.id)
+
+
 def attention_static(node, a):
     p = a.get("dropout_p")
     if isinstance(p, float) and not 0.0 <= p < 1.0:
@@ -446,13 +477,6 @@ def scaled_mm_static(node, a):
         s = a.get(k)
         if _is_t(s) and s.dtype != torch.float32:
             raise _bad(node, f"{k} must be float32")
-
-
-def cudnn_rnn_static(node, a):
-    if a.get("weight_buf") is not None:
-        # Flat weight buffers would need layout validation against the RNN
-        # configuration; v1 accepts only the per-parameter weight list.
-        raise _bad(node, "flat weight buffers are not supported; call flatten_parameters() is not needed")
 
 
 def ctc_static(node, a):
@@ -555,7 +579,7 @@ STATIC = {
     "as_strided": as_strided_static, "empty_strided": empty_strided_static, "to_copy": to_copy_static,
     "cdist": cdist_static, "reduction": reduction_static, "bce": reduction_static, "attention": attention_static,
     "int_mm": int_mm_static, "linalg": linalg_static, "scaled_mm": scaled_mm_static,
-    "cudnn_rnn": cudnn_rnn_static, "ctc": ctc_static, "foreach_lengths": foreach_lengths_static,
+    "ctc": ctc_static, "foreach_lengths": foreach_lengths_static,
     "fused_optim": fused_optim_static, "dataset_gather": dataset_gather_static, "alloc": alloc_static,
 }
 
@@ -568,6 +592,7 @@ RUNTIME = {
     "shift_amount": shift_amount_runtime, "masked_scatter": masked_scatter_runtime,
     "multinomial": multinomial_runtime, "as_strided": as_strided_runtime, "ctc": ctc_runtime,
     "dataset_gather": dataset_gather_runtime, "bounds_check": bounds_check_runtime, "bce": bce_runtime,
+    "probability": probability_runtime, "normal_std": normal_std_runtime,
 }
 
 # Every validator named in the opset must exist (checked at import and in CI).
@@ -577,6 +602,8 @@ KNOWN = set(STATIC) | set(RUNTIME)
 DIM_ARGS = {"dim", "dim0", "dim1", "dim2", "start_dim", "end_dim", "dims", "source", "destination"}
 # Ops whose dim may address one past the input's last dim (they add a dim).
 DIM_PLUS_ONE = ("aten.unsqueeze", "aten.stack", "aten.unsqueeze_copy", "aten.diag_embed")
+# Arguments named like dims that are not: tile's dims are repeat counts.
+NOT_DIMS = {("aten.tile.default", "dims")}
 
 
 def check_dims(node, args, kwargs) -> None:
@@ -602,7 +629,7 @@ def check_dims(node, args, kwargs) -> None:
     if node.op.name.startswith(DIM_PLUS_ONE):
         rank += 1
     for spec in node.op.args:
-        if spec.name not in DIM_ARGS:
+        if spec.name not in DIM_ARGS or (node.op.name, spec.name) in NOT_DIMS:
             continue
         v = named.get(spec.name)
         vals = v if isinstance(v, list) else [v]

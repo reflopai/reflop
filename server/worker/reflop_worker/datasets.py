@@ -15,13 +15,13 @@ import os
 
 import torch
 
-from . import safetensors
+from . import dtypes, safetensors
 from ._pb import compute_pb2 as cpb
 from .errors import ReflopError
 
 
 class DatasetTensor:
-    """One named tensor of a dataset, concatenated over shards on axis 0."""
+    """One named tensor of a dataset: its shards, in order along axis 0."""
 
     def __init__(self, name: str, dtype: torch.dtype, shape: tuple, parts: list[torch.Tensor], device) -> None:
         self.name = name
@@ -32,7 +32,6 @@ class DatasetTensor:
         self.offsets = [0]
         for p in parts:
             self.offsets.append(self.offsets[-1] + p.shape[0])
-        self._whole_cpu: torch.Tensor | None = None
         self._on_device: torch.Tensor | None = None
         # Value range of integer tensors, scanned once on the host, so batch
         # indices gathered from labels need no device sync to be validated.
@@ -46,20 +45,32 @@ class DatasetTensor:
     def nbytes(self) -> int:
         return self.shape.numel() * torch.empty((), dtype=self.dtype).element_size()
 
-    def _cpu(self) -> torch.Tensor:
-        if self._whole_cpu is None:
-            self._whole_cpu = self.parts[0] if len(self.parts) == 1 else torch.cat(self.parts, 0)
-        return self._whole_cpu
-
     def make_resident(self) -> None:
         if self._on_device is None and self.device.type == "cuda":
-            self._on_device = self._cpu().to(self.device, non_blocking=False)
+            # Shard by shard into the device copy: no host copy of the whole
+            # dataset (#25).
+            out = torch.empty(self.shape, dtype=self.dtype, device=self.device)
+            for p, a, b in zip(self.parts, self.offsets, self.offsets[1:]):
+                if b > a:
+                    out[a:b].copy_(p)
+            self._on_device = dtypes.canonical_bool_(out)
 
     def gather(self, indices: torch.Tensor) -> torch.Tensor:
+        """Rows at indices (validated in range by E2)."""
         if self._on_device is not None:
             return self._on_device.index_select(0, indices.to(self._on_device.device))
         idx = indices.to("cpu", torch.int64)
-        rows = self._cpu().index_select(0, idx)
+        if len(self.parts) == 1:
+            rows = self.parts[0].index_select(0, idx)
+        else:
+            # From each shard that holds a requested row: the gather holds
+            # only the rows, never the shards concatenated (#25).
+            part = torch.searchsorted(torch.tensor(self.offsets[1:]), idx, right=True)
+            rows = torch.empty((idx.numel(), *self.shape[1:]), dtype=self.dtype)
+            for k in part.unique().tolist():
+                sel = (part == k).nonzero().squeeze(1)
+                rows[sel] = self.parts[k].index_select(0, idx[sel] - self.offsets[k])
+        dtypes.canonical_bool_(rows)
         if self.device.type == "cuda":
             return rows.pin_memory().to(self.device, non_blocking=True)
         return rows
@@ -80,49 +91,72 @@ class Dataset:
                 pass  # still referenced by a tensor; freed when collected
 
 
+def _close_maps(maps: list) -> None:
+    for m in maps:
+        try:
+            m.close()
+        except (BufferError, ValueError):
+            pass  # still referenced by a tensor; unmapped when that is collected
+
+
 def open_dataset(msg, fds: list[int], device, max_numel: int, resident_budget: int) -> Dataset:
-    """Build a Dataset from a DatasetOpen message and shard fds."""
-    if len(fds) != len(msg.shards):
+    """Build a Dataset from a DatasetOpen message and shard fds.
+
+    Every descriptor is closed and every refusal is ERROR_DATASET, whatever
+    the manifest or the shards hold. reflopd validated both, so a refusal
+    here means the two disagree (#25)."""
+    maps: list = []
+    try:
+        if len(fds) != len(msg.shards):
+            raise ReflopError(cpb.ERROR_DATASET, "shard descriptors do not match the manifest")
+        return _open(msg, fds, maps, device, max_numel, resident_budget)
+    except safetensors.SafetensorsError as e:
+        _close_maps(maps)
+        raise ReflopError(cpb.ERROR_DATASET, f"shard: {e}") from None
+    except BaseException:
+        _close_maps(maps)
+        raise
+    finally:
         for fd in fds:
-            os.close(fd)
-        raise ReflopError(cpb.ERROR_DATASET, "shard descriptors do not match the manifest")
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _open(msg, fds: list[int], maps: list, device, max_numel: int, resident_budget: int) -> Dataset:
     from .dtypes import PB_TO_TORCH
 
-    want = {t.name: (PB_TO_TORCH[t.meta.dtype], tuple(t.meta.shape)) for t in msg.tensors}
+    want: dict[str, tuple] = {}
+    for t in msg.tensors:
+        dt = PB_TO_TORCH.get(t.meta.dtype)
+        if dt is None or not t.meta.shape or t.name in want:
+            raise ReflopError(cpb.ERROR_DATASET, f"manifest tensor {t.name[:64]!r} is not valid")
+        want[t.name] = (dt, tuple(t.meta.shape))
     parts: dict[str, list] = {n: [] for n in want}
-    maps = []
-    try:
-        for shard, fd in zip(msg.shards, fds):
-            size = os.fstat(fd).st_size
-            mm = mmap.mmap(fd, size, prot=mmap.PROT_READ) if size else None
-            os.close(fd)
-            if mm is None:
-                raise ReflopError(cpb.ERROR_DATASET, "empty shard")
-            maps.append(mm)
-            start, hdr = safetensors.parse_header(memoryview(mm), size, max_numel)
-            if set(hdr) != set(want):
-                raise ReflopError(cpb.ERROR_DATASET, "shard tensors do not match the manifest")
-            for name, (dt, shape, b, e) in hdr.items():
-                wdt, wshape = want[name]
-                if dt != wdt or tuple(shape[1:]) != tuple(wshape[1:]) or shape[0] != shard.num_samples:
-                    raise ReflopError(cpb.ERROR_DATASET, f"shard tensor {name!r} does not match the manifest")
-                if e > b:
-                    t = torch.frombuffer(mm, dtype=dt, count=(e - b) // torch.empty((), dtype=dt).element_size(),
-                                         offset=start + b)
-                else:
-                    t = torch.empty(0, dtype=dt)
-                parts[name].append(t.view(shape))
-    except Exception:
-        for m in maps:
-            try:
-                m.close()
-            except (BufferError, ValueError):
-                pass
-        raise
+    for shard, fd in zip(msg.shards, fds):
+        size = os.fstat(fd).st_size
+        if not size:
+            raise ReflopError(cpb.ERROR_DATASET, "empty shard")
+        mm = mmap.mmap(fd, size, prot=mmap.PROT_READ)
+        maps.append(mm)
+        start, hdr = safetensors.parse_header(memoryview(mm), size, max_numel)
+        if set(hdr) != set(want):
+            raise ReflopError(cpb.ERROR_DATASET, "shard tensors do not match the manifest")
+        for name, (dt, shape, b, e) in hdr.items():
+            wdt, wshape = want[name]
+            if dt != wdt or len(shape) != len(wshape) or shape[1:] != wshape[1:] or shape[0] != shard.num_samples:
+                raise ReflopError(cpb.ERROR_DATASET, f"shard tensor {name[:64]!r} does not match the manifest")
+            if e > b:
+                t = torch.frombuffer(mm, dtype=dt, count=(e - b) // torch.empty((), dtype=dt).element_size(),
+                                     offset=start + b)
+            else:
+                t = torch.empty(0, dtype=dt)
+            parts[name].append(t.view(shape))
+    for n, ps in parts.items():
+        if sum(p.shape[0] for p in ps) != want[n][1][0]:
+            raise ReflopError(cpb.ERROR_DATASET, f"tensor {n[:64]!r}: shard sizes do not add up")
     tensors = {n: DatasetTensor(n, want[n][0], want[n][1], parts[n], device) for n in want}
-    for n, t in tensors.items():
-        if sum(p.shape[0] for p in t.parts) != t.shape[0]:
-            raise ReflopError(cpb.ERROR_DATASET, f"tensor {n!r}: shard sizes do not add up")
     total = sum(t.nbytes() for t in tensors.values())
     if device.type == "cuda" and total <= resident_budget:
         for t in tensors.values():

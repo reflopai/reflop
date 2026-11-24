@@ -24,6 +24,8 @@ import torch
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
 from . import _opset_generated as opset
+from . import _outmeta_generated as outmeta
+from ._pb import graph_pb2 as gpb
 from .errors import ReflopError
 from .trace import HANDLE, UnsupportedOperatorError, Value, _base, normalize
 
@@ -313,6 +315,21 @@ def run_meta(func, args, kwargs):
         return _META_OVERRIDES.get(func, func)(*tree_map(_to_meta, args), **tree_map(_to_meta, kwargs))
 
 
+def device_meta(func, args, kwargs, cuda: bool):
+    """run_meta, with the output shapes and dtypes that the kernel on the
+    session's device returns where they differ from the meta kernel's. The
+    worker infers the same (outmeta.py), so later graphs that bind these
+    outputs declare what the worker holds."""
+    name = _op_name(func)
+    if name not in outmeta.FIXUPS and name not in outmeta.META:
+        return run_meta(func, args, kwargs)
+    vals = tree_map(_to_meta, normalize(func, args, kwargs))
+    a = dict(zip((x.name for x in func._schema.arguments), vals))
+    with torch._C._DisableTorchDispatch():
+        out = outmeta.META[name](a) if name in outmeta.META else run_meta(func, args, kwargs)
+        return outmeta.fixup(name, out, a, cuda)
+
+
 # Meta inference cache for non-view ops. Output shapes/dtypes depend on input
 # metas and on int/bool/dtype arguments, never on float values (ALLOC ops,
 # whose sizes can depend on floats, are not cached). Python meta kernels
@@ -339,23 +356,23 @@ def _sig(x):
     raise TypeError  # unknown: do not cache
 
 
-def meta_cached(func, args, kwargs):
+def meta_cached(func, args, kwargs, cuda: bool = False):
     global _UNCACHED_FLAGS
     if _UNCACHED_FLAGS is None:
         _UNCACHED_FLAGS = opset.FLAG_ALLOC | opset.FLAG_RNG
     entry = opset.OPS.get(_op_name(func))
     if entry is None or entry[1] & _UNCACHED_FLAGS:
-        return run_meta(func, args, kwargs)
+        return device_meta(func, args, kwargs, cuda)
     try:
-        key = (func, _sig(args), _sig(tuple(sorted(kwargs.items()))))
+        key = (func, cuda, _sig(args), _sig(tuple(sorted(kwargs.items()))))
     except TypeError:
-        return run_meta(func, args, kwargs)
+        return device_meta(func, args, kwargs, cuda)
     hit = _META_CACHE.get(key)
     if hit is not None:
         spec, leaves = hit
         return tree_unflatten([torch.empty_strided(sh, st, dtype=dt, device="meta") if sh is not None else v
                                for sh, st, dt, v in leaves], spec)
-    out = run_meta(func, args, kwargs)
+    out = device_meta(func, args, kwargs, cuda)
     flat, spec = tree_flatten(out)
     leaves = [(tuple(t.shape), t.stride(), t.dtype, None) if isinstance(t, torch.Tensor) else (None, None, None, t)
               for t in flat]
@@ -756,7 +773,7 @@ def _functional(sess, func, args, kwargs):
         return _dds(sess, func, args, kwargs)
     if entry[1] & (opset.FLAG_CLIENT | opset.FLAG_BANNED):
         return _fallback(sess, func, args, kwargs)
-    out_meta = meta_cached(func, args, kwargs)
+    out_meta = meta_cached(func, args, kwargs, sess.gdevice.kind == gpb.DEVICE_CUDA)
     vals = normalize(func, args, kwargs)
     outs = sess.record_values(name, func, vals, _flat_tensors(out_meta))
     return _wrap_outputs(sess, out_meta, outs)
@@ -889,41 +906,10 @@ def _batch_norm_special(sess, func, args, kwargs):
 
 def _batch_norm_eval(sess, vals):
     """Eval mode updates nothing, so it is a plain function."""
-    from ._pb import graph_pb2 as gpb
-
-    if sess.gdevice.kind == gpb.DEVICE_CPU:
-        # PyTorch's CPU kernel returns empty save_mean and save_invstd in eval
-        # mode, its meta kernel (and the CUDA kernel) [C], and autograd hands
-        # them to the backward, so the server would reject the mismatch. The
-        # formula below returns [C] (elementwise ops; the server CPU is slow
-        # anyway).
-        return _batch_norm_eval_ops(sess, *vals[:5], vals[7])
     f = aten.native_batch_norm.default
     if _placement_local(sess, f, vals, {}):
         return _run_locally(sess, f, vals, {}, keep_local=True)
     return _functional(sess, f, vals, {})
-
-
-def _batch_norm_eval_ops(sess, inp, w, b, rm, rv, eps):
-    """(input - mean) * rsqrt(var + eps) * weight + bias, computed in float32
-    for half inputs as the kernels do; returns (out, mean, invstd)."""
-    cdt = torch.float32 if inp.dtype in (torch.float16, torch.bfloat16) else inp.dtype
-
-    def cast(t, dt):
-        return t if t.dtype == dt else dispatch(sess, aten._to_copy.default, (t,), {"dtype": dt})
-
-    def col(t):  # [C] -> [1, C, 1, ...]
-        return dispatch(sess, aten.view.default, (t, [1, -1] + [1] * (inp.dim() - 2)), {})
-
-    mean = dispatch(sess, aten._to_copy.default, (rm,), {"dtype": cdt})  # a copy: autograd keeps it
-    invstd = dispatch(sess, aten.rsqrt.default, (dispatch(sess, aten.add.Tensor, (cast(rv, cdt), eps), {}),), {})
-    out = dispatch(sess, aten.sub.Tensor, (cast(inp, cdt), col(mean)), {})
-    out = dispatch(sess, aten.mul.Tensor, (out, col(invstd)), {})
-    if w is not None:
-        out = dispatch(sess, aten.mul.Tensor, (out, col(cast(w, cdt))), {})
-    if b is not None:
-        out = dispatch(sess, aten.add.Tensor, (out, col(cast(b, cdt))), {})
-    return cast(out, inp.dtype), mean, invstd
 
 
 def _batch_norm(sess, func, vals):

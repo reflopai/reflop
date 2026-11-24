@@ -16,6 +16,7 @@ const (
 	RESTRICTED = 128
 	CLIENT     = 256
 	BANNED     = 512
+	FP8        = 1024
 )
 
 // Arg is one schema argument.

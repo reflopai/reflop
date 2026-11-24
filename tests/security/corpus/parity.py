@@ -21,21 +21,22 @@ memory-capped scope, a mutated size can ask for any amount of memory:
 from __future__ import annotations
 
 import math
+import types
 from dataclasses import dataclass
 
 import torch
 from helpers import NAME, I, decode, make_session, tensor_binding, tnode
-from reflop_worker import natives
+from reflop_worker import execute, natives
 from reflop_worker._pb import compute_pb2 as cpb
 from reflop_worker._pb import graph_pb2 as gpb
 from reflop_worker.dtypes import TORCH_TO_PB
 from reflop_worker.graph import MEMFMT, _base
-from reflop_worker.ops_generated import FLAG_BANNED, FLAG_CLIENT, FLAG_DDS, FLAG_RNG, FLAG_UNINIT, OPS
+from reflop_worker.ops_generated import FLAG_ALLOC, FLAG_BANNED, FLAG_CLIENT, FLAG_DDS, FLAG_RNG, FLAG_UNINIT, OPS
 from torch.utils._python_dispatch import TorchDispatchMode
 
 A = torch.ops.aten
 SPEC = {o.name: o for o in OPS.values()}
-SKIP_FLAGS = FLAG_RNG | FLAG_DDS | FLAG_CLIENT | FLAG_BANNED
+SKIP_FLAGS = FLAG_DDS | FLAG_CLIENT | FLAG_BANNED
 HUGE = 2**31
 # A mutated call whose output would have more elements than this is not run
 # natively (the worker's own limits decide it; nothing to compare).
@@ -47,7 +48,10 @@ class Call:
     op: str
     args: list                     # one value per schema argument, in schema order
     label: str = "seed"
-    transposed: bool = False       # args[0] goes through a transpose node first
+    transposed: int | None = None  # this tensor argument goes through a transpose node first
+    lifted: int | None = None      # this float argument is bound as a scalar graph input
+    value: bool = False            # a float-value mutation of an op that does not allocate from it
+    fp8: bool = False              # a seed with only dtypes changed to float8: as safe to run as the seed
 
 
 def _name(func) -> str:
@@ -73,26 +77,34 @@ class _Recorder(TorchDispatchMode):
                     v = kwargs[sa.name]
                 else:
                     v = sa.default_value
+                    if _base(spec.args[i].type).rstrip("?") == "ScalarType" and type(v) is int:
+                        v = SCALAR_TYPES[v]  # the schema default is c10's enum value
                 vals.append(_snap(v))
             self.out.append(Call(name, vals))
         return func(*args, **kwargs)
 
 
+# c10::ScalarType's first values, for schema defaults such as dtype=4.
+SCALAR_TYPES = [torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64, torch.float16, torch.float32,
+                torch.float64, torch.complex32, torch.complex64, torch.complex128, torch.bool]
+
+
 def _snap(v):
     if isinstance(v, torch.Tensor):
-        return v.detach().clone().contiguous()
+        return v.detach().cpu().clone().contiguous()  # native_args places it
     if isinstance(v, (list, tuple)):
         return [_snap(x) for x in v]
     return v
 
 
-def record(programs) -> list[Call]:
+def record(programs, register_device=True) -> list[Call]:
     # The autograd engine sizes its per-device queues at the first backward
     # of the process; register the reflop device first, or backward on
     # reflop tensors fails later in the same test run.
-    from reflop.device import register
+    if register_device:
+        from reflop.device import register
 
-    register()
+        register()
     out: list[Call] = []
     for p in programs:
         with _Recorder(out):
@@ -104,6 +116,49 @@ def record(programs) -> list[Call]:
             seen.add(key)
             uniq.append(c)
     return uniq
+
+
+def record_cuda(programs: str = "CUDA_PROGRAMS") -> list[Call]:
+    """record() of parity_programs.<programs> in a child process: once the
+    reflop device is registered, a local CUDA backward fails (BUGS.md #28),
+    and a backward before it breaks reflop backward (record)."""
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    code = ("import sys, torch, parity, parity_programs as p; "
+            "calls = parity.record(getattr(p, sys.argv[1]), register_device=False); "
+            "torch.save([(c.op, parity._tag(c.args)) for c in calls], sys.argv[2])")
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(p for p in sys.path if p)}
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "calls.pt")
+        subprocess.run([sys.executable, "-W", "ignore", "-c", code, programs, path], env=env, check=True,
+                       timeout=600)
+        return [Call(op, _untag(args)) for op, args in torch.load(path, weights_only=True)]
+
+
+_TAG = "torch."
+
+
+def _tag(v):
+    # weights_only loads no memory_format or layout; name them instead.
+    if isinstance(v, list):
+        return [_tag(x) for x in v]
+    if isinstance(v, (torch.dtype, torch.memory_format, torch.layout)):
+        return _TAG + str(v).removeprefix("torch.")
+    if isinstance(v, torch.device):
+        return _TAG + "device:" + str(v)
+    return v
+
+
+def _untag(v):
+    if isinstance(v, list):
+        return [_untag(x) for x in v]
+    if isinstance(v, str) and v.startswith(_TAG):
+        name = v.removeprefix(_TAG)
+        return torch.device(name.removeprefix("device:")) if name.startswith("device:") else getattr(torch, name)
+    return v
 
 
 def _sig(v):
@@ -136,11 +191,17 @@ def encode(sess, call: Call):
     for k, (sa, v) in enumerate(zip(spec.args, call.args)):
         t = _base(sa.type)
         core = t.rstrip("?")
-        if v is None:
+        if k == call.lifted:
+            # The client's path for a finite Python float (ADR-011): a
+            # scalar graph input, a placeholder until the execute binds it.
+            inputs.append(float(v))
+            gargs.append(gpb.Arg(tensor=gpb.ValueRef(graph_input=len(inputs) - 1)))
+        elif v is None:
             gargs.append(gpb.Arg(none=True))
         elif core == "Tensor":
             if isinstance(v, torch.Tensor):
-                if k == 0 and call.transposed:
+                if k == call.transposed:
+                    tin = len(inputs)
                     inputs.append(v.transpose(0, -1).contiguous())
                     gargs.append(None)  # patched to the transpose node's output below
                 else:
@@ -194,10 +255,10 @@ def encode(sess, call: Call):
         else:
             raise Unencodable(sa.type)
     nodes = []
-    if call.transposed:
+    if call.transposed is not None:
         nodes.append(gpb.Node(op_id=NAME["aten.transpose.int"],
-                              args=[gpb.Arg(tensor=gpb.ValueRef(graph_input=0)), I(0), I(-1)]))
-        gargs[0] = tnode(0)
+                              args=[gpb.Arg(tensor=gpb.ValueRef(graph_input=tin)), I(0), I(-1)]))
+        gargs[call.transposed] = tnode(0)
     nodes.append(gpb.Node(op_id=spec.id, args=gargs))
     return inputs, nodes
 
@@ -205,6 +266,10 @@ def encode(sess, call: Call):
 def graph_of(sess, inputs, nodes, outs):
     g = gpb.Graph(opset_version=1, device=sess.gdevice)
     for t in inputs:
+        if isinstance(t, float):
+            g.inputs.append(gpb.GraphInput(kind=gpb.GraphInput.KIND_SCALAR,
+                                           meta=gpb.TensorMeta(dtype=gpb.DTYPE_FLOAT64)))
+            continue
         g.inputs.append(gpb.GraphInput(kind=gpb.GraphInput.KIND_TENSOR,
                                        meta=gpb.TensorMeta(dtype=TORCH_TO_PB[t.dtype], shape=list(t.shape))))
     g.nodes.extend(nodes)
@@ -227,7 +292,7 @@ def native_args(call: Call, device="cpu"):
             v = torch.device(device)
         elif isinstance(v, torch.Tensor):
             v = v.to(device, copy=True)  # in-place ops must not change the seed
-            if k == 0 and call.transposed:
+            if k == call.transposed:
                 v = v.transpose(0, -1).contiguous().transpose(0, -1)
         elif isinstance(v, list):
             v = [x.to(device, copy=True) if isinstance(x, torch.Tensor) else x for x in v]
@@ -250,6 +315,11 @@ def flat_tensors(out):
     return [x for x in torch.utils._pytree.tree_flatten(out)[0] if isinstance(x, torch.Tensor)]
 
 
+def _extent(shape) -> int:
+    # An empty output's kernel can still allocate by its other sizes (cost.WORKSPACE).
+    return math.prod(d or 1 for d in shape)
+
+
 NATIVE_REJECTS = object()
 TOO_BIG = object()
 
@@ -262,7 +332,7 @@ def native(call: Call, device="cpu"):
     pos, kw = _kw(call, margs)
     try:
         m = flat_tensors(_run(spec, pos, kw, "meta"))
-        if any(t.numel() > MAX_NATIVE_NUMEL for t in m):
+        if any(_extent(t.shape) > MAX_NATIVE_NUMEL for t in m):
             return TOO_BIG
     except Exception:  # noqa: BLE001
         if _max_int(call.args) > 4096:
@@ -281,6 +351,10 @@ def _run(spec, pos, kw, device):
         if device == "meta":
             return natives.meta(spec.name, pos, kw)
         return natives.call(spec.name, pos, kw, torch.device(device))
+    if device != "meta" and spec.name in execute.PRE:
+        # The worker adjusts these arguments before the kernel (execute.PRE).
+        pos = list(pos)
+        execute.PRE[spec.name](types.SimpleNamespace(op=spec), pos, kw, device == "cuda")
     return spec.fn(*pos, **kw)
 
 
@@ -336,7 +410,12 @@ def worker(sess, call: Call, outs):
         return "rejected", r.error
     ex = cpb.Execute(graph_hash=r.graph_registered.graph_hash)
     for t in inputs:
-        ex.bindings.append(tensor_binding(t))
+        if isinstance(t, float):
+            b = cpb.Binding()
+            b.scalar.f = t
+            ex.bindings.append(b)
+        else:
+            ex.bindings.append(tensor_binding(t))
     for _ in g.outputs:
         ex.outputs.append(cpb.OutputSpec(kind=cpb.OutputSpec.KIND_RETURN))
     e = _call(sess, cpb.Envelope(request_id=2, execute=ex))
@@ -372,14 +451,37 @@ STRICT = {
     "aten.grid_sampler_2d_backward.default", "aten.grid_sampler_3d.default", "aten.grid_sampler_3d_backward.default",
     "reflop.fused_adam.default", "reflop.fused_adamw.default", "reflop.fused_sgd.default",
     "reflop.fused_adagrad.default", "reflop.amp_unscale_and_check.default", "reflop.amp_update_scale.default",
+    # ADR-049: given a scale far below output/input, the kernels index (or
+    # size a host buffer) past the input; the worker takes the scales
+    # F.interpolate passes.
+    *(f"aten.{n}{b}.default" for b in ("", "_backward") for n in (
+        "upsample_nearest1d", "upsample_nearest2d", "upsample_nearest3d", "_upsample_nearest_exact1d",
+        "_upsample_nearest_exact2d", "_upsample_nearest_exact3d", "upsample_linear1d", "upsample_bilinear2d",
+        "upsample_bicubic2d", "upsample_trilinear3d", "_upsample_bilinear2d_aa")),
 }
-# Ops whose later outputs are partly never written by the kernel (their
-# values are whatever the allocator held): compare the first n only.
-# _ctc_loss: log_alpha past 2 * target_length + 1 (follow-up in BUGS.md).
-PARTIAL_OUTPUTS = {"aten._ctc_loss.default": 1, "aten._ctc_loss.Tensor": 1}
+def _ctc_written(call: Call, want):
+    """The reference log_alpha with its never-written entries set to -inf,
+    as the worker sets them (#25 D, I13)."""
+    a = dict(zip((s.name for s in SPEC[call.op].args), call.args))
+    la = want[1].clone()
+    _, t, s = la.shape
+    for b, (il, tl) in enumerate(zip(torch.as_tensor(a["input_lengths"]).tolist(),
+                                     torch.as_tensor(a["target_lengths"]).tolist())):
+        la[b, il:] = float("-inf")
+        la[b, :, 2 * tl + 1:] = float("-inf")
+    return [want[0], la]
+
+
+# Ops whose kernels leave part of an output unwritten (whatever the allocator
+# held); the worker fills it, the reference is filled the same way.
+UNWRITTEN = {"aten._ctc_loss.default": _ctc_written, "aten._ctc_loss.Tensor": _ctc_written}
 # Runtime checks that run before any kernel launch (I4): a call PyTorch
 # rejects may pass V4 when the reason depends on the data.
 BEFORE_KERNEL = (cpb.STAGE_E1_BINDINGS, cpb.STAGE_E2_RUNTIME)
+# A session offers fp8 only on a CUDA device that computes in it
+# (core.detect_capabilities), so a CPU session refuses fp8 tensors and
+# dtypes that PyTorch's CPU kernels take.
+CAPABILITY = "requires capability"
 
 
 def check(sess, call: Call, device="cpu", mark=lambda s: None):
@@ -397,13 +499,20 @@ def check(sess, call: Call, device="cpu", mark=lambda s: None):
         # On CUDA a kernel run on input the worker refused can trip a device
         # assert and end the process's CUDA context; false rejections are
         # checked on the CPU.
-        if call.op in STRICT or device != "cpu":
+        # A float8 cast of a seed is as safe to run as the seed: a refusal of
+        # one the CUDA kernel runs is a false rejection (ADR-050).
+        if call.op in STRICT or (device != "cpu" and not call.fp8) or CAPABILITY in err.message:
             return None
         want = native(call, device)
         if isinstance(want, list):
             return f"false rejection: {cpb.ValidationStage.Name(err.stage)} {err.message[:300]}"
         return None
-    if any(math.prod(shape) > MAX_NATIVE_NUMEL for _, shape in outs):
+    if not outs:
+        # Every output is undefined (the backward of a cell given no
+        # gradient): no graph can return one, so none runs the kernel.
+        want = native(call, device)
+        return f"the meta has no outputs; the kernel returned {len(want)}" if isinstance(want, list) and want else None
+    if any(_extent(shape) > MAX_NATIVE_NUMEL for _, shape in outs):
         return None  # too big to run on either side; the Owner's rails decide it
     kind, got = worker(sess, call, outs)
     if kind == "failed" and got.stage in BEFORE_KERNEL:
@@ -414,17 +523,25 @@ def check(sess, call: Call, device="cpu", mark=lambda s: None):
         return None
     if want is NATIVE_REJECTS:
         if kind == "failed":
+            if call.value:
+                # A float an op does not allocate from may reach the worker
+                # as a scalar input, which V4 sees only as a placeholder
+                # (ADR-011); its kernel's host check is the rule (ADR-049).
+                return None
             return f"validation passed; the kernel raised (I3): {got.message[:300]}"
         return "PyTorch rejects; the worker ran it"
     if kind != "ran":
         return f"PyTorch accepts; the worker failed: {cpb.ValidationStage.Name(got.stage)} {got.message[:300]}"
     if [(t.dtype, tuple(t.shape)) for t in want] != outs:
         return f"meta shapes {outs} differ from the kernel's {[(t.dtype, tuple(t.shape)) for t in want]}"
-    if SPEC[call.op].flags & FLAG_UNINIT:
-        return None
+    if SPEC[call.op].flags & (FLAG_UNINIT | FLAG_RNG):
+        return None  # the values are not the kernel's to compare
     tol = 1e-5 if device == "cpu" else 1e-3
-    n = PARTIAL_OUTPUTS.get(call.op, len(want))
-    for w, g in zip(want[:n], got[:n]):
+    if call.op in UNWRITTEN:
+        want = UNWRITTEN[call.op](call, want)
+    for w, g in zip(want, got, strict=True):
+        if w.dtype.is_floating_point and w.dtype.itemsize == 1:
+            w, g = w.float(), g.float()  # float8 has no allclose kernel
         if w.dtype.is_floating_point or w.dtype.is_complex:
             if not torch.allclose(g, w, rtol=tol, atol=tol / 10, equal_nan=True):
                 return "values differ"
@@ -496,6 +613,8 @@ def _ints_for(call):
 
 
 INT64 = (-(2**63), 2**63 - 1)
+DTYPES = sorted(TORCH_TO_PB, key=str)
+FLOATS = (0.0, -0.5, -1.0, 0.5, 2.0, 1e-10, 1e-30, 5e-324, 1e30, -1e30, 3e39, math.nan, math.inf, -math.inf)
 
 
 def _int_values(v, rank, size):
@@ -524,7 +643,7 @@ def mutations(seed: Call):
     def mut(k, v, label):
         args = list(seed.args)
         args[k] = v
-        out.append(Call(seed.op, args, label))
+        out.append(_like(seed, args, label))
 
     for k, (sa, v) in enumerate(zip(spec.args, seed.args)):
         core = _base(sa.type).rstrip("?")
@@ -546,6 +665,13 @@ def mutations(seed: Call):
             mut(k, [], f"{sa.name}=[]")
         elif core == "bool" and isinstance(v, bool):
             mut(k, not v, f"{sa.name}={not v}")
+        elif core == "ScalarType" and (isinstance(v, torch.dtype) or (v is None and opt)):
+            for dt in DTYPES:
+                if dt != v:
+                    mut(k, dt, f"{sa.name}={str(dt).removeprefix('torch.')}")
+                    out[-1].fp8 = dt in FLOAT8 and _nonempty(seed)
+        elif core in ("float", "Scalar") and (type(v) is float or (v is None and opt)):
+            out.extend(_float_mutations(seed, k, v, sa.name))
         elif core == "Tensor" and isinstance(v, torch.Tensor):
             out.extend(_tensor_mutations(seed, k, v, sa.name))
         elif core in ("Tensor[]", "Tensor?[]") and v:
@@ -556,8 +682,60 @@ def mutations(seed: Call):
             mut(k, v[:-1], f"{sa.name} shorter")
     ts = _tensors(seed)
     if ts and ts[0][0] == 0 and seed.args[0].dim() >= 2:
-        out.append(Call(seed.op, list(seed.args), "self non-contiguous", transposed=True))
+        out.append(Call(seed.op, list(seed.args), "self non-contiguous", transposed=0))
+    if _nonempty(seed) and any(_castable(t) for t in _flat(seed.args)):
+        for dt in FLOAT8:
+            args = [_to_fp8(v, dt) for v in seed.args]
+            out.append(_like(seed, args, f"floats as {str(dt).removeprefix('torch.')}", fp8=True))
     return out
+
+
+def _like(seed, args, label, **kw):
+    # A mutation of a seed that transposes an argument transposes it too,
+    # while it is still a matrix.
+    t = seed.transposed
+    if t is not None and not (isinstance(args[t], torch.Tensor) and args[t].dim() >= 2):
+        t = None
+    return Call(seed.op, args, label, transposed=t, **kw)
+
+
+FLOAT8 = (torch.float8_e4m3fn, torch.float8_e5m2)
+
+
+def _flat(v):
+    return [y for x in v for y in (_flat(x) if isinstance(x, (list, tuple)) else [x])]
+
+
+def _castable(t):
+    return isinstance(t, torch.Tensor) and t.dtype.is_floating_point and t.dtype.itemsize > 1
+
+
+def _nonempty(seed):
+    # An empty call's kernel may return before it looks at the dtype.
+    return all(t.numel() for t in _flat(seed.args) if isinstance(t, torch.Tensor))
+
+
+def _to_fp8(v, dt):
+    if isinstance(v, list):
+        return [_to_fp8(x, dt) for x in v]
+    return v.to(dt) if _castable(v) else v
+
+
+def _float_mutations(seed, k, v, name):
+    # Literal values, and the finite ones of an op that does not allocate
+    # from them also as a scalar input, the way the client sends a Python
+    # float (ADR-011). An allocating op takes literals only (ADR-049).
+    value = not SPEC[seed.op].flags & FLAG_ALLOC
+    res = []
+    for x in FLOATS:
+        if v is not None and (x == v or math.isnan(x) and math.isnan(v)):
+            continue
+        args = list(seed.args)
+        args[k] = x
+        res.append(_like(seed, args, f"{name}={x}", value=value))
+        if value and math.isfinite(x):
+            res.append(_like(seed, list(args), f"{name}={x} lifted", lifted=k, value=True))
+    return res
 
 
 def _tensor_mutations(seed, k, t, name):
@@ -566,7 +744,7 @@ def _tensor_mutations(seed, k, t, name):
     def mk(new, label):
         args = list(seed.args)
         args[k] = new
-        res.append(Call(seed.op, args, f"{name} {label}"))
+        res.append(_like(seed, args, f"{name} {label}"))
 
     s = list(t.shape)
     mk(_retensor(t, [1] + s), "unsqueezed")
@@ -580,25 +758,36 @@ def _tensor_mutations(seed, k, t, name):
             mk(_retensor(t, [s[0] + 1] + s[1:]), "first+1")
     other = {torch.float32: torch.float64, torch.float64: torch.float32, torch.int64: torch.int32,
              torch.int32: torch.int64, torch.float16: torch.float32, torch.bfloat16: torch.float32,
-             torch.bool: torch.float32}.get(t.dtype)
+             torch.bool: torch.float32, torch.float8_e4m3fn: torch.float8_e5m2,
+             torch.float8_e5m2: torch.float8_e4m3fn}.get(t.dtype)
     if other is not None:
         mk(t.to(other), f"as {other}")
+    if _castable(t) and t.numel():
+        # Not marked fp8: refusing float8 mixed into a non-FP8 op's other
+        # operands is the allowlist (ADR-050), so it is not run natively.
+        mk(t.to(torch.float8_e4m3fn), "as float8_e4m3fn")
     return res
 
 
-def seeds():
-    from parity_programs import DIRECT, PROGRAMS
+def seeds(refused=True, cuda=False):
+    """The seeds; with refused, also the calls PyTorch refuses (REFUSED);
+    with cuda, also the seeds of CUDA-only kernels (CUDA_PROGRAMS)."""
+    from parity_programs import DIRECT, PROGRAMS, REFUSED
 
-    return record(PROGRAMS) + DIRECT()
+    out = record(PROGRAMS) + DIRECT() + (REFUSED() if refused else [])
+    return out + (record_cuda() if cuda else [])
 
 
+def all_cases(cuda=False):
+    """Seeds and their mutations. cuda adds the CUDA-only seeds; it changes
+    the case list, so it is off unless the run is on CUDA."""
+    from parity_grid import GRID
 
-def all_cases():
     out = []
-    for s in seeds():
+    for s in seeds(cuda=cuda):
         out.append(s)
         out.extend(mutations(s))
-    return out
+    return out + GRID()
 
 
 if __name__ == "__main__":  # discovery: print every disagreement
