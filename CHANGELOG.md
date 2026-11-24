@@ -1,9 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.2.10 (2026-11-24)
 
-- One reflopd can issue separate invites for multiple GPUs. Owners choose cards
-  with `reflopd up --gpu` and Guests switch pairings with `reflop use`.
+- Owners can list cards with `reflopd gpu list`, choose which ones to share
+  with `reflopd up --gpu`, and create a separate invite for each card.
+- Guests can pair with multiple GPUs on one daemon, list their pairings with
+  `reflop status`, and select a default for new sessions with `reflop use`.
+- Existing pairings keep their access. Update both the daemon and the Guest
+  client to use GPU-specific invites.
 
 ## 0.2.9 (2026-11-24)
 
