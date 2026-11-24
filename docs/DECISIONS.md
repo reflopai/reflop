@@ -1448,3 +1448,22 @@ registration cleanup but changes the copy path used for diagnostics.
 write. Daemon processes still release their registrations at exit. CPU tests
 check teardown order and partial registration. CUDA tests compare snapshot
 restores and checkpoint recovery across repeated session openings.
+
+## ADR-046: Validate explicit device indexes before opening a session
+
+**Context.** The session registry uses Python integers. PyTorch stores a
+device index in a signed 8-bit integer. An out-of-range index could become
+a different index in the returned device and select the wrong session.
+
+**Decision.** Normalize explicit integer indexes and check the range 0
+through 127 before looking up or opening a session. Use the same upper
+bound when assigning indexes to implicit CPU sessions. The device returned
+to the caller and the session registry use the same index.
+
+**Alternatives.** Checking the device after opening a session would catch
+the mismatch after the connection was made. Taking the index from PyTorch
+without checking the input could still select a different session.
+
+**Consequences.** Invalid indexes leave existing sessions and their checkpoint
+settings alone. Valid device indexes and automatic CPU placement keep their
+existing behavior. The change works with existing daemons.

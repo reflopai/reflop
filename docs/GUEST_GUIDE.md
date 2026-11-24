@@ -97,6 +97,7 @@ y = torch.zeros(64, dtype=torch.long, device=dev)
 
 `reflop.device(server="lab", kind="cuda")` picks a paired server by name and a
 device kind. Tensors on this device print as `device='reflop:0'`.
+Explicit session indexes are integers from 0 through 127.
 `torch.manual_seed(n)` also seeds open reFLOP sessions. Use `reflop.seed(n)`
 to seed all open sessions and set the initial seed for sessions opened later.
 You can call it before `reflop.device()`.

@@ -22,6 +22,7 @@ from .errors import ReflopError, ReflopRemoteError, SessionLostError
 from .trace import CPU, DATASET, HANDLE, NODE, SCALAR, ArgEncoder, GraphBuilder, Trace, Value, tensor_meta
 
 FLUSH_NODES = int(os.environ.get("REFLOP_FLUSH_NODES", "20000"))
+MAX_DEVICE_INDEX = 127  # PyTorch stores device indexes as signed 8-bit integers.
 # How raise_async names the request whose error it reports.
 _ASYNC_WHAT = {"upload": "uploading a tensor", "free": "freeing tensors", "register": "checking a graph",
                "execute": "running a graph"}
@@ -175,9 +176,8 @@ class Session:
                 seed = _seed
                 if seed is None or seed == applied_seed:
                     if device_index is None:
-                        # Reserve reflop:0 for explicit use and stay in the
-                        # positive range of PyTorch's signed device index.
-                        device_index = next((i for i in range(1, 128) if i not in _sessions), None)
+                        # Reserve reflop:0 for explicit use.
+                        device_index = next((i for i in range(1, MAX_DEVICE_INDEX + 1) if i not in _sessions), None)
                         if device_index is None:
                             raise ReflopError("no free reFLOP device index for the Owner's CPU session")
                     if device_index in _sessions:
