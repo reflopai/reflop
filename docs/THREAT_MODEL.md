@@ -92,6 +92,12 @@ unless the Owner passes `--accept-weak-isolation`.
 - Pairing: an HMAC with the invite's one-time secret over the same binding,
   plus a signature by the new key. An invite is consumed by its first use,
   successful or not.
+- GPU invitations bind the redeemed identity to the Owner's stored GPU UUID.
+  The daemon checks that scope when opening or resuming a session. Each GPU
+  pairing has its own identity and storage namespace. The optional remote CPU
+  belongs to that same pairing. Existing host-wide identities retain their
+  prior access. A GPU UUID identifies a card and the pinned daemon key
+  authenticates the endpoint.
 - Unpair (ADR-025): accepted only after authentication, and it revokes only
   the connection's own identity. A Guest can give up its own access, never
   another's, and it deletes no data; deletion is the Owner's `reflopd

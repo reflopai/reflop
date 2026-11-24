@@ -143,6 +143,7 @@ type AuthResult struct {
 	IdentityName  string                 `protobuf:"bytes,1,opt,name=identity_name,json=identityName,proto3" json:"identity_name,omitempty"`
 	IdentityId    []byte                 `protobuf:"bytes,2,opt,name=identity_id,json=identityId,proto3" json:"identity_id,omitempty"` // 16 bytes
 	Capabilities  *ServerCapabilities    `protobuf:"bytes,3,opt,name=capabilities,proto3" json:"capabilities,omitempty"`
+	GpuUuid       string                 `protobuf:"bytes,4,opt,name=gpu_uuid,json=gpuUuid,proto3" json:"gpu_uuid,omitempty"` // empty for legacy host-wide identities
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -198,6 +199,13 @@ func (x *AuthResult) GetCapabilities() *ServerCapabilities {
 	return nil
 }
 
+func (x *AuthResult) GetGpuUuid() string {
+	if x != nil {
+		return x.GpuUuid
+	}
+	return ""
+}
+
 // Pair registers a new public key using a one-time invite secret.
 //
 //	mac       = HMAC-SHA256(invite_secret, "reflop-pair-v1\x00" || server_nonce || server_key_fingerprint || invite_id || public_key)
@@ -208,6 +216,7 @@ type Pair struct {
 	PublicKey     []byte                 `protobuf:"bytes,2,opt,name=public_key,json=publicKey,proto3" json:"public_key,omitempty"` // 32 bytes
 	Mac           []byte                 `protobuf:"bytes,3,opt,name=mac,proto3" json:"mac,omitempty"`                              // 32 bytes
 	Signature     []byte                 `protobuf:"bytes,4,opt,name=signature,proto3" json:"signature,omitempty"`                  // 64 bytes
+	GpuUuid       string                 `protobuf:"bytes,5,opt,name=gpu_uuid,json=gpuUuid,proto3" json:"gpu_uuid,omitempty"`       // must match the Owner's stored invite
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -268,6 +277,13 @@ func (x *Pair) GetSignature() []byte {
 		return x.Signature
 	}
 	return nil
+}
+
+func (x *Pair) GetGpuUuid() string {
+	if x != nil {
+		return x.GpuUuid
+	}
+	return ""
 }
 
 type PairResult struct {
@@ -339,9 +355,12 @@ type InviteCode struct {
 	// SSH only: the server's sshd host keys as "type base64" lines. The client
 	// pins them in its own known_hosts file, so ssh never trusts a host key it
 	// learned elsewhere (SEC_SWEEP L6).
-	SshHostKeys   []string `protobuf:"bytes,10,rep,name=ssh_host_keys,json=sshHostKeys,proto3" json:"ssh_host_keys,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	SshHostKeys       []string `protobuf:"bytes,10,rep,name=ssh_host_keys,json=sshHostKeys,proto3" json:"ssh_host_keys,omitempty"`
+	GpuUuid           string   `protobuf:"bytes,11,opt,name=gpu_uuid,json=gpuUuid,proto3" json:"gpu_uuid,omitempty"`                                   // empty for a host-wide invite
+	GpuName           string   `protobuf:"bytes,12,opt,name=gpu_name,json=gpuName,proto3" json:"gpu_name,omitempty"`                                   // informational
+	SshGuestPublicKey []byte   `protobuf:"bytes,13,opt,name=ssh_guest_public_key,json=sshGuestPublicKey,proto3" json:"ssh_guest_public_key,omitempty"` // 32 bytes for a GPU-scoped SSH invite
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *InviteCode) Reset() {
@@ -444,6 +463,27 @@ func (x *InviteCode) GetSshHostKeys() []string {
 	return nil
 }
 
+func (x *InviteCode) GetGpuUuid() string {
+	if x != nil {
+		return x.GpuUuid
+	}
+	return ""
+}
+
+func (x *InviteCode) GetGpuName() string {
+	if x != nil {
+		return x.GpuName
+	}
+	return ""
+}
+
+func (x *InviteCode) GetSshGuestPublicKey() []byte {
+	if x != nil {
+		return x.SshGuestPublicKey
+	}
+	return nil
+}
+
 var File_reflop_v1_auth_proto protoreflect.FileDescriptor
 
 const file_reflop_v1_auth_proto_rawDesc = "" +
@@ -452,24 +492,26 @@ const file_reflop_v1_auth_proto_rawDesc = "" +
 	"\fAuthenticate\x12\x1d\n" +
 	"\n" +
 	"public_key\x18\x01 \x01(\fR\tpublicKey\x12\x1c\n" +
-	"\tsignature\x18\x02 \x01(\fR\tsignature\"\x95\x01\n" +
+	"\tsignature\x18\x02 \x01(\fR\tsignature\"\xb0\x01\n" +
 	"\n" +
 	"AuthResult\x12#\n" +
 	"\ridentity_name\x18\x01 \x01(\tR\fidentityName\x12\x1f\n" +
 	"\videntity_id\x18\x02 \x01(\fR\n" +
 	"identityId\x12A\n" +
-	"\fcapabilities\x18\x03 \x01(\v2\x1d.reflop.v1.ServerCapabilitiesR\fcapabilities\"r\n" +
+	"\fcapabilities\x18\x03 \x01(\v2\x1d.reflop.v1.ServerCapabilitiesR\fcapabilities\x12\x19\n" +
+	"\bgpu_uuid\x18\x04 \x01(\tR\agpuUuid\"\x8d\x01\n" +
 	"\x04Pair\x12\x1b\n" +
 	"\tinvite_id\x18\x01 \x01(\fR\binviteId\x12\x1d\n" +
 	"\n" +
 	"public_key\x18\x02 \x01(\fR\tpublicKey\x12\x10\n" +
 	"\x03mac\x18\x03 \x01(\fR\x03mac\x12\x1c\n" +
-	"\tsignature\x18\x04 \x01(\fR\tsignature\"R\n" +
+	"\tsignature\x18\x04 \x01(\fR\tsignature\x12\x19\n" +
+	"\bgpu_uuid\x18\x05 \x01(\tR\agpuUuid\"R\n" +
 	"\n" +
 	"PairResult\x12#\n" +
 	"\ridentity_name\x18\x01 \x01(\tR\fidentityName\x12\x1f\n" +
 	"\videntity_id\x18\x02 \x01(\fR\n" +
-	"identityId\"\xf6\x02\n" +
+	"identityId\"\xdd\x03\n" +
 	"\n" +
 	"InviteCode\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\rR\aversion\x126\n" +
@@ -482,7 +524,10 @@ const file_reflop_v1_auth_proto_rawDesc = "" +
 	"\ridentity_name\x18\b \x01(\tR\fidentityName\x12!\n" +
 	"\freflopd_path\x18\t \x01(\tR\vreflopdPath\x12\"\n" +
 	"\rssh_host_keys\x18\n" +
-	" \x03(\tR\vsshHostKeys*L\n" +
+	" \x03(\tR\vsshHostKeys\x12\x19\n" +
+	"\bgpu_uuid\x18\v \x01(\tR\agpuUuid\x12\x19\n" +
+	"\bgpu_name\x18\f \x01(\tR\agpuName\x12/\n" +
+	"\x14ssh_guest_public_key\x18\r \x01(\fR\x11sshGuestPublicKey*L\n" +
 	"\rTransportKind\x12\x15\n" +
 	"\x11TRANSPORT_INVALID\x10\x00\x12\x11\n" +
 	"\rTRANSPORT_TLS\x10\x01\x12\x11\n" +

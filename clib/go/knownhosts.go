@@ -40,7 +40,11 @@ func pinnedHostArgs(e *serverEntry) ([]string, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	path := filepath.Join(dir, e.Fingerprint)
+	pin := e.Fingerprint
+	if e.KeyID != "" {
+		pin += "-" + e.KeyID
+	}
+	path := filepath.Join(dir, pin)
 	if old, err := os.ReadFile(path); err != nil || !bytes.Equal(old, buf.Bytes()) {
 		if err := writeAtomic(path, buf.Bytes()); err != nil {
 			return nil, err

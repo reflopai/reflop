@@ -4,6 +4,7 @@ package cli
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 )
 
@@ -16,6 +17,7 @@ func TestServeArgvIsServeWithTheSameFlags(t *testing.T) {
 		{},
 		{listen: []string{"100.64.0.1:7460", "[::1]:7460"}, weak: true, noSandbox: true},
 		{listen: []string{"127.0.0.1:7460"}, foreground: true},
+		{gpus: []string{"0", "2"}, variant: "cu132"},
 	} {
 		argv := serveArgv(f)
 		if len(argv) < 2 || argv[1] != "serve" {
@@ -26,6 +28,8 @@ func TestServeArgvIsServeWithTheSameFlags(t *testing.T) {
 			t.Fatalf("%q: %v", argv, err)
 		}
 		listen, _ := cmd.Flags().GetStringSlice("listen")
+		gpus, _ := cmd.Flags().GetStringSlice("gpu")
+		variant, _ := cmd.Flags().GetString("variant")
 		weak, _ := cmd.Flags().GetBool("accept-weak-isolation")
 		noSandbox, _ := cmd.Flags().GetBool("no-self-sandbox")
 		if len(f.listen) == 0 {
@@ -33,6 +37,9 @@ func TestServeArgvIsServeWithTheSameFlags(t *testing.T) {
 		}
 		if !reflect.DeepEqual(listen, f.listen) || weak != f.weak || noSandbox != f.noSandbox {
 			t.Fatalf("%q parsed to listen=%q weak=%v no-self-sandbox=%v, want %+v", argv, listen, weak, noSandbox, f)
+		}
+		if !slices.Equal(gpus, f.gpus) || variant != f.variant {
+			t.Fatalf("%q lost GPU selections or the runtime variant", argv)
 		}
 	}
 }

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import os
+import re
 import struct
 import tempfile
 from pathlib import Path
@@ -67,7 +68,7 @@ def quote_option(path: str) -> str:
     return '"' + path.replace("%", "%%") + '"'
 
 
-def known_hosts_options(fingerprint_hex: str, host_keys: list[str]) -> list[str]:
+def known_hosts_options(fingerprint_hex: str, host_keys: list[str], key_id: str = "") -> list[str]:
     """ssh options that trust only host_keys; [] if none were recorded."""
     if not host_keys:
         return []
@@ -75,7 +76,7 @@ def known_hosts_options(fingerprint_hex: str, host_keys: list[str]) -> list[str]
     data = "".join(f"{a} {k}\n" for k in normalize(host_keys))
     d = config_dir() / "ssh_known_hosts"
     d.mkdir(parents=True, exist_ok=True, mode=0o700)
-    path = d / fingerprint_hex
+    path = d / _pin_name(fingerprint_hex, key_id)
     try:
         same = path.read_text() == data
     except OSError:
@@ -86,12 +87,17 @@ def known_hosts_options(fingerprint_hex: str, host_keys: list[str]) -> list[str]
             "-o", "HostKeyAlias=" + a, "-o", "CheckHostIP=no"]
 
 
-def forget(fingerprint_hex: str) -> None:
+def _pin_name(fingerprint_hex: str, key_id: str) -> str:
+    return f"{fingerprint_hex}-{key_id}" if key_id else fingerprint_hex
+
+
+def forget(fingerprint_hex: str, key_id: str = "") -> None:
     """Delete the host keys pinned for a server (`reflop unpair`)."""
-    if not all(c in "0123456789abcdef" for c in fingerprint_hex) or len(fingerprint_hex) != 64:
+    name = _pin_name(fingerprint_hex, key_id)
+    if not re.fullmatch(r"[0-9a-f]{64}(?:-[0-9a-f]{64})?", name):
         return  # not a name this module wrote
     try:
-        (config_dir() / "ssh_known_hosts" / fingerprint_hex).unlink()
+        (config_dir() / "ssh_known_hosts" / name).unlink()
     except FileNotFoundError:
         pass
 

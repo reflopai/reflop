@@ -10,6 +10,7 @@ package gpu
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,6 +44,58 @@ type Info struct {
 }
 
 var driverRe = regexp.MustCompile(`(\d+)\.(\d+)(?:\.(\d+))?`)
+
+var uuidRe = regexp.MustCompile(`^gpu-[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$`)
+
+// UUID returns the canonical hardware identifier, or empty if unavailable.
+func (g GPU) StableUUID() string {
+	id := strings.ToLower(g.UUID)
+	if uuidRe.MatchString(id) {
+		return id
+	}
+	return ""
+}
+
+// Find resolves a physical index or full hardware UUID.
+func Find(devices []GPU, selector string) (GPU, error) {
+	index, err := strconv.Atoi(selector)
+	id := strings.ToLower(selector)
+	for _, g := range devices {
+		if (err == nil && index == g.Index) || (id != "" && id == g.StableUUID()) {
+			return g, nil
+		}
+	}
+	return GPU{}, fmt.Errorf("no GPU matches %q (see `reflopd gpu list`)", selector)
+}
+
+// Select applies the startup flags, or the configured physical indexes.
+func Select(info Info, selectors []string, configured []int) (Info, error) {
+	if len(selectors) == 0 && len(configured) == 0 {
+		return info, nil
+	}
+	want := make(map[int]bool)
+	for _, index := range configured {
+		want[index] = true
+	}
+	if len(selectors) != 0 {
+		clear(want)
+		for _, selector := range selectors {
+			g, err := Find(info.GPUs, selector)
+			if err != nil {
+				return Info{}, err
+			}
+			want[g.Index] = true
+		}
+	}
+	var selected []GPU
+	for _, g := range info.GPUs {
+		if want[g.Index] {
+			selected = append(selected, g)
+		}
+	}
+	info.GPUs = selected
+	return info, nil
+}
 
 // Detect inspects the machine.
 func Detect() Info {

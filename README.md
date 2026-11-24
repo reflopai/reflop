@@ -178,19 +178,41 @@ pip install ./client/python                 # the reFLOP client
 # 1) Set up and start (rootless).
 reflopd up --listen <LAN-or-Tailscale-addr>:7460
 
-# 2) One invite per Guest, prints the one-time pairing code
+# 2) For one GPU, print the pairing code
 reflopd invite --name alice
 ```
 
 > Guest side `reflop`
 ```sh
-# 3) Pair once (the server key gets pinned), then check
+# 3) Pair and check
 reflop pair reflop1-baaraai2b4…
 reflop status
 
 # 4) Train your model
 python reflop_train.py          # Embed `reflop` in code
 reflop run python train.py      # Or just add a prefix command
+```
+
+## Multiple GPUs
+
+**Owner**
+
+```sh
+reflopd gpu list
+reflopd up --gpu 0 --gpu 2 --listen <LAN-or-Tailscale-addr>:7460
+reflopd invite --name alice --gpu 0
+reflopd invite --name alice --gpu 2
+reflopd unpair alice --gpu 0
+```
+
+**Guest**
+
+```sh
+reflop pair <gpu-0-code> --name lab-0
+reflop pair <gpu-2-code> --name lab-2
+reflop status
+reflop use lab-2
+reflop unpair lab-0
 ```
 
 ## How it works
@@ -302,7 +324,7 @@ correction, a Python learning-rate schedule) are detected and refused; use
 | `reflopd yield --auto` | pause Guests while you use the GPU yourself |
 | `reflopd quota set alice --device-memory 6GiB` | optional quotas (none by default) |
 | `reflopd rails show` · `rails set --ram 8GiB` | safety rails (always on) |
-| `reflopd invite --name bob --via ssh --key "ssh-ed25519 …"` | reuse `sshd`: a forced-command pipe, never a shell |
+| `reflopd invite --name bob --via ssh --key "ssh-ed25519 …"` | use a key from `reflop key --ssh --new` over an SSH forced command |
 | `sudo reflopd install --system` | move reflopd into a dedicated system account |
 | `reflop data build` · `push` · `ls` · `rm` | datasets |
 | `reflop verify` | cross-check small graphs against your CPU |

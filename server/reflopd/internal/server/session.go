@@ -71,8 +71,14 @@ type Session struct {
 }
 
 func (s *Server) openSession(c *clientConn, req *pb.OpenSession) (*Session, error) {
-	slot := s.slotFor(req.Device)
+	slot := s.slotForIdentity(req.Device, c.identity.GPUUUID)
 	if slot == nil {
+		if c.identity.GPUUUID != "" {
+			if requested := s.slotFor(req.Device); req.Device != nil && requested != nil {
+				return nil, statusf(pb.ErrorCode_ERROR_PERMISSION_DENIED, "this pairing does not grant access to that device")
+			}
+			return nil, statusf(pb.ErrorCode_ERROR_INVALID_GRAPH, "the paired GPU or requested device is unavailable")
+		}
 		return nil, statusf(pb.ErrorCode_ERROR_INVALID_GRAPH, "this server has no such device")
 	}
 	if q := s.quota(c.identity.Name); q.MaxSessions > 0 && s.countSessions(c.identity.ID) >= int(q.MaxSessions) {
@@ -192,7 +198,7 @@ func (s *Server) resume(c *clientConn, id []byte) (*Session, error) {
 	s.mu.Lock()
 	sess := s.sessions[hex.EncodeToString(id)]
 	s.mu.Unlock()
-	if sess == nil || sess.Identity.ID != c.identity.ID {
+	if sess == nil || sess.Identity.ID != c.identity.ID || !sess.Device.allowed(c.identity.GPUUUID) {
 		return nil, errors.New("no such session (it may have expired)")
 	}
 	sess.mu.Lock()

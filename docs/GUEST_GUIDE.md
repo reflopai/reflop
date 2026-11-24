@@ -50,15 +50,12 @@ and this machine's clock, both in UTC. If the Owner made the invite recently,
 this machine's date or time is probably wrong: compare `date -u` here and on
 the Owner's machine.
 
-Pairing creates an Ed25519 key for this machine (macOS: stored in the login
-Keychain; Linux: `~/.config/reflop/id_ed25519`, mode 0600) and pins the
-server's key. If the server ever presents a different key, the client stops
-before sending anything. With `REFLOP_CLIENT_HOME` set, the client keeps its
-config there and uses a separate key (a separate Keychain entry on macOS), so
-one machine can act as several Guests. The C API reads a key file; on macOS run
-`reflop key --write-file` once. SSH pipe mode also needs the key as a file, so
-on macOS the first SSH connection writes `~/.config/reflop/id_ed25519` (mode
-0600) next to the Keychain entry.
+Each GPU pairing uses its own Ed25519 key in `~/.config/reflop/gpu-keys/`
+(mode 0600) and pins the daemon key. Existing host-wide pairings use the
+original machine key (`id_ed25519` or the macOS login Keychain). Run
+`reflop key --write-file` to export that original key for libreflop on
+macOS. SSH pipe mode writes it on the first connection.
+`REFLOP_CLIENT_HOME` selects a separate client configuration and keys.
 
 With an SSH invite, the client also pins the server's SSH host keys. It keeps
 them in its own `known_hosts` file and runs ssh with
@@ -67,22 +64,39 @@ whatever your `~/.ssh/config` says. Servers paired with an older client have no
 pinned host keys; ssh then checks your `~/.ssh/known_hosts`, and never accepts
 an unknown key. Pair again with a new invite to pin them.
 
+### Pairing with more GPUs
+
+```sh
+reflop pair <code> --name lab-2
+reflop status
+reflop use lab-2
+reflop --server lab-2 status
+```
+
+Each card needs its own invite, even when two cards share an endpoint.
+The first pairing becomes the default. `use` changes the default for new
+sessions. Running sessions stay where they are. To use two at once in Python,
+call `reflop.device(0, server="lab-0")` and `reflop.device(1, server="lab-2")`.
+If a paired GPU is unavailable, the session fails. An explicit `kind="cpu"`
+can still use the Owner's CPU when enabled.
+
 ### Unpairing
 
 ```sh
 reflop unpair lab          # or just `reflop unpair` for the default server
 ```
 
-This tells the server to stop accepting this machine's key, then forgets the
-server here. The Owner's half is `reflopd unpair <your-name>`, which also
-deletes your datasets and snapshots on the server. Either side may go first;
-once both have, `reflop pair` with a new invite works as it did the first time.
+This revokes the pairing's keys and forgets the pairing here. If it was your
+default GPU, use `reflop use <name>` to choose another. The Owner can run
+`reflopd unpair <your-name> --gpu <index-or-uuid>` to delete that identity,
+its datasets, and its snapshots. Either side may go first. Once both have,
+you can pair with a new invite.
 
 If the server cannot be reached, `reflop unpair` still forgets it and tells
 you to ask the Owner to run `reflopd unpair <your-name>`. `--local` skips the
 connection. If the Owner unpaired you first, commands fail with "no longer
 accepts this machine's key: run `reflop unpair lab`". `reflop pair` with a
-server you are still paired with tells you to unpair first.
+GPU you are still paired with points to its existing alias.
 
 ## The device
 
@@ -145,7 +159,7 @@ memory as soon as a new session needs it.
 `reflop usage` shows the compute you have used on a server: device time (how
 long the server's devices ran your executes, per device), estimated FLOPs,
 executes, sessions and session time, peak memory of your largest execute and
-traffic. `reflop status` prints a one-line summary.
+traffic. `reflop --server <name> status` prints a one-line summary.
 
 ```
 $ reflop usage
@@ -601,17 +615,20 @@ with `reflop run`:
 
 | Command | Purpose |
 |---|---|
-| `reflop pair <code> [--name lab]` | register with a server |
-| `reflop unpair [<name>] [--local]` | forget a server and give up this machine's access to it |
+| `reflop pair <code> [--name lab]` | pair with a GPU |
+| `reflop unpair [<name>] [--local]` | forget a pairing and give up its access |
 | `reflop servers [default\|remove <name>]` | list and manage paired servers (`remove` is `unpair`) |
-| `reflop status` | devices, enabled operators, limits, your quotas, datasets |
+| `reflop status` | list pairings and mark the default |
+| `reflop use <name>` | select the default pairing |
+| `reflop --server <name> status` | show live device, limits, and usage details |
 | `reflop usage [--json]` | compute you have used on the server |
 | `reflop init` | measure round-trip time and local speed, write `.reflop.toml` |
 | `reflop data build\|push\|ls\|rm` | datasets |
 | `reflop run <command>` | run a command here with `cuda` mapped to reFLOP |
 | `reflop verify` | compare small results with your CPU |
 | `reflop doctor` | check torch, its OpenMP runtimes, the key, the config and the connection |
-| `reflop key [--ssh] [--write-file]` | print your public key; `--write-file` also stores the private key for the C API on macOS |
+| `reflop key [--ssh] [--write-file]` | print or export the legacy machine key |
+| `reflop key --ssh --new` | create and print a new public key for a GPU's SSH invite |
 | `reflop update` | update the client to the newest signed release. In a uv project it upgrades `uv.lock` and syncs; elsewhere it installs the release's wheel |
 
 `--server <name>` (or `REFLOP_SERVER`) selects a paired server for any command.

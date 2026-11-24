@@ -19,6 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/reflopai/reflop/pkg/opset"
 	pb "github.com/reflopai/reflop/pkg/reflopv1"
 	"github.com/reflopai/reflop/server/reflopd/internal/audit"
@@ -54,7 +56,9 @@ type Options struct {
 	AcceptWeakIsolation bool
 	Log                 *log.Logger
 	Listen              []string // overrides config
-	SkipProbe           bool     // tests: do not spawn probe workers
+	GPUs                []string // physical indexes or UUIDs, overrides config
+	RuntimeVariant      string
+	SkipProbe           bool // tests: do not spawn probe workers
 }
 
 // Server is the reflopd daemon.
@@ -209,13 +213,24 @@ func (s *Server) Reload() error {
 // Prepare detects hardware, picks the installed runtime and probes devices.
 func (s *Server) Prepare(ctx context.Context) error {
 	s.gpuInfo = gpu.Detect()
+	selected, err := gpu.Select(s.gpuInfo, s.opts.GPUs, s.cfg().Devices.CUDA)
+	if err != nil {
+		return err
+	}
 	lock, err := runtime.Load()
 	if err != nil {
 		return err
 	}
-	choice, err := lock.Choose(s.gpuInfo, os.Getenv("REFLOP_RUNTIME_VARIANT"))
+	variant := s.opts.RuntimeVariant
+	if variant == "" {
+		variant = os.Getenv("REFLOP_RUNTIME_VARIANT")
+	}
+	choice, err := lock.Choose(selected, variant)
 	if err != nil {
 		return err
+	}
+	if choice.Variant == "cpu" && len(s.opts.GPUs) > 0 {
+		return fmt.Errorf("the selected GPUs cannot be served with the CPU runtime")
 	}
 	arch, err := runtime.Arch()
 	if err != nil {
@@ -243,7 +258,7 @@ func (s *Server) Prepare(ctx context.Context) error {
 	if s.cfg().Sandbox.TryUserNamespaces {
 		s.userNS = supervisor.UserNSAvailable()
 	}
-	all := s.buildSlots(choice.Variant)
+	all := s.buildSlots(choice.Variant, selected.GPUs)
 	s.allSlots = all
 	if s.opts.SkipProbe {
 		s.slots.Store(&all)
@@ -343,27 +358,17 @@ func (s *Server) retryPending(ctx context.Context) {
 	}()
 }
 
-func (s *Server) buildSlots(variant string) []*DeviceSlot {
+func (s *Server) buildSlots(variant string, selected []gpu.GPU) []*DeviceSlot {
 	cfg := s.cfg()
 	var slots []*DeviceSlot
 	if variant != "cpu" {
-		want := map[int]bool{}
-		for _, i := range cfg.Devices.CUDA {
-			want[i] = true
-		}
-		idx := 0
-		for i := range s.gpuInfo.GPUs {
-			g := s.gpuInfo.GPUs[i]
-			if len(want) > 0 && !want[g.Index] {
-				continue
-			}
+		for idx, g := range selected {
 			slots = append(slots, &DeviceSlot{
 				PB:    &pb.Device{Kind: pb.DeviceKind_DEVICE_CUDA, Index: uint32(idx)},
 				Name:  fmt.Sprintf("cuda:%d (%s)", idx, g.Name),
 				GPU:   &g,
 				Nodes: gpu.DeviceNodes([]gpu.GPU{g}, s.gpuInfo.WSL),
 			})
-			idx++
 		}
 	}
 	if cfg.Devices.CPU || len(slots) == 0 {
@@ -373,19 +378,37 @@ func (s *Server) buildSlots(variant string) []*DeviceSlot {
 }
 
 func (s *Server) slotFor(d *pb.Device) *DeviceSlot {
-	slots := s.devices()
-	for _, sl := range slots {
+	return s.slotForIdentity(d, "")
+}
+
+func (s *Server) slotForIdentity(d *pb.Device, uuid string) *DeviceSlot {
+	var cpu *DeviceSlot
+	for _, sl := range s.devices() {
+		if !sl.allowed(uuid) {
+			continue
+		}
 		if d == nil && sl.PB.Kind == pb.DeviceKind_DEVICE_CUDA {
 			return sl
 		}
 		if d != nil && sl.PB.Kind == d.Kind && sl.PB.Index == d.Index {
 			return sl
 		}
+		if sl.PB.Kind == pb.DeviceKind_DEVICE_CPU {
+			cpu = sl
+		}
 	}
-	if d == nil && len(slots) > 0 {
-		return slots[0]
+	if d == nil && uuid == "" {
+		return cpu
 	}
 	return nil
+}
+
+func (slot *DeviceSlot) allowed(uuid string) bool {
+	if uuid == "" {
+		return true
+	}
+	return slot != nil && (slot.PB.Kind == pb.DeviceKind_DEVICE_CPU ||
+		(slot.PB.Kind == pb.DeviceKind_DEVICE_CUDA && slot.GPU != nil && slot.GPU.StableUUID() == uuid))
 }
 
 // enabledFor filters a device's op table by Owner settings.
@@ -550,8 +573,16 @@ func (s *Server) limits() *pb.Limits {
 func (s *Server) capabilitiesFor(id *auth.Identity) *pb.ServerCapabilities {
 	c := &pb.ServerCapabilities{ProtocolVersions: []uint32{ProtocolVersion}, OpsetVersions: []uint32{1}}
 	seen := map[string]bool{}
-	slots := s.devices()
-	for _, slot := range slots {
+	for _, slot := range s.devices() {
+		if !slot.allowed(id.GPUUUID) {
+			continue
+		}
+		if len(c.Devices) == 0 {
+			c.EnabledOpIds = s.filterOps(slot)
+			if slot.Runtime != nil {
+				c.RuntimeInfo = proto.CloneOf(slot.Runtime)
+			}
+		}
 		if slot.Info != nil {
 			c.Devices = append(c.Devices, slot.Info)
 		} else {
@@ -567,10 +598,6 @@ func (s *Server) capabilitiesFor(id *auth.Identity) *pb.ServerCapabilities {
 	c.Capabilities = append(c.Capabilities, "usage", "snapshots", "checkpoints")
 	if ck := s.cfg().Checkpoints; ck.Enabled {
 		c.CheckpointIntervalS = uint64(time.Duration(ck.Interval) / time.Second)
-	}
-	if len(slots) > 0 {
-		c.EnabledOpIds = s.filterOps(slots[0])
-		c.RuntimeInfo = slots[0].Runtime
 	}
 	if c.RuntimeInfo == nil {
 		c.RuntimeInfo = &pb.RuntimeInfo{}

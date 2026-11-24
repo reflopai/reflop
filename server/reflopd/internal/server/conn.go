@@ -192,7 +192,7 @@ func (c *clientConn) handshake() error {
 			c.srv.audit.Write(audit.Record{Identity: id.Name, ID: id.ID, Event: "connect",
 				Fields: map[string]any{"remote": c.remote, "transport": c.transport}})
 			return c.send(&pb.Envelope{RequestId: env.RequestId, End: true, Body: &pb.Envelope_AuthResult{
-				AuthResult: &pb.AuthResult{IdentityName: id.Name, IdentityId: id.IDBytes(), Capabilities: caps}}})
+				AuthResult: &pb.AuthResult{IdentityName: id.Name, IdentityId: id.IDBytes(), Capabilities: caps, GpuUuid: id.GPUUUID}}})
 		default:
 			c.sendErr(env.RequestId, pb.ErrorCode_ERROR_UNAUTHENTICATED, "authenticate first")
 			return errors.New("request before authentication")
@@ -307,7 +307,7 @@ func (c *clientConn) unpair(rid uint64) error {
 		Fields: map[string]any{"remote": c.remote, "keys": len(id.Keys)}})
 	c.srv.logf("%q ran `reflop unpair` from %s: its keys are revoked. To delete it and its data and free "+
 		"the name, run: reflopd unpair %s", id.Name, c.remote, id.Name)
-	c.srv.Kill(id.Name, "the Guest unpaired")
+	c.srv.kill("the Guest unpaired", func(sess *Session) bool { return sess.Identity.ID == id.ID })
 	if err := c.send(&pb.Envelope{RequestId: rid, End: true, Body: &pb.Envelope_Unpaired{
 		Unpaired: &pb.Unpaired{IdentityName: id.Name}}}); err != nil {
 		return err

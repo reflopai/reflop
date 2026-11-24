@@ -11,15 +11,17 @@ import time
 from .. import _debug
 from .._pb import compute_pb2 as cpb
 from .._pb import data_pb2 as dpb
+from .._pb import graph_pb2 as gpb
 from ..errors import sanitize
 
 EPILOG = """\
 Your programs run on this machine. Only operator graphs and tensors go to
 the server, which runs whitelisted tensor operators and nothing else.
 
-  reflop pair <invite-code>         register with a server (once)
-  reflop unpair [server]            forget a server; it stops accepting this machine
-  reflop status                     server, devices, limits, quotas
+  reflop pair <invite-code>         add a GPU pairing
+  reflop unpair [name]              forget a pairing and give up its access
+  reflop status                     list pairings
+  reflop use <name>                 choose the default pairing
   reflop usage                      compute you have used on the server
   reflop data push ./pack --name d  upload a dataset once
   reflop run python train.py        run locally with reflop enabled
@@ -36,7 +38,8 @@ def cmd_pair(a) -> int:
     from ..client import pair
 
     e = pair(a.code, a.name)
-    _p(f"paired with {e.name} as {e.identity!r} ({e.transport}, {', '.join(e.addresses)})")
+    card = f" ({e.gpu_name or e.gpu_uuid})" if e.gpu_uuid else ""
+    _p(f"paired with {e.name}{card} as {e.identity!r} ({e.transport}, {sanitize(', '.join(e.addresses))})")
     _p(f"server key pinned: {e.fingerprint[:16]}…")
     _p("next: reflop status")
     return 0
@@ -80,14 +83,8 @@ def cmd_unpair(a) -> int:
 def cmd_servers(a) -> int:
     from ..config import ClientConfig
 
-    cfg = ClientConfig.load()
     if a.action == "default":
-        if a.name not in cfg.servers:
-            _p(f"no server named {a.name!r}")
-            return 2
-        cfg.default = a.name
-        cfg.save()
-        return 0
+        return cmd_use(a)
     if a.action == "remove":
         # Removing only the local entry left this machine's key registered,
         # so it could never pair with that server again (issue #6).
@@ -95,18 +92,37 @@ def cmd_servers(a) -> int:
             _p("usage: reflop servers remove <name> (the same as reflop unpair <name>)")
             return 2
         return cmd_unpair(argparse.Namespace(name=a.name, server=None, local=False, yes=False))
+    cfg = ClientConfig.load()
     if not cfg.servers:
         _p("no servers paired (reflop pair <invite-code>)")
     for n, s in cfg.servers.items():
         mark = "*" if n == cfg.default else " "
-        _p(f"{mark} {n:16} {s.transport:4} {', '.join(s.addresses):30} as {s.identity}  key {s.fingerprint[:16]}…")
+        _p(f"{mark} {n:16} {s.transport:4} {sanitize(', '.join(s.addresses)):30} as {s.identity}  key {s.fingerprint[:16]}…")
+    return 0
+
+
+def cmd_use(a) -> int:
+    from ..config import ClientConfig, config_lock
+
+    with config_lock():
+        cfg = ClientConfig.load()
+        if a.name not in cfg.servers:
+            raise ValueError(f"no pairing named {a.name!r} (see `reflop status`)")
+        cfg.default = a.name
+        cfg.save()
+    _p(f"default pairing: {a.name}")
     return 0
 
 
 def cmd_key(a) -> int:
     from .. import keys
 
-    k = keys.load_or_create()
+    if a.new:
+        if not a.ssh or a.write_file:
+            raise ValueError("--new requires --ssh and stores the new pairing key automatically")
+        k = keys.new_ssh_pairing_key()
+    else:
+        k = keys.load_or_create()
     if a.write_file:
         f = keys.write_key_file(k)
         _p(f"wrote {f} (mode 0600) for libreflop and SSH pipe mode")
@@ -119,8 +135,6 @@ def cmd_key(a) -> int:
 
 
 def _caps_summary(caps) -> list[str]:
-    from .._pb import graph_pb2 as gpb
-
     out = []
     for d in caps.devices:
         kind = "cuda" if d.device.kind == gpb.DEVICE_CUDA else "cpu"
@@ -131,13 +145,33 @@ def _caps_summary(caps) -> list[str]:
 
 
 def cmd_status(a) -> int:
+    if a.server is None:
+        from ..config import ClientConfig
+
+        cfg = ClientConfig.load()
+        if not cfg.servers:
+            _p("no pairings (reflop pair <invite-code>)")
+            return 0
+        _p("  NAME              GPU                          ADDRESS")
+        for name, entry in cfg.servers.items():
+            mark = "*" if name == cfg.default else " "
+            card = entry.gpu_name or entry.gpu_uuid or "host-wide"
+            _p(f"{mark} {name:<17} {card:<28} {sanitize(', '.join(entry.addresses))}")
+        if not cfg.default:
+            _p("choose a default with reflop use <name>")
+        return 0
+
     from ..client import admin
 
     c = admin(a.server)
     try:
         caps = c.caps
         e = c.entry
-        _p(f"server:   {e.name} ({e.transport}, {', '.join(e.addresses)}), you are {sanitize(c.auth.identity_name, 64)!r}")
+        _p(f"server:   {e.name} ({e.transport}, {sanitize(', '.join(e.addresses))}), you are {sanitize(c.auth.identity_name, 80)!r}")
+        if e.gpu_uuid:
+            _p(f"GPU:      {e.gpu_name} {e.gpu_uuid}")
+            if not any(d.device.kind == gpb.DEVICE_CUDA for d in caps.devices):
+                _p("          paired GPU unavailable")
         for line in _caps_summary(caps):
             _p(f"device:   {line}")
         _p(f"opset:    v1, {len(caps.enabled_op_ids)} operators enabled; capabilities: "
@@ -478,11 +512,11 @@ def cmd_version(a) -> int:
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="reflop", description="reFLOP client: use a remote GPU as a calculator.",
                                  epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--server", "-s", help="paired server name (default: the default server)")
+    ap.add_argument("--server", "-s", help="pairing name (default: the selected pairing)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("pair", help="redeem an invite code")
     p.add_argument("code")
-    p.add_argument("--name", help="local name for this server")
+    p.add_argument("--name", help="local name for this pairing")
     p.set_defaults(fn=cmd_pair)
     p = sub.add_parser("unpair", help="forget a paired server and give up this machine's access to it")
     p.add_argument("name", nargs="?", help="local server name (default: the default server)")
@@ -495,10 +529,14 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_servers)
     p = sub.add_parser("key", help="print this machine's public key")
     p.add_argument("--ssh", action="store_true", help="OpenSSH format, for SSH pipe mode invites")
+    p.add_argument("--new", action="store_true", help="with --ssh, generate a new key for a GPU invite")
     p.add_argument("--write-file", action="store_true",
                    help="also store the private key as ~/.config/reflop/id_ed25519 (needed by libreflop on macOS)")
     p.set_defaults(fn=cmd_key)
-    sub.add_parser("status", help="show the server's devices, limits and quotas").set_defaults(fn=cmd_status)
+    sub.add_parser("status", help="list pairings, or show live details with --server").set_defaults(fn=cmd_status)
+    p = sub.add_parser("use", help="choose the default pairing")
+    p.add_argument("name")
+    p.set_defaults(fn=cmd_use)
     p = sub.add_parser("usage", help="compute you have used on the server (device time, FLOPs, traffic)")
     p.add_argument("--json", action="store_true", help="JSON output")
     p.set_defaults(fn=cmd_usage)

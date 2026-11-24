@@ -60,7 +60,8 @@ machine can reach it.
 4. Installs and starts the `reflopd` systemd user service (`Delegate=yes`, so
    each worker gets its own cgroup for the memory and process rails). Without a
    systemd user manager, or with `--foreground`, it serves in the terminal.
-5. On the first run, prints a one-time invite for a Guest named `guest`.
+5. On the first run, prints a one-time invite for `guest` or the invite command
+   if you enabled multiple GPUs.
 
 If reflopd should keep running after you log out:
 
@@ -76,10 +77,25 @@ reflopd invite --name alice --expires 2h
 reflopd invite --name alice --address gpu.tailnet.example:7460
 ```
 
-The code carries the address(es), the fingerprint of this server's key, and a
-one-time secret. The Guest runs `reflop pair <code>`. Pairing registers their
-Ed25519 key; from then on they authenticate by signing a fresh challenge, and
-their client refuses any server whose key differs from the pinned one.
+The code carries the address, the daemon's key fingerprint, the GPU UUID, and
+a one-time secret. The Guest runs `reflop pair <code>` and registers the key for
+that pairing. Existing host-wide and CPU-only pairings continue to work.
+
+### Sharing multiple GPUs
+
+```sh
+reflopd gpu list
+reflopd up --gpu 0 --gpu 2
+reflopd invite --name alice --gpu 0
+reflopd invite --name alice --gpu 2
+reflopd quota set alice --gpu 2 --max-sessions 1
+```
+
+The repeatable `up --gpu` flag overrides `[devices].cuda` at startup. It
+accepts physical indexes or full UUIDs. Restart the daemon to change the
+selection. `invite` requires `--gpu` when several cards are enabled.
+Use the same selector with `revoke`, `users delete`, and `unpair`. A full UUID
+can target a pairing after its card is removed.
 
 An invite works once. A failed attempt (wrong secret, tampered code) also
 consumes it, so a leaked code cannot be brute-forced. To see or remove access:
@@ -128,11 +144,12 @@ If `sshd` already runs and you would rather not open a port, Guests can reach
 reflopd through SSH. SSH then works as a pipe that can only start
 `reflopd serve --stdio`: no shell, no PTY, no port or agent forwarding.
 
-1. The Guest prints their public key: `reflop key --ssh`
+1. The Guest creates a key for the GPU with `reflop key --ssh --new`. On a
+   CPU-only Owner, they use `reflop key --ssh`.
 2. You register it and add the restricted line to `~/.ssh/authorized_keys`:
 
    ```sh
-   reflopd invite --name bob --via ssh --key "ssh-ed25519 AAAA… bob@laptop" --ssh-target you@gpu-box
+   reflopd invite --name bob --gpu 0 --via ssh --key "ssh-ed25519 AAAA… bob@laptop" --ssh-target you@gpu-box
    ```
 
    The line it adds:
@@ -156,7 +173,7 @@ replace the host keys, Guests need a new invite.
 Inside the pipe, the client still authenticates with its key, and the key must
 belong to the identity named in the forced command. `reflopd doctor` scans
 `authorized_keys` and reports any reFLOP key missing `restrict` or the forced
-command as critical. `reflopd revoke bob` removes the line.
+command as critical. `reflopd revoke bob --gpu 0` removes the line.
 
 ## Level 1: the system install
 
@@ -375,7 +392,7 @@ the audit log still holds. `--since` recomputes from the audit log, so it only
 reaches back as far as the log's retention.
 
 Guests see their own lifetime totals with `reflop usage` (and a summary in
-`reflop status`); they never see other Guests or their share.
+`reflop --server <name> status`); they never see other Guests or their share.
 
 ## Files and directories
 
