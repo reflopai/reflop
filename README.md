@@ -193,8 +193,9 @@ python reflop_train.py          # Embed `reflop` in code
 reflop run python train.py      # Or just add a prefix command
 ```
 
-⚠️ The Owner's firewall may block pairing. If UFW is enabled, run
-`sudo ufw allow 7460/tcp` on the Owner's machine.
+> [!WARNING]
+> The Owner's firewall may block pairing. If UFW is enabled, run
+> `sudo ufw allow 7460/tcp` on the Owner's machine.
 
 ## Multiple GPUs
 
