@@ -175,10 +175,13 @@ pip install ./client/python                 # the reFLOP client
 
 > Owner side `reflopd`
 ```sh
-# 1) Set up and start (rootless).
-reflopd up --listen <LAN-or-Tailscale-addr>:7460
+# 0) If ufw is enabled, allow port 7460/tcp
+sudo ufw allow 7460/tcp
 
-# 2) For one GPU, print the pairing code
+# 1) Set up and start on IP address of choice.
+reflopd up --listen <LAN-or-Tailscale-IP-addr>:7460
+
+# 2) To Invite a user, print the pairing code
 reflopd invite --name alice
 ```
 
@@ -193,31 +196,48 @@ python reflop_train.py          # Embed `reflop` in code
 reflop run python train.py      # Or just add a prefix command
 ```
 
-> [!WARNING]
-> The Owner's firewall may block pairing. If UFW is enabled, run
-> `sudo ufw allow 7460/tcp` on the Owner's machine.
-
 ## Multiple GPUs
 
 **Owner**
 
+> If you have multiple GPUs, you can expose them individually or together. Each GPU gets its own pairing code.
+
 ```sh
+# List available GPUs
 reflopd gpu list
+
+# Choose which GPUs to expose
+reflopd up --gpu 0 --listen <LAN-or-Tailscale-addr>:7460
+reflopd up --gpu 2 --listen <LAN-or-Tailscale-addr>:7460
+
+# Or expose both at once
 reflopd up --gpu 0 --gpu 2 --listen <LAN-or-Tailscale-addr>:7460
+
+# Invite a Guest to a specific GPU
 reflopd invite --name alice --gpu 0
 reflopd invite --name alice --gpu 2
+
+# Unpairing works the same way
 reflopd unpair alice --gpu 0
 ```
 
 **Guest**
 
+> The Guest essentially treats each GPU as a separate server, regardless of whether they reside in the same machine or not. Each pairing code is for one GPU.
+
 ```sh
+# Can pair multiple GPUs, each with its own pairing code
 reflop pair <gpu-0-code>
-reflop pair <gpu-2-code> --name lab-2
-reflop status
-reflop rename nvidia-h100 lab-0   # Use the name shown by status
-reflop use lab-2
-reflop unpair lab-0
+reflop pair <gpu-2-code> --name lab-5090
+
+# Rename a paired GPU
+reflop rename <current-name> <new-name>
+
+# Switch to a different GPU
+reflop use lab-5090
+
+# Unpair a specific GPU
+reflop unpair lab-h100
 ```
 
 Default names use the GPU model, for example `nvidia-h100` and `nvidia-h100-2`.
