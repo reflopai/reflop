@@ -114,17 +114,22 @@ def _keychain_put(seed: bytes) -> bool:
     return _keychain_get() == seed
 
 
-def load_or_create() -> Ed25519PrivateKey:
+def load_existing() -> Ed25519PrivateKey:
     if _keychain_ok():
         seed = _keychain_get()
         if seed is not None:
             return Ed25519PrivateKey.from_private_bytes(seed)
     f = _key_file()
-    if f.exists():
-        st = f.stat()
-        if st.st_mode & 0o077:
-            raise PermissionError(f"{f} is readable by other users; run: chmod 600 {f}")
-        return serialization.load_ssh_private_key(f.read_bytes(), password=None)
+    if f.stat().st_mode & 0o077:
+        raise PermissionError(f"{f} is readable by other users; run: chmod 600 {f}")
+    return serialization.load_ssh_private_key(f.read_bytes(), password=None)
+
+
+def load_or_create() -> Ed25519PrivateKey:
+    try:
+        return load_existing()
+    except FileNotFoundError:
+        pass
     key = Ed25519PrivateKey.generate()
     seed = key.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
     if _keychain_ok() and _keychain_put(seed):

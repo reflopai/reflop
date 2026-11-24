@@ -50,6 +50,12 @@ and this machine's clock, both in UTC. If the Owner made the invite recently,
 this machine's date or time is probably wrong: compare `date -u` here and on
 the Owner's machine.
 
+If TLS pairing says “connection refused,” ask the Owner to check that
+`reflopd` is listening on the address and port in the invite and that the
+firewall allows inbound TCP on that port. The error shows the UFW command
+for the refused port, for example `sudo ufw allow 7460/tcp`. Run it on the
+Owner's machine if it uses UFW. [Owner network setup](OWNER_GUIDE.md#network-exposure)
+
 Each GPU pairing uses its own Ed25519 key in `~/.config/reflop/gpu-keys/`
 (mode 0600) and pins the daemon key. Existing host-wide pairings use the
 original machine key (`id_ed25519` or the macOS login Keychain). Run
@@ -67,13 +73,29 @@ an unknown key. Pair again with a new invite to pin them.
 ### Pairing with more GPUs
 
 ```sh
-reflop pair <code> --name lab-2
+reflop pair <code>
 reflop status
+reflop rename nvidia-h100 lab-2
 reflop use lab-2
 reflop --server lab-2 status
 ```
 
 Each card needs its own invite, even when two cards share an endpoint.
+New GPU pairings get a name like `nvidia-mx450` or `nvidia-h100`. Names
+are unique on your machine, so another H100 gets `nvidia-h100-2` even
+if it's at a different address. Use `--name` when pairing to pick your own
+name, or `reflop rename <old> <new>` afterward. Renaming works offline
+and carries over the default selection. Update any scripts, environment
+variables, or project settings that refer to the old name.
+
+`reflop status` marks the default with `*` and checks each pairing.
+A GPU shows `online` when authentication succeeds and the daemon
+advertises that GPU. A host-wide pairing shows `online` when it can use
+at least one device. `offline` also covers connection or authentication
+failures. Use `reflop --server <name> status` for details. On narrow
+terminals, long values may be shortened. Redirect the output to see them
+in full.
+
 The first pairing becomes the default. `use` changes the default for new
 sessions. Running sessions stay where they are. To use two at once in Python,
 call `reflop.device(0, server="lab-0")` and `reflop.device(1, server="lab-2")`.
@@ -618,7 +640,8 @@ with `reflop run`:
 | `reflop pair <code> [--name lab]` | pair with a GPU |
 | `reflop unpair [<name>] [--local]` | forget a pairing and give up its access |
 | `reflop servers [default\|remove <name>]` | list and manage paired servers (`remove` is `unpair`) |
-| `reflop status` | list pairings and mark the default |
+| `reflop status` | show which pairings are online and mark the default |
+| `reflop rename <old> <new>` | change a pairing's local name |
 | `reflop use <name>` | select the default pairing |
 | `reflop --server <name> status` | show live device, limits, and usage details |
 | `reflop usage [--json]` | compute you have used on the server |

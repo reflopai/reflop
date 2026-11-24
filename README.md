@@ -193,6 +193,9 @@ python reflop_train.py          # Embed `reflop` in code
 reflop run python train.py      # Or just add a prefix command
 ```
 
+⚠️ The Owner's firewall may block pairing. If UFW is enabled, run
+`sudo ufw allow 7460/tcp` on the Owner's machine.
+
 ## Multiple GPUs
 
 **Owner**
@@ -208,12 +211,16 @@ reflopd unpair alice --gpu 0
 **Guest**
 
 ```sh
-reflop pair <gpu-0-code> --name lab-0
+reflop pair <gpu-0-code>
 reflop pair <gpu-2-code> --name lab-2
 reflop status
+reflop rename nvidia-h100 lab-0   # Use the name shown by status
 reflop use lab-2
 reflop unpair lab-0
 ```
+
+Default names use the GPU model, for example `nvidia-h100` and `nvidia-h100-2`.
+`reflop status` shows whether each pairing is online.
 
 ## How it works
 

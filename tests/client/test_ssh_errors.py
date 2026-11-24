@@ -6,10 +6,11 @@ import io
 import os
 import stat
 import sys
+import time
 from concurrent.futures import Future
 
 import pytest
-from reflop import client, config
+from reflop import client, config, keys
 from reflop.connection import Connection
 from reflop.errors import ReflopError, SessionLostError
 
@@ -64,6 +65,23 @@ def test_unpair_over_ssh_says_why(fake_ssh):
 
     assert outcome == client.UNPAIR_UNREACHABLE
     assert "Connection refused" in detail
+
+
+def test_ssh_probe_ends_if_the_pipe_stalls(tmp_path, monkeypatch):
+    monkeypatch.setenv("REFLOP_CLIENT_HOME", str(tmp_path))
+    ssh = tmp_path / "ssh"
+    ssh.write_text("#!/bin/sh\nexec sleep 15\n")
+    ssh.chmod(0o700)
+    monkeypatch.setenv("REFLOP_SSH_COMMAND", str(ssh))
+
+    start = time.monotonic()
+    fr = client.dial_ssh("me@gpu.example", keys.load_or_create(), "ab" * 32, [], timeout=0.1)
+    try:
+        with pytest.raises(EOFError):
+            fr.read()
+    finally:
+        fr.close()
+    assert time.monotonic() - start < 3
 
 
 def test_a_dropped_connection_names_the_ssh_reason():
