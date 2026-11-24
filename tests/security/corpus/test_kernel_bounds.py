@@ -50,7 +50,11 @@ def unsafe():
     o, idx, off, o2b, bag_size, maxi = _bag(1)
     x3 = r(1, 2, 4, 4, 4)
     p3, i3 = _pool3d_idx(x3)
-    am3, ai3 = A.adaptive_max_pool3d.default(x3, [2, 2, 2])
+    _, ai3 = A.adaptive_max_pool3d.default(x3, [2, 2, 2])
+    # Ascending values put every window's max at its far corner, so the deeper
+    # windows' indices are >= 48, past a 4x4x3 self. Indices from random data
+    # all fall inside it about once in 256 runs, and the call then runs safely.
+    um3, ui3 = A.adaptive_max_pool3d.default(torch.arange(128.0).reshape(1, 2, 4, 4, 4), [2, 2, 2])
     return [
         ("adaptive avg pool 2d: grad_output has another batch size",
          Call("aten._adaptive_avg_pool2d_backward.default", [r(4, 6, 1, 3), r(3, 6, 1, 6)])),
@@ -94,7 +98,7 @@ def unsafe():
         ("max pool 3d: indices beyond self", Call("aten.max_pool3d_with_indices_backward.default",
                                                   [p3, x3, [2, 2, 2], [2, 2, 2], [0, 0, 0], [1, 1, 1], False, i3 + 64])),
         ("adaptive max pool 3d: self smaller than the indices", Call("aten.adaptive_max_pool3d_backward.default",
-                                                                    [am3, r(1, 2, 4, 4, 3), ai3])),
+                                                                    [um3, r(1, 2, 4, 4, 3), ui3])),
     ]
 
 
