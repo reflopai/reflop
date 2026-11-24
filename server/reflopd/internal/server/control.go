@@ -194,6 +194,7 @@ type StatusView struct {
 	Fingerprint string        `json:"fingerprint"`
 	Runtime     string        `json:"runtime"`
 	Devices     []string      `json:"devices"`
+	GPUs        []GPUView     `json:"gpus"`
 	Paused      bool          `json:"paused"`
 	Yielding    bool          `json:"yielding"`
 	Connections int           `json:"connections"`
@@ -201,6 +202,40 @@ type StatusView struct {
 	Sandbox     []string      `json:"sandbox"`
 	Level       int           `json:"level"`
 	Checkpoints string        `json:"checkpoints"` // "off" or the interval
+}
+
+// GPUView describes a physical card and its state on the daemon.
+type GPUView struct {
+	Index int    `json:"index"`
+	UUID  string `json:"uuid"`
+	Name  string `json:"name"`
+	State string `json:"state"` // serving, pending, or disabled
+}
+
+func (s *Server) gpuInventory() []GPUView {
+	ready := make(map[*DeviceSlot]bool)
+	for _, slot := range s.devices() {
+		ready[slot] = true
+	}
+	states := make(map[int]string)
+	for _, slot := range s.allSlots {
+		if slot.GPU != nil {
+			state := "pending"
+			if ready[slot] {
+				state = "serving"
+			}
+			states[slot.GPU.Index] = state
+		}
+	}
+	out := make([]GPUView, 0, len(s.gpuInfo.GPUs))
+	for _, g := range s.gpuInfo.GPUs {
+		state := states[g.Index]
+		if state == "" {
+			state = "disabled"
+		}
+		out = append(out, GPUView{Index: g.Index, UUID: g.StableUUID(), Name: g.Name, State: state})
+	}
+	return out
 }
 
 func (s *Server) sandboxLayers() []string {
@@ -228,7 +263,7 @@ func (s *Server) status(withStats bool) StatusView {
 		Version: buildinfo.Version, Uptime: time.Since(s.started).Truncate(time.Second).String(),
 		Listen: s.Addrs(), Fingerprint: hex.EncodeToString(fp[:]),
 		Runtime: s.runtime.Marker.ID, Paused: s.paused.Load(), Yielding: s.yielding.Load(), Sandbox: s.sandboxLayers(),
-		Checkpoints: "off",
+		Checkpoints: "off", GPUs: s.gpuInventory(),
 	}
 	if ck := s.cfg().Checkpoints; ck.Enabled {
 		v.Checkpoints = "every " + time.Duration(ck.Interval).String()
@@ -555,9 +590,15 @@ func (s *Server) Resume(by string) {
 
 // Kill terminates sessions matching an identity name or session id prefix.
 func (s *Server) Kill(target, why string) int {
+	return s.kill(why, func(sess *Session) bool {
+		return target != "" && (sess.Identity.Name == target || strings.HasPrefix(sess.hex(), target))
+	})
+}
+
+func (s *Server) kill(why string, match func(*Session) bool) int {
 	n := 0
 	for _, sess := range s.allSessions() {
-		if target != "" && (sess.Identity.Name == target || strings.HasPrefix(sess.hex(), target)) {
+		if match(sess) {
 			s.audit.Write(audit.Record{Identity: sess.Identity.Name, ID: sess.Identity.ID, Session: sess.hex(), Event: "killed",
 				Fields: map[string]any{"reason": why}})
 			go sess.closeFinal(why)

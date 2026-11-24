@@ -25,7 +25,7 @@ _sym_db = _symbol_database.Default()
 from . import capabilities_pb2 as reflop_dot_v1_dot_capabilities__pb2
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14reflop/v1/auth.proto\x12\treflop.v1\x1a\x1creflop/v1/capabilities.proto\"5\n\x0c\x41uthenticate\x12\x12\n\npublic_key\x18\x01 \x01(\x0c\x12\x11\n\tsignature\x18\x02 \x01(\x0c\"m\n\nAuthResult\x12\x15\n\ridentity_name\x18\x01 \x01(\t\x12\x13\n\x0bidentity_id\x18\x02 \x01(\x0c\x12\x33\n\x0c\x63\x61pabilities\x18\x03 \x01(\x0b\x32\x1d.reflop.v1.ServerCapabilities\"M\n\x04Pair\x12\x11\n\tinvite_id\x18\x01 \x01(\x0c\x12\x12\n\npublic_key\x18\x02 \x01(\x0c\x12\x0b\n\x03mac\x18\x03 \x01(\x0c\x12\x11\n\tsignature\x18\x04 \x01(\x0c\"8\n\nPairResult\x12\x15\n\ridentity_name\x18\x01 \x01(\t\x12\x13\n\x0bidentity_id\x18\x02 \x01(\x0c\"\xfa\x01\n\nInviteCode\x12\x0f\n\x07version\x18\x01 \x01(\r\x12+\n\ttransport\x18\x02 \x01(\x0e\x32\x18.reflop.v1.TransportKind\x12\x11\n\taddresses\x18\x03 \x03(\t\x12\x1e\n\x16server_key_fingerprint\x18\x04 \x01(\x0c\x12\x11\n\tinvite_id\x18\x05 \x01(\x0c\x12\x0e\n\x06secret\x18\x06 \x01(\x0c\x12\x14\n\x0c\x65xpires_unix\x18\x07 \x01(\x03\x12\x15\n\ridentity_name\x18\x08 \x01(\t\x12\x14\n\x0creflopd_path\x18\t \x01(\t\x12\x15\n\rssh_host_keys\x18\n \x03(\t*L\n\rTransportKind\x12\x15\n\x11TRANSPORT_INVALID\x10\x00\x12\x11\n\rTRANSPORT_TLS\x10\x01\x12\x11\n\rTRANSPORT_SSH\x10\x02\x42)Z\'github.com/reflopai/reflop/pkg/reflopv1b\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x14reflop/v1/auth.proto\x12\treflop.v1\x1a\x1creflop/v1/capabilities.proto\"5\n\x0c\x41uthenticate\x12\x12\n\npublic_key\x18\x01 \x01(\x0c\x12\x11\n\tsignature\x18\x02 \x01(\x0c\"\x7f\n\nAuthResult\x12\x15\n\ridentity_name\x18\x01 \x01(\t\x12\x13\n\x0bidentity_id\x18\x02 \x01(\x0c\x12\x33\n\x0c\x63\x61pabilities\x18\x03 \x01(\x0b\x32\x1d.reflop.v1.ServerCapabilities\x12\x10\n\x08gpu_uuid\x18\x04 \x01(\t\"_\n\x04Pair\x12\x11\n\tinvite_id\x18\x01 \x01(\x0c\x12\x12\n\npublic_key\x18\x02 \x01(\x0c\x12\x0b\n\x03mac\x18\x03 \x01(\x0c\x12\x11\n\tsignature\x18\x04 \x01(\x0c\x12\x10\n\x08gpu_uuid\x18\x05 \x01(\t\"8\n\nPairResult\x12\x15\n\ridentity_name\x18\x01 \x01(\t\x12\x13\n\x0bidentity_id\x18\x02 \x01(\x0c\"\xbc\x02\n\nInviteCode\x12\x0f\n\x07version\x18\x01 \x01(\r\x12+\n\ttransport\x18\x02 \x01(\x0e\x32\x18.reflop.v1.TransportKind\x12\x11\n\taddresses\x18\x03 \x03(\t\x12\x1e\n\x16server_key_fingerprint\x18\x04 \x01(\x0c\x12\x11\n\tinvite_id\x18\x05 \x01(\x0c\x12\x0e\n\x06secret\x18\x06 \x01(\x0c\x12\x14\n\x0c\x65xpires_unix\x18\x07 \x01(\x03\x12\x15\n\ridentity_name\x18\x08 \x01(\t\x12\x14\n\x0creflopd_path\x18\t \x01(\t\x12\x15\n\rssh_host_keys\x18\n \x03(\t\x12\x10\n\x08gpu_uuid\x18\x0b \x01(\t\x12\x10\n\x08gpu_name\x18\x0c \x01(\t\x12\x1c\n\x14ssh_guest_public_key\x18\r \x01(\x0c*L\n\rTransportKind\x12\x15\n\x11TRANSPORT_INVALID\x10\x00\x12\x11\n\rTRANSPORT_TLS\x10\x01\x12\x11\n\rTRANSPORT_SSH\x10\x02\x42)Z\'github.com/reflopai/reflop/pkg/reflopv1b\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -33,16 +33,16 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'reflop.v1.auth_pb2', _globa
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'Z\'github.com/reflopai/reflop/pkg/reflopv1'
-  _globals['_TRANSPORTKIND']._serialized_start=621
-  _globals['_TRANSPORTKIND']._serialized_end=697
+  _globals['_TRANSPORTKIND']._serialized_start=723
+  _globals['_TRANSPORTKIND']._serialized_end=799
   _globals['_AUTHENTICATE']._serialized_start=65
   _globals['_AUTHENTICATE']._serialized_end=118
   _globals['_AUTHRESULT']._serialized_start=120
-  _globals['_AUTHRESULT']._serialized_end=229
-  _globals['_PAIR']._serialized_start=231
-  _globals['_PAIR']._serialized_end=308
-  _globals['_PAIRRESULT']._serialized_start=310
-  _globals['_PAIRRESULT']._serialized_end=366
-  _globals['_INVITECODE']._serialized_start=369
-  _globals['_INVITECODE']._serialized_end=619
+  _globals['_AUTHRESULT']._serialized_end=247
+  _globals['_PAIR']._serialized_start=249
+  _globals['_PAIR']._serialized_end=344
+  _globals['_PAIRRESULT']._serialized_start=346
+  _globals['_PAIRRESULT']._serialized_end=402
+  _globals['_INVITECODE']._serialized_start=405
+  _globals['_INVITECODE']._serialized_end=721
 # @@protoc_insertion_point(module_scope)

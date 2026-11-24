@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- One reflopd can issue separate invites for multiple GPUs. Owners choose cards
+  with `reflopd up --gpu` and Guests switch pairings with `reflop use`.
+
 ## 0.2.9 (2026-11-24)
 
 This patch strengthens worker validation and fixes in-process CUDA checkpoint

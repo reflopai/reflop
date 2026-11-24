@@ -176,6 +176,8 @@ def recover(sess):
         except ReflopRemoteError as e:
             raise ReflopError(f"cannot recover: {e.message}") from None
         rec = r.session_recovered
+        if hasattr(conn, "gdevice"):
+            sess.gdevice = conn.gdevice
         _adopt(sess, rec)
     tag = bytes(rec.tag)
     if not tag:

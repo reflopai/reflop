@@ -16,9 +16,11 @@ from __future__ import annotations
 import base64
 import os
 import platform
+import re
 import shutil
 import struct
 import subprocess
+import tempfile
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -31,6 +33,45 @@ SERVICE = "reflop-client-key"
 
 def _key_file() -> Path:
     return config_dir() / "id_ed25519"
+
+
+def _scoped_path(key_id: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", key_id):
+        raise ValueError("invalid GPU pairing key identifier")
+    return config_dir() / "gpu-keys" / key_id
+
+
+def pairing_key(key_id: str, *, create: bool = False) -> Ed25519PrivateKey:
+    if not key_id:
+        return load_or_create()
+    path = _scoped_path(key_id)
+    if create and not path.exists():
+        _store_pairing_key(path, Ed25519PrivateKey.generate())
+    if path.stat().st_mode & 0o077:
+        raise PermissionError(f"{path} is readable by other users; run: chmod 600 {path}")
+    key = serialization.load_ssh_private_key(path.read_bytes(), password=None)
+    if not isinstance(key, Ed25519PrivateKey):
+        raise ValueError("GPU pairing key is not Ed25519")
+    return key
+
+
+def new_ssh_pairing_key() -> Ed25519PrivateKey:
+    key = Ed25519PrivateKey.generate()
+    _store_pairing_key(_scoped_path(public_bytes(key).hex()), key)
+    return key
+
+
+def _store_pairing_key(path: Path, key: Ed25519PrivateKey) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    data = key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.OpenSSH,
+                             serialization.NoEncryption())
+    with tempfile.NamedTemporaryFile(dir=path.parent) as temp:
+        temp.write(data)
+        temp.flush()
+        try:
+            os.link(temp.name, path)
+        except FileExistsError:
+            pass
 
 
 def _keychain_ok() -> bool:
@@ -102,8 +143,10 @@ def write_key_file(key: Ed25519PrivateKey) -> Path:
     return f
 
 
-def ssh_key_file(key: Ed25519PrivateKey) -> Path:
+def ssh_key_file(key: Ed25519PrivateKey, key_id: str = "") -> Path:
     """A key file ssh(1) can use (written on demand for SSH pipe mode)."""
+    if key_id:
+        return _scoped_path(key_id)
     f = _key_file()
     if not f.exists():
         write_key_file(key)

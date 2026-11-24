@@ -42,6 +42,8 @@ type serverEntry struct {
 	SSHPort     *int     `json:"ssh_port"`
 	SSHHostKeys []string `json:"ssh_host_keys"`
 	Extra       any      `json:"extra"`
+	GPUUUID     string   `json:"gpu_uuid"`
+	KeyID       string   `json:"key_id"`
 }
 
 func configDir() string {
@@ -61,8 +63,9 @@ func loadServer(name string) (*serverEntry, error) {
 		return nil, errors.New("no paired servers: run `reflop pair <invite-code>` first")
 	}
 	var cfg struct {
-		Default string                  `json:"default"`
-		Servers map[string]*serverEntry `json:"servers"`
+		Default     string                  `json:"default"`
+		Servers     map[string]*serverEntry `json:"servers"`
+		GPUPairings map[string]*serverEntry `json:"gpu_pairings"`
 	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return nil, fmt.Errorf("servers.json: %w", err)
@@ -73,15 +76,30 @@ func loadServer(name string) (*serverEntry, error) {
 	if name == "" {
 		name = cfg.Default
 	}
+	if name == "" && len(cfg.GPUPairings) != 0 {
+		return nil, errors.New("no default pairing; run reflop use <name>")
+	}
 	e := cfg.Servers[name]
+	if scoped := cfg.GPUPairings[name]; scoped != nil {
+		if e != nil || scoped.GPUUUID == "" || scoped.KeyID == "" {
+			return nil, errors.New("servers.json: invalid GPU pairing")
+		}
+		e = scoped
+	}
 	if e == nil {
 		return nil, fmt.Errorf("no paired server named %q", name)
 	}
 	return e, nil
 }
 
-func loadKey() (ed25519.PrivateKey, error) {
-	p := filepath.Join(configDir(), "id_ed25519")
+func (e *serverEntry) keyPath() string {
+	if e.KeyID == "" {
+		return filepath.Join(configDir(), "id_ed25519")
+	}
+	return filepath.Join(configDir(), "gpu-keys", e.KeyID)
+}
+
+func loadKey(p string) (ed25519.PrivateKey, error) {
 	st, err := os.Stat(p)
 	if err != nil {
 		return nil, fmt.Errorf("%s not found; on macOS the key is in the Keychain: run `reflop key --write-file` once", p)
@@ -139,7 +157,7 @@ func dial(e *serverEntry, fp []byte) (io.ReadWriteCloser, error) {
 			return nil, err
 		}
 		args = append(args, pinned...)
-		args = append(args, "-i", filepath.Join(configDir(), "id_ed25519"))
+		args = append(args, "-i", e.keyPath())
 		if e.SSHPort != nil {
 			args = append(args, "-p", fmt.Sprint(*e.SSHPort))
 		}
@@ -193,7 +211,12 @@ func connect(server, device string) (*conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	key, err := loadKey()
+	if e.KeyID != "" {
+		if keyID, err := hex.DecodeString(e.KeyID); err != nil || len(keyID) != sha256.Size {
+			return nil, errors.New("servers.json: invalid pairing key identifier")
+		}
+	}
+	key, err := loadKey(e.keyPath())
 	if err != nil {
 		return nil, err
 	}
@@ -230,11 +253,17 @@ func connect(server, device string) (*conn, error) {
 		}
 		return nil, err
 	}
-	c.caps = ar.GetAuthResult().GetCapabilities()
+	result := ar.GetAuthResult()
+	if result == nil || result.GpuUuid != e.GPUUUID ||
+		(e.GPUUUID != "" && (len(result.IdentityId) != 16 || hex.EncodeToString(result.IdentityId) != e.IdentityID)) {
+		rw.Close()
+		return nil, errors.New("the authenticated identity or GPU does not match the pairing")
+	}
+	c.caps = result.Capabilities
 	if l := c.caps.GetLimits(); l != nil && l.UploadChunkBytes > 0 {
 		c.chunk = int(l.UploadChunkBytes)
 	}
-	for _, want := range kinds(device) {
+	for _, want := range kinds(device, e.GPUUUID != "") {
 		for _, d := range c.caps.GetDevices() {
 			if d.Device.Kind == want && c.device == nil {
 				c.device = d.Device
@@ -243,6 +272,9 @@ func connect(server, device string) (*conn, error) {
 	}
 	if c.device == nil {
 		rw.Close()
+		if e.GPUUUID != "" && device != "cpu" {
+			return nil, fmt.Errorf("the paired GPU %q is unavailable", e.Name)
+		}
 		return nil, fmt.Errorf("the server has no %s device", device)
 	}
 	if _, err := c.call(&pb.Envelope{Body: &pb.Envelope_OpenSession{OpenSession: &pb.OpenSession{Device: c.device}}}); err != nil {
@@ -252,11 +284,11 @@ func connect(server, device string) (*conn, error) {
 	return c, nil
 }
 
-func kinds(device string) []pb.DeviceKind {
-	switch device {
-	case "cpu":
+func kinds(device string, gpuScoped bool) []pb.DeviceKind {
+	if device == "cpu" {
 		return []pb.DeviceKind{pb.DeviceKind_DEVICE_CPU}
-	case "cuda":
+	}
+	if device == "cuda" || gpuScoped {
 		return []pb.DeviceKind{pb.DeviceKind_DEVICE_CUDA}
 	}
 	return []pb.DeviceKind{pb.DeviceKind_DEVICE_CUDA, pb.DeviceKind_DEVICE_CPU}

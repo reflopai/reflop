@@ -1467,3 +1467,27 @@ without checking the input could still select a different session.
 **Consequences.** Invalid indexes leave existing sessions and their checkpoint
 settings alone. Valid device indexes and automatic CPU placement keep their
 existing behavior. The change works with existing daemons.
+
+## ADR-047: Bind pairing to a physical GPU
+
+**Context.** Multiple GPUs can share a listener. A host-wide pairing can use
+any served card, and the Guest CLI cannot save two pairings for one daemon.
+Physical indexes can change between restarts.
+
+**Decision.** The Owner selects a card by physical index or full UUID. The
+daemon records the UUID with the invite and the resulting identity. Only
+that card and the configured CPU are visible to the identity. The daemon
+checks the scope before starting or resuming a worker. Checkpoints, datasets,
+quotas, and revocation use the GPU identity. The Guest pins the daemon key,
+stores a separate Ed25519 key for each GPU pairing, and rejects duplicate
+hardware UUIDs. SSH keeps the forced command and uses a separate restricted
+key for each pairing.
+
+**Alternatives.** One listener per GPU would require separate addresses or
+ports. Client-side selection alone would leave every GPU accessible to the
+same Guest. Index-based grants could change scope when the GPU order changes.
+
+**Consequences.** Existing host-wide pairings retain access and data. New
+GPU invites require updated clients. Clients choose a default for future
+sessions with `reflop use`. Selecting explicit CPU placement still uses the
+pairing's own identity.

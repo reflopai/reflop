@@ -7,11 +7,16 @@ ever sent to a server (invariant I12).
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
+import re
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+GPU_UUID = re.compile(r"gpu-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}")
 
 
 def config_dir() -> Path:
@@ -19,6 +24,17 @@ def config_dir() -> Path:
         return Path(h)
     base = os.environ.get("XDG_CONFIG_HOME")
     return Path(base) / "reflop" if base else Path.home() / ".config" / "reflop"
+
+
+@contextlib.contextmanager
+def config_lock():
+    """Serialize pairing and default changes across CLI processes."""
+    directory = config_dir()
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    fd = os.open(directory / "servers.lock", os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(fd, "rb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
 
 
 @dataclass
@@ -32,6 +48,9 @@ class ServerEntry:
     ssh_port: int | None = None
     extra: dict = field(default_factory=dict)
     ssh_host_keys: list[str] = field(default_factory=list)  # SSH mode: pinned sshd host keys
+    gpu_uuid: str = ""
+    gpu_name: str = ""
+    key_id: str = ""
 
 
 @dataclass
@@ -45,14 +64,29 @@ class ClientConfig:
         if not p.exists():
             return cls()
         d = json.loads(p.read_text())
-        return cls(default=d.get("default", ""),
-                   servers={k: ServerEntry(**v) for k, v in d.get("servers", {}).items()})
+        servers = d.get("servers", {})
+        scoped = d.get("gpu_pairings", {})
+        if servers.keys() & scoped.keys():
+            raise ValueError("duplicate pairing aliases in servers.json")
+        for v in scoped.values():
+            if (not GPU_UUID.fullmatch(v.get("gpu_uuid", ""))
+                    or not re.fullmatch(r"[0-9a-f]{64}", v.get("key_id", ""))):
+                raise ValueError("invalid GPU pairing in servers.json")
+        return cls(default=d.get("default", ""), servers={k: ServerEntry(**v) for k, v in (servers | scoped).items()})
 
     def save(self) -> None:
         d = config_dir()
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
-        data = json.dumps({"default": self.default, "servers": {k: asdict(v) for k, v in self.servers.items()}},
-                          indent=2) + "\n"
+        legacy, scoped = {}, {}
+        for name, entry in self.servers.items():
+            fields = asdict(entry)
+            if entry.gpu_uuid:
+                scoped[name] = fields
+            else:
+                for field_name in ("gpu_uuid", "gpu_name", "key_id"):
+                    del fields[field_name]
+                legacy[name] = fields
+        data = json.dumps({"default": self.default, "servers": legacy, "gpu_pairings": scoped}, indent=2) + "\n"
         fd, tmp = tempfile.mkstemp(dir=d, prefix=".servers-")
         with os.fdopen(fd, "w") as f:
             f.write(data)
@@ -62,6 +96,8 @@ class ClientConfig:
     def get(self, name: str | None) -> ServerEntry:
         name = name or os.environ.get("REFLOP_SERVER") or self.default
         if not name:
+            if self.servers:
+                raise RuntimeError("no default pairing; run `reflop status` and `reflop use <name>`")
             raise RuntimeError("no reflop server is paired; run `reflop pair <invite-code>` first")
         if name not in self.servers:
             raise RuntimeError(f"no paired server named {name!r} (see `reflop servers`)")

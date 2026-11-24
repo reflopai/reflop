@@ -28,7 +28,7 @@ from . import _debug, _sshhost, keys
 from ._pb import auth_pb2 as apb
 from ._pb import compute_pb2 as cpb
 from ._pb import graph_pb2 as gpb
-from .config import ClientConfig, ServerEntry
+from .config import GPU_UUID, ClientConfig, ServerEntry, config_lock
 from .connection import Connection
 from .errors import NotPairedError, ReflopError, ReflopRemoteError, ServerKeyMismatch, SessionLostError, sanitize
 
@@ -172,14 +172,14 @@ def dial_tls(addresses: list[str], fingerprint: bytes, timeout: float = 15.0) ->
 
 
 def ssh_command(target: str, keyfile, fingerprint_hex: str, host_keys: list[str],
-                port: int | None = None) -> list[str]:
+                port: int | None = None, *, key_id: str = "") -> list[str]:
     """The ssh argv for SSH pipe mode. With host keys recorded at pairing,
     ssh trusts only those (SEC_SWEEP L6); without, it checks the user's
     known_hosts and never accepts an unknown key."""
     ssh = os.environ.get("REFLOP_SSH_COMMAND") or shutil.which("ssh")
     if ssh is None:
         raise ReflopError("ssh is not installed")
-    cmd = [ssh, "-T", *_sshhost.BASE_OPTIONS, *_sshhost.known_hosts_options(fingerprint_hex, host_keys),
+    cmd = [ssh, "-T", *_sshhost.BASE_OPTIONS, *_sshhost.known_hosts_options(fingerprint_hex, host_keys, key_id),
            "-i", str(keyfile)]
     if port:
         cmd += ["-p", str(port)]
@@ -237,8 +237,9 @@ class SshStderr:
             return "; ".join(self._lines)
 
 
-def dial_ssh(target: str, key, fingerprint_hex: str, host_keys: list[str], port: int | None = None) -> Framer:
-    cmd = ssh_command(target, keys.ssh_key_file(key), fingerprint_hex, host_keys, port)
+def dial_ssh(target: str, key, fingerprint_hex: str, host_keys: list[str], port: int | None = None,
+             *, key_id: str = "") -> Framer:
+    cmd = ssh_command(target, keys.ssh_key_file(key, key_id), fingerprint_hex, host_keys, port, key_id=key_id)
     _debug.log(f"ssh: starting {shlex.join(cmd)}")
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
 
@@ -322,7 +323,7 @@ def _expired_message(expires_unix: int, now: float) -> str:
 
 
 def pair(code: str, name: str | None = None) -> ServerEntry:
-    """Redeem an invite and store the server (pinned key) in the config."""
+    """Redeem an invite and save its endpoint, credential and GPU scope."""
     inv = decode_invite(code)
     now = time.time()
     if inv.expires_unix and inv.expires_unix < now:
@@ -330,57 +331,104 @@ def pair(code: str, name: str | None = None) -> ServerEntry:
     fp = inv.server_key_fingerprint
     if len(fp) != 32:
         raise ReflopError("invite has no server key fingerprint")
-    _check_not_paired(ClientConfig.load(), fp.hex())
-    key = keys.load_or_create()
+    if not inv.addresses or inv.transport not in (apb.TRANSPORT_TLS, apb.TRANSPORT_SSH):
+        raise ReflopError("invite has no address or uses an unsupported transport")
+    if inv.gpu_uuid and not GPU_UUID.fullmatch(inv.gpu_uuid):
+        raise ReflopError("invite has an invalid GPU UUID")
+    with config_lock():
+        cfg = ClientConfig.load()
+        _check_not_paired(cfg, fp.hex(), inv.gpu_uuid)
+        if name is not None and (not name.strip() or name.startswith("-") or sanitize(name, 80) != name):
+            raise ReflopError("invalid pairing name")
+        name = name or _default_name(inv, cfg)
+        if name in cfg.servers:
+            raise ReflopError(f"the pairing name {name!r} is already in use; pick another --name")
+        entry = _redeem(inv, name)
+        if not cfg.servers:
+            cfg.default = entry.name
+        cfg.servers[entry.name] = entry
+        cfg.save()
+        return entry
+
+
+def _redeem(inv: apb.InviteCode, name: str) -> ServerEntry:
+    fp = inv.server_key_fingerprint
+    ssh = inv.transport == apb.TRANSPORT_SSH
+    if not inv.gpu_uuid:
+        key_id = ""
+    elif ssh:
+        if len(inv.ssh_guest_public_key) != 32:
+            raise ReflopError("SSH invite is missing the GPU pairing public key")
+        key_id = inv.ssh_guest_public_key.hex()
+    else:
+        key_id = hashlib.sha256(fp + inv.gpu_uuid.encode("ascii")).hexdigest()
+    try:
+        key = keys.pairing_key(key_id, create=bool(inv.gpu_uuid) and not ssh)
+    except FileNotFoundError:
+        if not (ssh and key_id):
+            raise
+        raise ReflopError("this SSH invite is for a different key; run `reflop key --ssh --new` and send it to the Owner") from None
+    if ssh and key_id and not hmac.compare_digest(keys.public_bytes(key), inv.ssh_guest_public_key):
+        raise ReflopError("the local SSH pairing key does not match the invite")
     host_keys: list[str] = []
-    if inv.transport == apb.TRANSPORT_SSH:
+    if ssh:
         try:
             host_keys = _sshhost.normalize(inv.ssh_host_keys)
         except ValueError as e:
             raise ReflopError(f"invite: SSH host key: {e}") from None
-        fr = dial_ssh(inv.addresses[0], key, fp.hex(), host_keys)
+        fr = dial_ssh(inv.addresses[0], key, fp.hex(), host_keys, key_id=key_id)
     else:
         fr = dial_tls(list(inv.addresses), fp)
     try:
         try:
             hr = _hello(fr)
         except (EOFError, OSError):
-            if inv.transport != apb.TRANSPORT_SSH:
+            if not ssh:
                 raise
-            raise ssh_closed(inv.addresses[0], fr, " Check that the invite is for this machine's key "
-                             "(`reflop key --ssh`) and that `ssh` to that address works.") from None
+            raise ssh_closed(inv.addresses[0], fr, " Check that the invite is for your SSH pairing key "
+                             "and that `ssh` to that address works.") from None
         _debug.log("handshake: server key matches the invite")
         if not hmac.compare_digest(hr.server_key_fingerprint, fp):
             raise ServerKeyMismatch("the server's key does not match the invite")
-        if inv.transport == apb.TRANSPORT_TLS:
+        if not ssh:
             pub = keys.public_bytes(key)
             msg = PAIR_CONTEXT + hr.server_nonce + fp + inv.invite_id + pub
             mac = hmac.new(inv.secret, msg, hashlib.sha256).digest()
             fr.write(cpb.Envelope(request_id=2, pair=apb.Pair(invite_id=inv.invite_id, public_key=pub, mac=mac,
-                                                              signature=key.sign(msg))))
+                                                              signature=key.sign(msg), gpu_uuid=inv.gpu_uuid)))
             env = fr.read()
             if env.WhichOneof("body") == "error":
                 raise ReflopRemoteError.from_pb(env.error)
+            if env.WhichOneof("body") != "pair_result":
+                raise ReflopError("unexpected reply to Pair")
         ar = _authenticate(fr, key, hr.server_nonce, fp)
+        _verify_pairing(ar, inv.gpu_uuid)
+        if not ssh and env.pair_result.identity_id != ar.identity_id:
+            raise ReflopError("the authenticated identity does not match the pairing result")
     finally:
         fr.close()
-    cfg = ClientConfig.load()
-    entry = ServerEntry(
-        name=name or _default_name(inv, cfg), transport="ssh" if inv.transport == apb.TRANSPORT_SSH else "tls",
-        addresses=list(inv.addresses), fingerprint=fp.hex(), identity=sanitize(ar.identity_name, 64),
-        identity_id=ar.identity_id.hex(), ssh_host_keys=host_keys)
-    cfg.servers[entry.name] = entry
-    if not cfg.default:
-        cfg.default = entry.name
-    cfg.save()
-    return entry
+    return ServerEntry(
+        name=name, transport="ssh" if ssh else "tls", addresses=list(inv.addresses), fingerprint=fp.hex(),
+        identity=sanitize(ar.identity_name, 80), identity_id=ar.identity_id.hex(), ssh_host_keys=host_keys,
+        gpu_uuid=ar.gpu_uuid, gpu_name=sanitize(inv.gpu_name, 80), key_id=key_id)
 
 
-def _check_not_paired(cfg: ClientConfig, fingerprint_hex: str) -> None:
-    """One machine has one key, and a server registers a key once: pairing
-    again with a server this machine is paired with needs an unpair on both
-    sides first (issue #6). Checked before the invite is used up."""
+def _verify_pairing(ar: apb.AuthResult, gpu_uuid: str, identity_id: str = "") -> None:
+    if ar.gpu_uuid != gpu_uuid:
+        raise ReflopError("the authenticated GPU does not match the pairing")
+    if gpu_uuid and (len(ar.identity_id) != 16 or (identity_id and ar.identity_id.hex() != identity_id)):
+        raise ReflopError("the authenticated Guest identity does not match the pairing")
+
+
+def _check_not_paired(cfg: ClientConfig, fingerprint_hex: str, gpu_uuid: str = "") -> None:
+    """Check GPU pairings by hardware UUID and legacy pairings by daemon key."""
     for n, s in cfg.servers.items():
+        if gpu_uuid:
+            if s.gpu_uuid == gpu_uuid:
+                raise ReflopError(f"this GPU is already paired as {n!r}; run `reflop use {n}` to select it")
+            continue
+        if s.gpu_uuid:
+            continue
         if hmac.compare_digest(s.fingerprint, fingerprint_hex):
             raise ReflopError(
                 f"this machine is already paired with that server, as {s.identity!r} (local name {n!r}). "
@@ -394,6 +442,9 @@ def _default_name(inv, cfg) -> str:
         host = inv.addresses[0].split("@")[-1].rsplit(":", 1)[0].strip("[]")
         if host and host not in ("127.0.0.1", "localhost", "::1"):
             base = "".join(ch for ch in host if ch.isalnum() or ch in "-_.")[:32] or "gpu"
+    if inv.gpu_uuid:
+        model = "-".join("".join(ch.lower() if ch.isalnum() else " " for ch in inv.gpu_name).split())
+        base = f"{base}-{model[:32] or inv.gpu_uuid[-8:]}"
     name, i = base, 2
     while name in cfg.servers:
         name, i = f"{base}{i}", i + 1
@@ -407,7 +458,7 @@ class RemoteConnection(Connection):
     def __init__(self, entry: ServerEntry, kind: str = "auto", *, key=None) -> None:
         super().__init__()
         self.entry = entry
-        self.key = keys.load_or_create() if key is None else key
+        self.key = keys.pairing_key(entry.key_id) if key is None else key
         self.fp = bytes.fromhex(entry.fingerprint)
         self.session_id = b""
         self._open()
@@ -438,7 +489,7 @@ class RemoteConnection(Connection):
         _debug.log(f"connecting to {self.entry.name} ({self.entry.transport}, {', '.join(self.entry.addresses)})")
         if self.entry.transport == "ssh":
             self.fr = dial_ssh(self.entry.addresses[0], self.key, self.entry.fingerprint, self.entry.ssh_host_keys,
-                               self.entry.ssh_port)
+                               self.entry.ssh_port, key_id=self.entry.key_id)
         else:
             self.fr = dial_tls(self.entry.addresses, self.fp)
         try:
@@ -454,6 +505,11 @@ class RemoteConnection(Connection):
                 if e.code != cpb.ERROR_UNAUTHENTICATED:
                     raise
                 raise NotPairedError(e.code, not_paired_message(self.entry)) from None
+            try:
+                _verify_pairing(self.auth, self.entry.gpu_uuid, self.entry.identity_id)
+            except ReflopError:
+                self.fr.close()
+                raise
         except (EOFError, OSError):
             self.fr.close()
             if self.entry.transport != "ssh":
@@ -482,6 +538,8 @@ class RemoteConnection(Connection):
             for d in devs:
                 if d.kind == gpb.DEVICE_CUDA:
                     return d
+            if self.entry.gpu_uuid:
+                raise ReflopError(f"the paired GPU {self.entry.name!r} is unavailable")
             if kind == "cuda":
                 raise ReflopError("the server has no GPU")
         for d in devs:
@@ -512,6 +570,15 @@ class RemoteConnection(Connection):
         """Open a fresh server session after the old one was lost (reflop.recover)."""
         if self.closed:
             self._open()
+            if self.entry.gpu_uuid:
+                kind = "cuda" if self.gdevice.kind == gpb.DEVICE_CUDA else "cpu"
+                try:
+                    self.caps.CopyFrom(self.auth.capabilities)
+                    self.gdevice = self._choose_device(kind)
+                except ReflopError:
+                    self.closed = True
+                    self.fr.close()
+                    raise
         self.open_session()
 
     def _read_loop(self, fr: Framer) -> None:
@@ -588,19 +655,24 @@ def unpair(name: str | None = None, local_only: bool = False) -> tuple[ServerEnt
     revokes this machine's key there. The local entry is removed whatever
     the server says: a server that cannot be reached must not keep a Guest
     from forgetting it. Returns (entry, outcome, detail)."""
-    cfg = ClientConfig.load()
-    entry = cfg.get(name)
-    outcome, detail = (UNPAIR_SKIPPED, "") if local_only else _tell_unpair(entry)
-    forget(cfg, entry.name)
-    return entry, outcome, detail
+    with config_lock():
+        cfg = ClientConfig.load()
+        entry = cfg.get(name)
+        outcome, detail = (UNPAIR_SKIPPED, "") if local_only else _tell_unpair(entry)
+        forget(cfg, entry.name)
+        return entry, outcome, detail
 
 
 def _tell_unpair(entry: ServerEntry) -> tuple[str, str]:
-    key = keys.load_or_create()
-    fp = bytes.fromhex(entry.fingerprint)
+    try:
+        key = keys.pairing_key(entry.key_id)
+        fp = bytes.fromhex(entry.fingerprint)
+    except (OSError, ValueError) as e:
+        return UNPAIR_FAILED, sanitize(str(e), 300)
     try:
         if entry.transport == "ssh":
-            fr = dial_ssh(entry.addresses[0], key, entry.fingerprint, entry.ssh_host_keys, entry.ssh_port)
+            fr = dial_ssh(entry.addresses[0], key, entry.fingerprint, entry.ssh_host_keys, entry.ssh_port,
+                          key_id=entry.key_id)
         else:
             fr = dial_tls(entry.addresses, fp)
     except ServerKeyMismatch:
@@ -612,11 +684,12 @@ def _tell_unpair(entry: ServerEntry) -> tuple[str, str]:
         if not hmac.compare_digest(hr.server_key_fingerprint, fp):
             return UNPAIR_MISMATCH, ""
         try:
-            _authenticate(fr, key, hr.server_nonce, fp)
+            ar = _authenticate(fr, key, hr.server_nonce, fp)
         except ReflopRemoteError as e:
             if e.code == cpb.ERROR_UNAUTHENTICATED:
                 return UNPAIR_ALREADY, ""
             raise
+        _verify_pairing(ar, entry.gpu_uuid, entry.identity_id)
         fr.write(cpb.Envelope(request_id=4, unpair=cpb.Unpair()))
         env = fr.read()
         body = env.WhichOneof("body")
@@ -642,10 +715,10 @@ def forget(cfg: ClientConfig, name: str) -> None:
     """Remove a server from the config, with its pinned SSH host keys."""
     entry = cfg.servers.pop(name)
     if cfg.default == name:
-        cfg.default = next(iter(cfg.servers), "")
+        cfg.default = "" if entry.gpu_uuid else next((n for n, e in cfg.servers.items() if not e.gpu_uuid), "")
     cfg.save()
-    if not any(s.fingerprint == entry.fingerprint for s in cfg.servers.values()):
-        _sshhost.forget(entry.fingerprint)
+    if not any(s.fingerprint == entry.fingerprint and s.key_id == entry.key_id for s in cfg.servers.values()):
+        _sshhost.forget(entry.fingerprint, entry.key_id)
 
 
 def connect(server: str | None = None, kind: str = "auto") -> RemoteConnection:
@@ -659,7 +732,7 @@ def admin(server: str | None = None):
     conn = RemoteConnection.__new__(RemoteConnection)
     Connection.__init__(conn)
     conn.entry = entry
-    conn.key = keys.load_or_create()
+    conn.key = keys.pairing_key(entry.key_id)
     conn.fp = bytes.fromhex(entry.fingerprint)
     conn._open()
     conn.caps = conn.auth.capabilities

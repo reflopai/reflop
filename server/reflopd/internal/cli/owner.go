@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,7 +32,10 @@ import (
 	"github.com/reflopai/reflop/server/reflopd/internal/sshpipe"
 )
 
-func makeInvite(l paths.Layout, name string, ttl time.Duration, listen []string) (string, error) {
+func makeInvite(l paths.Layout, name string, ttl time.Duration, listen []string, target server.GPUView) (string, error) {
+	if err := l.Ensure(); err != nil {
+		return "", err
+	}
 	ids, err := auth.Open(l.Identities())
 	if err != nil {
 		return "", err
@@ -40,7 +44,7 @@ func makeInvite(l paths.Layout, name string, ttl time.Duration, listen []string)
 	if err != nil {
 		return "", err
 	}
-	inv, err := ids.CreateInvite(name, ttl)
+	inv, err := ids.CreateGPUInvite(name, ttl, target.UUID)
 	if err != nil {
 		return "", err
 	}
@@ -59,7 +63,7 @@ func makeInvite(l paths.Layout, name string, ttl time.Duration, listen []string)
 	idb, _ := hex.DecodeString(inv.ID)
 	code, err := auth.EncodeInvite(&pb.InviteCode{Version: 1, Transport: pb.TransportKind_TRANSPORT_TLS, Addresses: addrs,
 		ServerKeyFingerprint: key.Fingerprint[:], InviteId: idb, Secret: inv.Secret, ExpiresUnix: inv.Expires.Unix(),
-		IdentityName: name})
+		IdentityName: name, GpuUuid: target.UUID, GpuName: target.Name})
 	if err != nil {
 		return "", err
 	}
@@ -96,7 +100,7 @@ func advertised(flags, cfg []string) []string {
 }
 
 func inviteCmd() *cobra.Command {
-	var name, via, key, sshTarget, hostKeys string
+	var name, via, key, sshTarget, hostKeys, selector string
 	var addresses []string
 	var expires time.Duration
 	var yes bool
@@ -107,12 +111,14 @@ func inviteCmd() *cobra.Command {
 fingerprint (the Guest pins it), and a one-time secret.
 
   reflopd invite --name alice                 daemon mode (TLS)
+  reflopd invite --name alice --gpu 2         grant access to physical GPU 2
   reflopd invite --name alice --expires 2h
   reflopd invite --name alice --via ssh --key "ssh-ed25519 AAAA… alice@mac" --ssh-target me@gpu-box
 
 SSH pipe mode adds the Guest's key to authorized_keys with
 restrict,command="reflopd serve --stdio …": SSH becomes a pipe that can only
-run that command. Get the key on the Guest machine with: reflop key --ssh
+run that command. For GPU invites, get a new key with: reflop key --ssh --new
+For CPU-only invites, use: reflop key --ssh
 
 SSH invites also carry this machine's sshd host keys (/etc/ssh/ssh_host_*.pub)
 and the Guest's ssh trusts only those. If the Guest reaches sshd somewhere else
@@ -127,9 +133,17 @@ and the Guest's ssh trusts only those. If the Guest reaches sshd somewhere else
 			if name == "" {
 				return exitWith(ExitUsage, errors.New("--name is required"))
 			}
+			gpus, err := ownerGPUs()
+			if err != nil {
+				return err
+			}
+			target, err := inviteGPU(gpus, selector)
+			if err != nil {
+				return err
+			}
 			switch via {
 			case "", "tls":
-				code, err := makeInvite(l, name, expires, addresses)
+				code, err := makeInvite(l, name, expires, addresses, target)
 				if err != nil {
 					return err
 				}
@@ -137,13 +151,14 @@ and the Guest's ssh trusts only those. If the Guest reaches sshd somewhere else
 					time.Now().Add(expires).Format(time.RFC1123), code)
 				return nil
 			case "ssh":
-				return inviteSSH(cmd, l, name, key, sshTarget, hostKeys, yes)
+				return inviteSSH(cmd, l, name, key, sshTarget, hostKeys, yes, target)
 			default:
 				return exitWith(ExitUsage, fmt.Errorf("--via must be tls or ssh"))
 			}
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "identity name for the Guest (a-z 0-9 _ -)")
+	cmd.Flags().StringVar(&selector, "gpu", "", "physical GPU index or UUID (required if sharing multiple GPUs)")
 	cmd.Flags().DurationVar(&expires, "expires", 24*time.Hour, "invite lifetime")
 	cmd.Flags().StringSliceVar(&addresses, "address", nil, "address(es) Guests should dial (default: where reflopd listens)")
 	cmd.Flags().StringVar(&via, "via", "tls", "transport: tls (daemon) or ssh (forced-command pipe)")
@@ -154,7 +169,7 @@ and the Guest's ssh trusts only those. If the Guest reaches sshd somewhere else
 	return cmd
 }
 
-func inviteSSH(cmd *cobra.Command, l paths.Layout, name, key, target, hostKeyGlob string, yes bool) error {
+func inviteSSH(cmd *cobra.Command, l paths.Layout, name, key, target, hostKeyGlob string, yes bool, device server.GPUView) error {
 	out := cmd.OutOrStdout()
 	hostKeys, err := sshhost.LocalHostKeys(hostKeyGlob)
 	if err != nil {
@@ -171,11 +186,14 @@ func inviteSSH(cmd *cobra.Command, l paths.Layout, name, key, target, hostKeyGlo
 	if err != nil {
 		return exitWith(ExitUsage, err)
 	}
+	if err := l.Ensure(); err != nil {
+		return err
+	}
 	ids, err := auth.Open(l.Identities())
 	if err != nil {
 		return err
 	}
-	id, err := ids.AddKey(name, pub, "ssh", comment)
+	id, err := ids.AddGPUKey(name, pub, "ssh", comment, device.UUID)
 	if err != nil {
 		return err
 	}
@@ -216,9 +234,14 @@ func inviteSSH(cmd *cobra.Command, l paths.Layout, name, key, target, hostKeyGlo
 		h, _ := os.Hostname()
 		target = os.Getenv("USER") + "@" + h
 	}
+	var guestPub []byte
+	if device.UUID != "" {
+		guestPub = pub
+	}
 	code, err := auth.EncodeInvite(&pb.InviteCode{Version: 1, Transport: pb.TransportKind_TRANSPORT_SSH,
 		Addresses: []string{target}, ServerKeyFingerprint: key2.Fingerprint[:], IdentityName: name, ReflopdPath: exe,
-		SshHostKeys: hostKeys, ExpiresUnix: time.Now().Add(365 * 24 * time.Hour).Unix()})
+		SshHostKeys: hostKeys, ExpiresUnix: time.Now().Add(365 * 24 * time.Hour).Unix(),
+		GpuUuid: device.UUID, GpuName: device.Name, SshGuestPublicKey: guestPub})
 	if err != nil {
 		return err
 	}
@@ -242,7 +265,7 @@ func usersCmd() *cobra.Command {
 				return err
 			}
 			tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tKEYS\tVIA\tCREATED\tSTATE")
+			fmt.Fprintln(tw, "NAME\tGPU\tKEYS\tVIA\tCREATED\tSTATE")
 			for _, id := range ids.List() {
 				via := map[string]bool{}
 				for _, k := range id.Keys {
@@ -253,7 +276,8 @@ func usersCmd() *cobra.Command {
 					vs = append(vs, v)
 				}
 				sort.Strings(vs)
-				fmt.Fprintf(tw, "%s\t%d\t%s\t%s\t%s\n", id.Name, len(id.Keys), strings.Join(vs, ","), id.Created.Format("2006-01-02"), identityState(id))
+				name, uuid, _ := strings.Cut(id.Name, "@")
+				fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%s\n", name, uuid, len(id.Keys), strings.Join(vs, ","), id.Created.Format("2006-01-02"), identityState(id))
 			}
 			if err := tw.Flush(); err != nil {
 				return err
@@ -269,7 +293,8 @@ func usersCmd() *cobra.Command {
 var identityIDRe = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 func usersDeleteCmd() *cobra.Command {
-	return &cobra.Command{
+	var selector string
+	cmd := &cobra.Command{
 		Use:     "delete <name>",
 		Aliases: []string{"rm"},
 		Short:   "Delete a revoked identity, its stored datasets and snapshots, and its quotas",
@@ -283,7 +308,10 @@ Only revoked identities can be deleted; revoke an active one first:
   reflopd users delete alice`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name := args[0]
+			name, err := scopedIdentityName(args[0], selector)
+			if err != nil {
+				return err
+			}
 			l, err := layout()
 			if err != nil {
 				return err
@@ -303,6 +331,8 @@ Only revoked identities can be deleted; revoke an active one first:
 			return deleteIdentity(cmd.OutOrStdout(), l, ids, id)
 		},
 	}
+	cmd.Flags().StringVar(&selector, "gpu", "", "physical GPU index or UUID")
+	return cmd
 }
 
 // deleteIdentity removes a revoked identity, its data, quotas and SSH lines.
@@ -349,11 +379,16 @@ func deleteIdentity(out io.Writer, l paths.Layout, ids *auth.Store, id auth.Iden
 }
 
 func revokeCmd() *cobra.Command {
-	return &cobra.Command{
+	var selector string
+	cmd := &cobra.Command{
 		Use:   "revoke <name>",
 		Short: "Revoke an identity: its keys stop working and its sessions end now",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			name, err := scopedIdentityName(args[0], selector)
+			if err != nil {
+				return err
+			}
 			l, err := layout()
 			if err != nil {
 				return err
@@ -363,18 +398,20 @@ func revokeCmd() *cobra.Command {
 				return err
 			}
 			out := cmd.OutOrStdout()
-			id, err := revokeIdentity(out, ids, args[0])
+			id, err := revokeIdentity(out, ids, name)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(out, "revoked %q\n", args[0])
+			fmt.Fprintf(out, "revoked %q\n", name)
 			if id.GuestUnpaired == nil {
-				fmt.Fprintln(out, "On the Guest machine, `reflop unpair` forgets this server.")
+				fmt.Fprintln(out, "On the Guest machine, run `reflop status` and `reflop unpair <name>` to forget this pairing.")
 			}
-			fmt.Fprintf(out, "To delete it and its data and free the name: reflopd users delete %s\n", args[0])
+			fmt.Fprintf(out, "To delete it and its data and free the name: reflopd users delete %s\n", name)
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&selector, "gpu", "", "physical GPU index or UUID")
+	return cmd
 }
 
 // revokeIdentity revokes name, removes its SSH lines and ends its sessions.
@@ -424,6 +461,7 @@ func printGuestUnpaired(out io.Writer, list []auth.Identity) {
 
 func unpairCmd() *cobra.Command {
 	var yes bool
+	var selector string
 	cmd := &cobra.Command{
 		Use:   "unpair <name>",
 		Short: "Forget a Guest: revoke it, then delete it, its datasets, snapshots and quotas",
@@ -431,12 +469,15 @@ func unpairCmd() *cobra.Command {
 Its keys stop working, its sessions end, its datasets and snapshots are
 deleted, and its name can be invited again. The audit log keeps its history.
 
-The Guest forgets this server with ` + "`reflop unpair`" + `. Either side may go
+The Guest forgets this pairing with ` + "`reflop unpair <name>`" + `. Either side may go
 first; after both, a new invite pairs them as if for the first time.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out := cmd.OutOrStdout()
-			name := args[0]
+			name, err := scopedIdentityName(args[0], selector)
+			if err != nil {
+				return err
+			}
 			l, err := layout()
 			if err != nil {
 				return err
@@ -475,12 +516,13 @@ first; after both, a new invite pairs them as if for the first time.`,
 			if id.GuestUnpaired != nil {
 				fmt.Fprintf(out, "unpaired %q; the Guest had already run `reflop unpair`, so a new invite pairs them again\n", name)
 			} else {
-				fmt.Fprintf(out, "unpaired %q. On the Guest machine, `reflop unpair` forgets this server; then a new invite pairs them again\n", name)
+				fmt.Fprintf(out, "unpaired %q. On the Guest machine, run `reflop status` and `reflop unpair <name>`; then pair with a new invite\n", name)
 			}
 			return nil
 		},
 	}
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "do not ask for confirmation")
+	cmd.Flags().StringVar(&selector, "gpu", "", "physical GPU index or UUID")
 	return cmd
 }
 
@@ -530,6 +572,7 @@ func isUnlimited(v string) bool {
 func quotaCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "quota", Short: "Optional per-identity quotas (none are set by default)"}
 	var devMem, storage, bw, sessions, wallMS, flops string
+	var setGPU, clearGPU string
 	set := &cobra.Command{
 		Use:   "set <name>",
 		Short: "Set quotas for an identity",
@@ -543,6 +586,10 @@ usage among themselves. Only the values you pass change.
 0 is not accepted: use "unlimited" to remove a quota.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			name, err := scopedIdentityName(args[0], setGPU)
+			if err != nil {
+				return err
+			}
 			l, err := layout()
 			if err != nil {
 				return err
@@ -554,7 +601,7 @@ usage among themselves. Only the values you pass change.
 			if s.Quotas == nil {
 				s.Quotas = map[string]config.Quota{}
 			}
-			cur := s.Quotas[args[0]]
+			cur := s.Quotas[name]
 			f := cmd.Flags()
 			for _, b := range []struct {
 				flag string
@@ -593,15 +640,15 @@ usage among themselves. Only the values you pass change.
 				cur.ExecuteFLOPs = n
 			}
 			if cur.IsZero() {
-				delete(s.Quotas, args[0])
+				delete(s.Quotas, name)
 			} else {
-				s.Quotas[args[0]] = cur
+				s.Quotas[name] = cur
 			}
 			if err := config.SaveSettings(settingsPath(l), s); err != nil {
 				return err
 			}
 			notifyReload()
-			fmt.Fprintf(cmd.OutOrStdout(), "quota for %q: %s\n", args[0], describeQuota(cur))
+			fmt.Fprintf(cmd.OutOrStdout(), "quota for %q: %s\n", name, describeQuota(cur))
 			return nil
 		},
 	}
@@ -611,11 +658,16 @@ usage among themselves. Only the values you pass change.
 	set.Flags().StringVar(&flops, "execute-flops", "", "estimated FLOPs per execute (or unlimited)")
 	set.Flags().StringVar(&storage, "storage", "", "dataset storage (or unlimited)")
 	set.Flags().StringVar(&bw, "upload-bandwidth", "", "dataset upload bandwidth per second (or unlimited)")
+	set.Flags().StringVar(&setGPU, "gpu", "", "physical GPU index or UUID")
 	clear := &cobra.Command{
 		Use:   "clear <name>",
 		Short: "Remove all quotas for an identity",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			name, err := scopedIdentityName(args[0], clearGPU)
+			if err != nil {
+				return err
+			}
 			l, err := layout()
 			if err != nil {
 				return err
@@ -624,15 +676,16 @@ usage among themselves. Only the values you pass change.
 			if err != nil {
 				return err
 			}
-			delete(s.Quotas, args[0])
+			delete(s.Quotas, name)
 			if err := config.SaveSettings(settingsPath(l), s); err != nil {
 				return err
 			}
 			notifyReload()
-			fmt.Fprintf(cmd.OutOrStdout(), "cleared quotas for %q\n", args[0])
+			fmt.Fprintf(cmd.OutOrStdout(), "cleared quotas for %q\n", name)
 			return nil
 		},
 	}
+	clear.Flags().StringVar(&clearGPU, "gpu", "", "physical GPU index or UUID")
 	show := &cobra.Command{
 		Use:   "show",
 		Short: "Show quotas",
@@ -896,6 +949,9 @@ func statusCmd() *cobra.Command {
 			if err := control("status", nil, &st); err != nil {
 				return err
 			}
+			if asJSON {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(st)
+			}
 			if err := printStatus(cmd.OutOrStdout(), st, false); err != nil {
 				return err
 			}
@@ -1037,7 +1093,8 @@ func selftestCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			skipped, err := runSelftest(context.Background(), cmd.OutOrStdout(), l, security, weak)
+			skipped, err := runSelftest(context.Background(), cmd.OutOrStdout(),
+				server.Options{Layout: l, AcceptWeakIsolation: weak}, security)
 			if err == nil && len(skipped) > 0 {
 				err = fmt.Errorf("not every device was tested (%d skipped); run the self-test again once GPU memory is free", len(skipped))
 			}
@@ -1051,8 +1108,9 @@ func selftestCmd() *cobra.Command {
 
 // runSelftest returns the devices it skipped because their GPU memory was
 // full (see Server.SelfTest).
-func runSelftest(ctx context.Context, out io.Writer, l paths.Layout, security, weak bool) ([]string, error) {
-	srv, err := server.New(server.Options{Layout: l, AcceptWeakIsolation: weak, SkipProbe: true})
+func runSelftest(ctx context.Context, out io.Writer, opts server.Options, security bool) ([]string, error) {
+	opts.SkipProbe = true
+	srv, err := server.New(opts)
 	if err != nil {
 		return nil, err
 	}
