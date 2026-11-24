@@ -5,6 +5,8 @@
 - Reopening an in-process CUDA session no longer corrupts snapshots or
   checkpoints. Closing or replacing the local worker now waits for the
   writer and unregisters its staging buffers before releasing them.
+- `reflop.device(index)` accepts integer indexes from 0 through 127 and
+  rejects invalid indexes before looking up or opening a session.
 
 ## 0.2.8 (2026-11-23)
 

@@ -4,12 +4,14 @@
 from __future__ import annotations
 
 import contextlib
+import operator
 import os
+from numbers import Integral
 
 import torch
 
 from . import session as _session
-from .device import register, torch_device
+from .device import torch_device
 
 
 def _open_session(conn, index: int | None, *, allow_local_fallback: bool = True, make_default: bool = True):
@@ -29,6 +31,7 @@ def device(index: int = 0, *, server: str | None = None, kind: str = "auto", loc
            allow_local_fallback: bool = True, checkpoint: bool = False, checkpoint_interval=None) -> torch.device:
     """Connect (once) and return the remote device.
 
+    index:  session index, an integer from 0 through 127.
     server: a name from `reflop pair` (default: the default server).
     kind:   "auto" (GPU if the server has one), "cuda" or "cpu" (server CPU).
     local:  run the reflop worker in-process instead ("cpu" or "cuda"); for
@@ -39,7 +42,12 @@ def device(index: int = 0, *, server: str | None = None, kind: str = "auto", loc
     checkpoint_interval: seconds (or a timedelta) between checkpoints; the
             default and the minimum are the Owner's interval.
     """
-    register()
+    if not isinstance(index, Integral) or isinstance(index, bool):
+        raise TypeError("reFLOP device index must be an integer")
+    index = operator.index(index)
+    if not 0 <= index <= _session.MAX_DEVICE_INDEX:
+        raise ValueError(f"reFLOP device index must be between 0 and {_session.MAX_DEVICE_INDEX}")
+    dev = torch_device(index)
     from . import natives
 
     natives.register()
@@ -49,7 +57,7 @@ def device(index: int = 0, *, server: str | None = None, kind: str = "auto", loc
             from . import checkpoints
 
             checkpoints.enable(sess, checkpoint_interval)
-        return torch_device(index)
+        return dev
     except KeyError:
         pass
     local = local or os.environ.get("REFLOP_LOCAL")
@@ -70,7 +78,7 @@ def device(index: int = 0, *, server: str | None = None, kind: str = "auto", loc
         except BaseException:
             sess.close()
             raise
-    return torch_device(index)
+    return dev
 
 
 def step_boundary() -> None:
