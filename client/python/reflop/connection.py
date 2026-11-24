@@ -329,25 +329,33 @@ class LocalConnection(Connection):
             _s._seeding.active = prev
 
     def new_session(self) -> None:
-        worker = self._new_worker()
         with self._wlock:
-            self.worker = worker
+            if self.closed:
+                raise SessionLostError(cpb.ERROR_SESSION_LOST, "connection is closed")
+            self.worker.writer.close()
+            self.worker = self._new_worker()
             self.session_id = os.urandom(16)
             self._dead = False
             self._last_ckpt = None
 
     def close(self) -> None:
-        super().close()
-        if self._dir is not None:
-            import shutil
+        with self._wlock:
+            super().close()
+            try:
+                self.worker.writer.close()
+            finally:
+                if self._dir is not None:
+                    import shutil
 
-            shutil.rmtree(self._dir, ignore_errors=True)
+                    shutil.rmtree(self._dir, ignore_errors=True)
 
     # -------------------------------------------------------------- requests
 
     def _send(self, env: cpb.Envelope) -> None:
         which = env.WhichOneof("body")
         with self._wlock, _as_worker_process():
+            if self.closed:
+                raise SessionLostError(cpb.ERROR_SESSION_LOST, "connection is closed")
             if which in ("list_snapshots", "delete_snapshot", "describe_snapshot"):
                 return self._admin(env, which)
             if self._dead:
