@@ -144,7 +144,9 @@ keeps sending during a pause cannot grow reflopd until its cgroup OOM-kills
 it (#15).
 
 Quotas (device memory, sessions, wall clock per execute, FLOPs per execute,
-storage, upload bandwidth) are optional and off by default. 0 is rejected as
+storage, upload bandwidth) are optional and off by default. The upload
+bandwidth quota counts every frame an authenticated Guest sends, on all of
+the identity's connections (ADR-054). 0 is rejected as
 a quota value, because an unset quota means no limit; `unlimited` removes one.
 The storage quota counts uploads still in progress, and uploads with no
 progress for 7 days are deleted. Snapshots and checkpoints count against it

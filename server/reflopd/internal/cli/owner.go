@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -583,14 +585,20 @@ usage among themselves. Only the values you pass change.
   reflopd quota set alice --execute-wall-ms 60000 --storage 50GiB --upload-bandwidth 20MiB
   reflopd quota set alice --storage unlimited     remove one quota
 
-0 is not accepted: use "unlimited" to remove a quota.`,
+A Guest paired with one GPU gets the quota on that GPU's pairing; one
+paired with several needs --gpu. 0 is not accepted: use "unlimited" to
+remove a quota.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name, err := scopedIdentityName(args[0], setGPU)
+			l, err := layout()
 			if err != nil {
 				return err
 			}
-			l, err := layout()
+			ids, err := auth.Open(l.Identities())
+			if err != nil {
+				return err
+			}
+			name, err := quotaIdentity(cmd.OutOrStdout(), ids, args[0], setGPU)
 			if err != nil {
 				return err
 			}
@@ -657,17 +665,13 @@ usage among themselves. Only the values you pass change.
 	set.Flags().StringVar(&wallMS, "execute-wall-ms", "", "wall-clock limit per execute, kills the worker (or unlimited)")
 	set.Flags().StringVar(&flops, "execute-flops", "", "estimated FLOPs per execute (or unlimited)")
 	set.Flags().StringVar(&storage, "storage", "", "dataset storage (or unlimited)")
-	set.Flags().StringVar(&bw, "upload-bandwidth", "", "dataset upload bandwidth per second (or unlimited)")
+	set.Flags().StringVar(&bw, "upload-bandwidth", "", "bytes per second the Guest may send: tensors, datasets, graphs (or unlimited)")
 	set.Flags().StringVar(&setGPU, "gpu", "", "physical GPU index or UUID")
 	clear := &cobra.Command{
 		Use:   "clear <name>",
 		Short: "Remove all quotas for an identity",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name, err := scopedIdentityName(args[0], clearGPU)
-			if err != nil {
-				return err
-			}
 			l, err := layout()
 			if err != nil {
 				return err
@@ -675,6 +679,18 @@ usage among themselves. Only the values you pass change.
 			s, err := config.LoadSettings(settingsPath(l))
 			if err != nil {
 				return err
+			}
+			name := args[0]
+			// A quota stored under exactly this name goes, even one that
+			// limits nobody (`reflopd quota show` marks those).
+			if _, stored := s.Quotas[name]; !stored || clearGPU != "" {
+				ids, err := auth.Open(l.Identities())
+				if err != nil {
+					return err
+				}
+				if name, err = quotaIdentity(cmd.OutOrStdout(), ids, args[0], clearGPU); err != nil {
+					return err
+				}
 			}
 			delete(s.Quotas, name)
 			if err := config.SaveSettings(settingsPath(l), s); err != nil {
@@ -701,9 +717,18 @@ usage among themselves. Only the values you pass change.
 			}
 			if len(cfg.Quotas) == 0 {
 				fmt.Fprintln(cmd.OutOrStdout(), "no quotas set (the default)")
+				return nil
 			}
-			for n, q := range cfg.Quotas {
-				fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", n, describeQuota(q))
+			ids, err := auth.Open(l.Identities())
+			if err != nil {
+				return err
+			}
+			for _, n := range slices.Sorted(maps.Keys(cfg.Quotas)) {
+				fmt.Fprintf(cmd.OutOrStdout(), "%s: %s\n", n, describeQuota(cfg.Quotas[n]))
+				if orphanQuota(ids, n) {
+					fmt.Fprintf(cmd.OutOrStdout(), "  limits nobody: no identity is named %q. Remove it with "+
+						"`reflopd quota clear %s` and set it again (see `reflopd users`)\n", n, n)
+				}
 			}
 			return nil
 		},

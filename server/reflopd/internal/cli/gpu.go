@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"text/tabwriter"
@@ -130,4 +131,78 @@ func scopedIdentityName(name, selector string) (string, error) {
 		}
 	}
 	return "", exitWith(ExitUsage, fmt.Errorf("no GPU matches %q (see `reflopd gpu list`)", selector))
+}
+
+// quotaIdentity is the identity a quota command applies to (ADR-055). Since
+// 0.2.10 a Guest has one identity per GPU, named alice@<gpu-uuid>, while
+// `reflopd users` shows alice. With --gpu, the named GPU's identity, which
+// must exist. Without it, the identity named exactly alice (paired before
+// 0.2.10, or on an Owner without GPUs); else alice's only active GPU
+// identity, said on out; several or none are refused. A quota is therefore
+// never stored under a name no identity has, where it would limit nobody.
+func quotaIdentity(out io.Writer, ids *auth.Store, name, selector string) (string, error) {
+	if selector != "" {
+		scoped, err := scopedIdentityName(name, selector)
+		if err != nil {
+			return "", err
+		}
+		if _, ok := ids.Get(scoped); !ok {
+			return "", exitWith(ExitUsage, fmt.Errorf("%q is not paired with GPU %s (see `reflopd users`)", name, selector))
+		}
+		return scoped, nil
+	}
+	exact := false
+	var onGPUs []auth.Identity
+	for _, id := range ids.List() {
+		switch {
+		case id.Name == name:
+			exact = true
+		case !id.Revoked && id.GPUUUID != "" && id.Name == auth.ScopedName(name, id.GPUUUID):
+			onGPUs = append(onGPUs, id)
+		}
+	}
+	gpus, _ := ownerGPUs() // only to show indexes; UUIDs alone still identify the GPU
+	where := func(id auth.Identity) string {
+		for _, g := range gpus {
+			if g.UUID == id.GPUUUID {
+				return fmt.Sprintf("GPU %d (%s)", g.Index, id.GPUUUID)
+			}
+		}
+		return id.GPUUUID
+	}
+	flag := func(id auth.Identity) string {
+		for _, g := range gpus {
+			if g.UUID == id.GPUUUID {
+				return strconv.Itoa(g.Index)
+			}
+		}
+		return id.GPUUUID
+	}
+	switch {
+	case exact:
+		for _, id := range onGPUs {
+			fmt.Fprintf(out, "note: %s is also paired with %s; set that identity's quotas with --gpu %s\n",
+				name, where(id), flag(id))
+		}
+		return name, nil
+	case len(onGPUs) == 1:
+		fmt.Fprintf(out, "%s is paired with %s: this applies to that identity (%s)\n", name, where(onGPUs[0]), onGPUs[0].Name)
+		return onGPUs[0].Name, nil
+	case len(onGPUs) > 1:
+		var b strings.Builder
+		fmt.Fprintf(&b, "%s is paired with %d GPUs; choose one with --gpu:", name, len(onGPUs))
+		for _, id := range onGPUs {
+			fmt.Fprintf(&b, "\n  --gpu %s  %s", flag(id), where(id))
+		}
+		return "", exitWith(ExitUsage, errors.New(b.String()))
+	}
+	return "", exitWith(ExitUsage, fmt.Errorf("no Guest named %q (see `reflopd users`)", name))
+}
+
+// orphanQuota says whether a quota is stored under a name no identity has:
+// it limits nobody. Quotas set without --gpu for a GPU-scoped Guest before
+// ADR-055 are like that.
+func orphanQuota(ids *auth.Store, name string) bool {
+	_, ok := ids.Get(name)
+	return !ok
 }

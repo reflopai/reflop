@@ -549,9 +549,7 @@ func (c *clientConn) dataRequest(env *pb.Envelope) error {
 		}
 		return c.send(&pb.Envelope{RequestId: rid, End: true, Body: &pb.Envelope_PackStatus{PackStatus: res}})
 	case *pb.Envelope_PackChunk:
-		if q := c.srv.quota(c.identity.Name); q.UploadBytesPerSec > 0 {
-			c.srv.throttle(id, uint64(len(b.PackChunk.Data)), uint64(q.UploadBytesPerSec))
-		}
+		// The upload quota was applied when the frame was read (clientConn.loop).
 		if err := st.PutChunk(id, b.PackChunk); err != nil {
 			return fail(err)
 		}

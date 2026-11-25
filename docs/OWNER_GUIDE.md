@@ -94,8 +94,9 @@ reflopd quota set alice --gpu 2 --max-sessions 1
 The repeatable `up --gpu` flag overrides `[devices].cuda` at startup. It
 accepts physical indexes or full UUIDs. Restart the daemon to change the
 selection. `invite` requires `--gpu` when several cards are enabled.
-Use the same selector with `revoke`, `users delete`, and `unpair`. A full UUID
-can target a pairing after its card is removed.
+Use the same selector with `revoke`, `users delete`, and `unpair`. `quota set`
+and `quota clear` need it only for a Guest paired with several GPUs. A full
+UUID can target a pairing after its card is removed.
 
 An invite works once. A failed attempt (wrong secret, tampered code) also
 consumes it, so a leaked code cannot be brute-forced. To see or remove access:
@@ -262,6 +263,26 @@ A quota of 0 is rejected: an unset quota means no limit, so 0 would read as
 "nothing" and act as "everything". To block a Guest, revoke them. The storage
 quota counts uploads still in progress as well as stored datasets, and an
 upload with no progress for 7 days is deleted.
+
+`--upload-bandwidth` limits every byte the Guest sends, on all of their
+connections together: tensors moved to the device, datasets, graphs and
+requests. Training that uploads a batch every step runs no faster than the
+batch size divided by this rate. In reFLOP 0.3.0 and earlier it limited
+dataset uploads only.
+
+Quotas belong to one pairing. Since 0.2.10 a Guest has a pairing per GPU,
+shown in `reflopd users`, and `quota set alice` picks it:
+
+- Paired with one GPU: that pairing, and the command says which GPU.
+- Paired with several: the command lists them; choose one with `--gpu`.
+- Paired before 0.2.10, or with an Owner without GPUs: the pairing named
+  `alice`.
+
+`quota set` refuses a name no pairing has. In reFLOP 0.2.10 to 0.3.0 it stored
+the quota under that name anyway, so `reflopd quota set alice` without
+`--gpu` limited nobody for a Guest paired since 0.2.10. `reflopd quota show` marks
+such a quota with "limits nobody"; remove it with `reflopd quota clear alice`
+and set it again.
 
 ## Controls while Guests train
 
