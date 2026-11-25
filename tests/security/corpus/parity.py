@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import math
 import types
+import zlib
 from dataclasses import dataclass
 
 import torch
@@ -624,7 +625,9 @@ def _int_values(v, rank, size):
 
 def _retensor(t: torch.Tensor, shape, dtype=None, lo_hi=None):
     dtype = dtype or t.dtype
-    g = torch.Generator().manual_seed(hash((tuple(shape), str(dtype))) & 0xFFFF)
+    # zlib.crc32, not hash(): Python salts str hashes per process, so the
+    # values (and which cases a run checks) used to differ between runs.
+    g = torch.Generator().manual_seed(zlib.crc32(repr((tuple(shape), str(dtype))).encode()) & 0xFFFF)
     if dtype == torch.bool:
         return torch.rand(shape, generator=g) > 0.5
     if dtype.is_floating_point:

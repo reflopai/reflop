@@ -87,6 +87,13 @@ def unsafe():
         ("embedding_bag backward: bag_size shorter than the bags",
          Call("aten._embedding_bag_dense_backward.default",
               [o, idx, o2b, bag_size[:2], maxi, 6, False, 1, None, -1])),
+        # ADR-056: one offset per bag plus one (include_last_offset) whose last
+        # is short of the indices puts indices 4 and 5 in a fourth bag; the
+        # CPU kernel rebuilds the bags from offsets and reads past grad.
+        ("embedding_bag backward: the last offset ends before the indices",
+         Call("aten._embedding_bag_backward.default",
+              [r(3, 4), idx, torch.tensor([0, 2, 4, 4]), torch.zeros(0, dtype=L), torch.zeros(3, dtype=L),
+               torch.zeros(3, dtype=L), 6, False, 0, False, None, -1])),
         ("embedding_bag: indices but no bags",
          Call("aten._embedding_bag.default", [r(6, 4), idx, torch.zeros(0, dtype=L), False, 2, False, None, False, -1])),
         ("avg pool 3d: self has another batch size",
@@ -123,6 +130,8 @@ def autograd_calls():
     """What autograd passes the same ops: these must keep running."""
     o, idx, off, o2b, bag_size, maxi = _bag(1)
     so, sidx, soff, so2b, sbag, smaxi = _bag(2)
+    last_off = torch.tensor([0, 2, 4, 6])
+    lo, lo2b, lbag, lmaxi = A._embedding_bag.default(r(6, 4), idx, last_off, False, 0, False, None, True)
     x2, x3 = r(2, 3, 6, 6), r(1, 2, 4, 4, 4)
     p2, i2 = _pool2d_idx()
     p3, i3 = _pool3d_idx(x3)
@@ -148,6 +157,9 @@ def autograd_calls():
         Call("aten._weight_norm_interface_backward.default", [r(4, 3), v, g, norms, 0]),
         Call("aten._weight_norm_interface_backward.default", [r(4, 3, dtype=torch.bfloat16), vb, gb, normsb, 1]),
         Call("aten._embedding_bag_backward.default", [o, idx, off, o2b, bag_size, maxi, 6, False, 1, False, None, -1]),
+        # include_last_offset: offsets has a bag more, ending at the indices.
+        Call("aten._embedding_bag_backward.default", [r(*lo.shape), idx, last_off, lo2b, lbag, lmaxi, 6, False, 0,
+                                                      False, None, -1]),
         Call("aten._embedding_bag_dense_backward.default", [so, sidx, so2b, sbag, smaxi, 6, False, 2, None, -1]),
         Call("aten._embedding_bag.default", [r(6, 4), torch.zeros(0, dtype=L), torch.zeros(0, dtype=L), False, 0,
                                              False, None, False, -1]),

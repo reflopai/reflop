@@ -208,8 +208,12 @@ def embedding_bag_backward_runtime(node, a):
     bounds(node, a["indices"], 0, a["num_weights"])
     if "offsets" in a:
         # With an empty offset2bag the kernels derive the bags from offsets
-        # (ADR-042).
-        _offsets(node, a["offsets"], a["indices"].numel())
+        # (ADR-042). With one offset per bag plus one (include_last_offset),
+        # the last must be the number of indices: a smaller one puts the
+        # indices after it in a bag grad does not have, and the CPU kernel
+        # reads past grad's end (ADR-056).
+        off = a["offsets"]
+        _offsets(node, off, a["indices"].numel(), include_last_offset=off.numel() == a["grad"].shape[0] + 1)
     o2b = a.get("offset2bag")
     if o2b is not None:
         bounds(node, o2b, 0, max(a["grad"].shape[0], 1), what="offset2bag")
