@@ -18,6 +18,7 @@ import functools
 import itertools
 import threading
 import warnings
+from collections import OrderedDict
 from typing import Any
 
 import torch
@@ -400,6 +401,48 @@ def meta_cached(func, args, kwargs, cuda: bool = False):
     return out
 
 
+# Meta inference cache for view ops. Keys include storage offsets and argument
+# signatures. To avoid boundless cache growth from shifting slice bounds or
+# dynamic offsets, this uses a bounded LRU cache (capped at 4,096 entries)
+# completely separate from _META_CACHE.
+_VIEW_CACHE: OrderedDict = OrderedDict()
+_VIEW_CACHE_MAX = 4096
+
+
+def _has_float(x):
+    if isinstance(x, float):
+        return True
+    if isinstance(x, (list, tuple)):
+        return any(_has_float(y) for y in x)
+    if isinstance(x, dict):
+        return any(_has_float(v) for v in x.values())
+    return False
+
+
+def view_meta_cached(func, args, kwargs):
+    if _has_float(args) or _has_float(kwargs):
+        return run_meta(func, args, kwargs)
+    try:
+        key = (func, _sig(args), _sig(tuple(sorted(kwargs.items()))))
+    except TypeError:
+        return run_meta(func, args, kwargs)
+    hit = _VIEW_CACHE.get(key)
+    if hit is not None:
+        _VIEW_CACHE.move_to_end(key)
+        spec, leaves = hit
+        return tree_unflatten([_restore_meta(sh, st, dt, off, is_conj, is_neg) if sh is not None else v
+                               for sh, st, dt, off, is_conj, is_neg, v in leaves], spec)
+    out = run_meta(func, args, kwargs)
+    flat, spec = tree_flatten(out)
+    leaves = [(tuple(t.shape), t.stride(), t.dtype, t.storage_offset(), t.is_conj(), t.is_neg(), None)
+              if isinstance(t, torch.Tensor)
+              else (None, None, None, None, False, False, t) for t in flat]
+    if len(_VIEW_CACHE) >= _VIEW_CACHE_MAX:
+        _VIEW_CACHE.popitem(last=False)
+    _VIEW_CACHE[key] = (spec, leaves)
+    return out
+
+
 def _flat_tensors(out) -> list:
     leaves, _ = tree_flatten(out)
     return [x for x in leaves if isinstance(x, torch.Tensor)]
@@ -438,7 +481,7 @@ def value_of(t: RemoteTensor) -> Value:
             v, cur_meta = cached[1], cached[2]
             continue
         a, kw = _rebind(func, [cur_meta, *rest])
-        out_meta = run_meta(func, a, kw)
+        out_meta = view_meta_cached(func, a, kw)
         metas = _flat_tensors(out_meta)
         outs = sess.record_values(_op_name(func), func, [v, *rest], metas, self_is_value=True)
         v = outs[k if k is not None else 0]
@@ -531,7 +574,7 @@ def write(t: RemoteTensor, new_val: Value, new_meta: torch.Tensor | None = None)
     cur, cm = st.value, st.meta
     for func, rest, k in t._rf_chain[:-1]:
         a, kw = _rebind(func, [cm, *rest])
-        om = _flat_tensors(run_meta(func, a, kw))
+        om = _flat_tensors(view_meta_cached(func, a, kw))
         cur = sess.record_values(_op_name(func), func, [cur, *rest], om, self_is_value=True)[k or 0]
         cm = om[k or 0]
         vals.append(cur)
@@ -724,7 +767,7 @@ def _view(sess, func, args, kwargs):
     if not isinstance(src, RemoteTensor):
         return _functional(sess, func, args, kwargs)
     func = _view_step(func, src)
-    out_meta = run_meta(func, args, kwargs)
+    out_meta = view_meta_cached(func, args, kwargs)
     _check_math_bits(func, out_meta)
     rest = tuple(_freeze(v) for v in vals[1:])
     st = src._rf_storage
@@ -754,7 +797,7 @@ def _inplace_view(sess, func, args, kwargs):
     _view_step(ffunc, t)
     rest = tuple(_freeze(v) for v in vals[1:])
     fa, fk = _rebind(ffunc, [t._rf_meta, *vals[1:]])
-    new_meta = run_meta(ffunc, fa, fk)
+    new_meta = view_meta_cached(ffunc, fa, fk)
     t._rf_chain = t._rf_chain + ((ffunc, rest, None),)
     t._rf_meta = new_meta
     with torch._C._DisableTorchDispatch():
