@@ -1838,3 +1838,36 @@ rate for the bytes each step uploads, and a request behind a large upload
 waits for it, as dataset chunks already did. The Guest client has no read or
 ping timeout that this can trip. Pre-authentication frames are not charged:
 they are capped at a few KiB and have no identity yet.
+
+## ADR-055: Quota commands resolve the Guest's pairing
+
+**Context.** Since 0.2.10 (independent GPU pairings) an identity paired
+with a GPU is named `alice@<gpu-uuid>`, and `reflopd users` shows `alice`
+with a GPU column. `reflopd quota set alice` without `--gpu` stored the
+quota under `alice`, which no such identity has, and every quota lookup
+uses the identity's full name. Every kind of quota therefore limited nobody,
+with no warning. Even on a one-GPU machine `invite` picks the GPU itself, so
+an Owner who never typed `--gpu` hit this.
+
+**Decision.** `quota set` and `quota clear` resolve the name
+(`cli.quotaIdentity`). With `--gpu`, that GPU's pairing, which must exist.
+Without it: the identity named exactly `alice` (paired before 0.2.10, or
+with an Owner without GPUs), with a note when she also has GPU pairings;
+otherwise her only active GPU pairing, and the command says which GPU; with
+several, it refuses and lists them with their `--gpu` values; with none, it
+refuses. `quota clear <name>` also removes a quota stored under exactly that
+name, and `quota show` marks a quota whose name no identity has as "limits
+nobody".
+
+**Alternatives.** Only warning when the name matches no identity: the quota
+would still be stored for nobody. Refusing every name without `--gpu` that is
+not an exact identity: the plain command would fail in the common one-GPU
+case. Migrating stored quotas to the scoped name at startup: the daemon
+would change the Owner's settings without being asked, and with several
+pairings it cannot know which one was meant.
+
+**Consequences.** A quota can no longer be set before the Guest pairs.
+Quotas stored the old way stay until the Owner clears them; `quota show`
+points them out. `revoke`, `users delete` and `unpair` still take the full
+selector: they already fail loudly ("no identity named") instead of doing
+nothing.

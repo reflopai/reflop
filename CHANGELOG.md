@@ -6,6 +6,12 @@
   uploads, tensors sent with a graph, datasets, graphs), on all of the
   Guest's connections together. It used to apply to dataset uploads only, so
   training that uploads a batch every step was not limited (GH#17).
+- `reflopd quota set alice` (and `quota clear`) without `--gpu` now reaches
+  a Guest paired with one GPU, and says which GPU. Since 0.2.10 it stored
+  the quota under the plain name, which no GPU pairing has, so the quota
+  limited nobody. A Guest paired with several GPUs needs `--gpu`, and a name
+  no pairing has is refused. Check `reflopd quota show`: quotas stored that
+  way are marked "limits nobody"; clear them and set them again.
 - C API: `reflop_fetch` with `buf == NULL` (a size query) answers from the
   handle's known size, without downloading the tensor (114 ms for 64 MiB
   before, on a local connection).
