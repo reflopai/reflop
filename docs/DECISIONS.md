@@ -1754,3 +1754,58 @@ steps on the in-process worker did not change measurably. Each 0-dim move
 costs a fetch and an upload; `clip_grad_norm_` makes two per step outside
 session 0. A learnable 0-dim parameter used with tensors from another
 session still needs an explicit `.to()`.
+
+## ADR-053: Backward on PyTorch's autograd thread
+
+**Context.** PyTorch runs backward for the reFLOP device on a thread of its
+own (`pt_autograd_0`) while the caller waits ([#48](https://github.com/reflopai/reflop/issues/48)).
+An exception that leaves a Python callback on that thread (reFLOP's
+`__torch_dispatch__`, a factory kernel, a gradient hook) aborts the process:
+while it unwinds through `Engine::evaluate_function`, the stream guard's
+destructor calls `PythonDeviceGuard::exchangeStream`, which is `noexcept`,
+and `std::terminate` runs. It happens in most runs but not all (one probe
+raised `SystemError` instead). Returning `NotImplemented` from
+`__torch_dispatch__` does not help: PyTorch turns it into a Python error
+too. `torch._C._acc.DeviceGuard` lets Python override only `type_`, and a
+guard that cleared pending errors there still aborted. Registering the
+backend without PrivateUse1 hooks makes backward refuse to run. The same
+thread also sees none of the caller's thread-local state: the placement mode
+(`placement("local")` backward ran on the server, `"remote"` could fall back
+to the client) and the active session (a tensor that a backward formula
+creates went to the default session).
+
+**Decision.**
+- No exception leaves reFLOP code on the autograd thread
+  (`torch._C._current_autograd_node()` is set). An op that fails there keeps
+  its error in its session and returns placeholders of its output shapes
+  from the meta kernel. Reading a placeholder, or a tensor the failed op
+  wrote to (an accumulated gradient), raises the kept error. Later backward
+  ops on placeholders fail the same way without server work. The same
+  applies to the factory and `empty` kernels and `_copy_from`, and to hooks
+  registered with `Tensor.register_hook` and
+  `register_post_accumulate_grad_hook`, which reFLOP wraps.
+- `Tensor.backward`, `torch.autograd.backward` and `torch.autograd.grad` on a
+  reflop tensor (`_backward.run`) carry the caller's placement mode and the
+  root tensor's session to the autograd thread while they run, then raise a
+  kept error. Backward from a client tensor does not pass through them: the
+  next read in the session raises the error (as in ADR-033).
+- Several backward calls in progress at once share one autograd thread: the
+  most recent call's context applies to all of them.
+- A `placement()` block saves and restores only its own thread's setting,
+  so a block inside a hook leaves no mode behind on the autograd thread.
+
+**Alternatives.** A plain C++ error with no Python error set, raised in
+place of the op's: there is no way to raise one from Python. Recording the
+mode and session on every forward op's `grad_fn`: correct with concurrent
+backward calls, but it costs every forward op, and nodes created inside C++
+composites would stay untagged. A process-wide `placement()` override: it
+changes the mode for every thread, not only for backward.
+
+**Consequences.** Every op checks whether it runs an autograd node (one
+call into PyTorch; small CPU ops went from 35.3 to 35.8 µs on the client).
+After a failure, backward keeps walking the graph without server work, and
+the error is raised when it ends. Exceptions from hooks on `grad_fn` objects
+and from module backward hooks (which use them) still abort, as does a local
+CUDA backward next to reFLOP: once a PrivateUse1 backend is registered,
+PyTorch treats it as the accelerator, and `Node::stream()` then ignores CUDA.
+Both need changes in PyTorch.

@@ -232,6 +232,13 @@ In reFLOP 0.2.4 and earlier, a read right after a failed request could
 return the tensor's old contents without an error, and the error surfaced one
 read later.
 
+An error in backward (an operation the server cannot run, a lost session, a
+gradient hook that raises) is raised by `.backward()` or `torch.autograd.grad()`
+when it returns. The gradients that the failed operation would have produced
+raise the same error when you read them. Backward started from a tensor on your
+machine, for example `loss = model(x).cpu().sum()`, returns, and the next read
+in that session raises the error.
+
 If the program ends before an error like that surfaces, reFLOP prints it to
 stderr at exit ("an error was not reported before the program ended: ...").
 It first waits up to 5 seconds for requests still running on the server.
@@ -433,6 +440,12 @@ Wherever an operation runs, writes behave as in PyTorch:
 - Training under `"local"` (forward, backward, optimizer step) gives the same
   parameters as plain PyTorch.
 
+Backward follows the placement of the code that calls `.backward()` or
+`torch.autograd.grad()`, although PyTorch runs it on a thread of its own: under
+`"local"` it stays on your machine, and under `"remote"` it never falls back.
+If two threads run backward at the same moment with different placements, the
+one that started last applies to both.
+
 In reFLOP 0.2.5 and earlier, an operation that ran locally and wrote to a reFLOP
 tensor changed a fetched copy, and the tensor silently kept its old value.
 That happened under `"local"` for every in-place operation (including the
@@ -598,6 +611,15 @@ Does not work:
 - `as_strided` on a `conj()` view (call `.conj_physical()` or `.clone()`
   first). A `conj()` view of a reFLOP tensor is already conjugated, so
   `is_conj()` returns `False`.
+- a local CUDA backward in a process that uses reFLOP. Once reFLOP's device is
+  registered, PyTorch treats it as the accelerator, and backward on a local CUDA
+  tensor fails with `opt_ready_stream && opt_parent_stream INTERNAL ASSERT
+  FAILED`. Train the local model in another process.
+- an exception raised by a hook on a `grad_fn` (`y.grad_fn.register_hook`) or
+  by a module backward hook (`register_full_backward_hook`,
+  `register_full_backward_pre_hook`) during a reFLOP backward. It still ends the
+  process inside PyTorch. Tensor hooks (`register_hook`,
+  `register_post_accumulate_grad_hook`) raise as usual.
 
 GPU results can differ from your CPU's in the last bits (TF32 is on for
 convolutions by default, and some GPU kernels are not deterministic).

@@ -7,24 +7,35 @@ from __future__ import annotations
 import contextlib
 import threading
 
+from . import _backward
+
 _state = threading.local()
 MODES = ("auto", "remote", "local", "remote-cpu")
 
 
 def mode() -> str:
-    return getattr(_state, "mode", "auto")
+    m = getattr(_state, "mode", None)
+    if m is not None:
+        return m
+    # PyTorch runs backward on its own thread: there, the mode of the thread
+    # that called backward() (ADR-053).
+    c = _backward.context()
+    return c.mode if c is not None else "auto"
 
 
 @contextlib.contextmanager
 def override(m: str):
     if m not in MODES:
         raise ValueError(f"placement must be one of {MODES}")
-    prev = mode()
+    prev = getattr(_state, "mode", None)  # not mode(): keep a carried mode out of this thread's state
     _state.mode = m
     try:
         yield
     finally:
-        _state.mode = prev
+        if prev is None:
+            del _state.mode
+        else:
+            _state.mode = prev
 
 
 # Cost model (§13.3): t_local = F / P_local; t_remote = F / P_server + bytes /

@@ -24,6 +24,7 @@ from typing import Any
 import torch
 from torch.utils._pytree import tree_flatten, tree_map, tree_unflatten
 
+from . import _backward
 from . import _opset_generated as opset
 from . import _outmeta_generated as outmeta
 from ._pb import graph_pb2 as gpb
@@ -31,6 +32,7 @@ from .errors import ReflopError
 from .trace import HANDLE, UnsupportedOperatorError, Value, _base, normalize
 
 aten = torch.ops.aten
+_current_node = _backward.current_node  # not None while this thread runs an autograd node
 
 
 class Storage:
@@ -41,7 +43,8 @@ class Storage:
     in a server handle.
     """
 
-    __slots__ = ("session", "meta", "value", "version", "_handle", "view_cache", "seq", "lost", "__weakref__")
+    __slots__ = ("session", "meta", "value", "version", "_handle", "view_cache", "seq", "lost", "poison",
+                 "__weakref__")
     _seq = itertools.count()
 
     def __init__(self, session, meta: torch.Tensor, value: Value | None) -> None:
@@ -52,6 +55,7 @@ class Storage:
         self.version = 0
         self._handle: bytes | None = None
         self.lost = ""  # why this tensor's server data is gone (set by reflop.recover)
+        self.poison: BaseException | None = None  # its op failed in backward: reads raise this
         self.view_cache: dict = {}
         if value is not None and value.kind == HANDLE:
             self.handle = value.handle
@@ -70,6 +74,7 @@ class Storage:
 
     def set(self, value: Value) -> None:
         self.value = value
+        self.poison = None
         self.version += 1
         self.view_cache.clear()
         if value.kind != HANDLE:
@@ -115,25 +120,14 @@ class RemoteTensor(torch.Tensor):
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
-        sess = None
-        mixed = False
-        for x in itertools.chain(tree_flatten(args)[0], tree_flatten(kwargs)[0]):
-            if isinstance(x, RemoteTensor):
-                s = x._rf_storage.session
-                if sess is None:
-                    sess = s
-                elif s is not sess:
-                    mixed = True
-        if sess is None:  # pragma: no cover - torch only calls us with a RemoteTensor
-            return func(*args, **kwargs)
-        if func is aten._to_copy.default:
-            target = _copy_target(sess, kwargs.get("device"))
-            if target is not None:
-                with _locked(sess, target):  # the move holds both (see _locked)
-                    return dispatch(sess, func, args, kwargs)
-        elif mixed:
-            return _cross_session(func, args, kwargs)
-        return dispatch(sess, func, args, kwargs)
+        if _current_node() is None:
+            return _torch_dispatch(func, args, kwargs)
+        # On PyTorch's autograd thread an exception leaving here aborts the
+        # process inside its device guard (ADR-053): keep it instead.
+        try:
+            return _torch_dispatch(func, args, kwargs)
+        except Exception as e:
+            return _failed_in_backward(e, func, args, kwargs)
 
     # ---------------------------------------------------------------- python API
 
@@ -209,6 +203,11 @@ class RemoteTensor(torch.Tensor):
                 return args[0].to(device=other.device, dtype=other.dtype, non_blocking=nb, copy=copy,
                                   memory_format=kw.get("memory_format", torch.preserve_format))
         kwargs = kwargs or {}
+        if func in _BACKWARD_CALLS:
+            root = next(x for x in tree_flatten((args, kwargs))[0] if isinstance(x, RemoteTensor))
+            return _backward.run(func, types, args, kwargs, root._rf_storage.session)
+        if func in _HOOK_REGISTRATIONS and len(args) == 2 and isinstance(args[0], RemoteTensor):
+            args = (args[0], _safe_hook(args[1], args[0], func is torch.Tensor.register_post_accumulate_grad_hook))
         # C++ composites (scaled_dot_product_attention's causal mask, ...)
         # create tensors with the inputs' C++ device, reflop:0: put them in
         # the inputs' session instead.
@@ -238,6 +237,131 @@ class RemoteTensor(torch.Tensor):
                           copy=copy, memory_format=mf or torch.preserve_format)
 
 
+def _torch_dispatch(func, args, kwargs):
+    """An op on reflop tensors: the session the op runs in, and moves between sessions."""
+    sess = None
+    mixed = False
+    for x in itertools.chain(tree_flatten(args)[0], tree_flatten(kwargs)[0]):
+        if isinstance(x, RemoteTensor):
+            s = x._rf_storage.session
+            if sess is None:
+                sess = s
+            elif s is not sess:
+                mixed = True
+    if sess is None:  # pragma: no cover - torch only calls us with a RemoteTensor
+        return func(*args, **kwargs)
+    if func is aten._to_copy.default:
+        target = _copy_target(sess, kwargs.get("device"))
+        if target is not None:
+            with _locked(sess, target):  # the move holds both (see _locked)
+                return dispatch(sess, func, args, kwargs)
+    elif mixed:
+        return _cross_session(func, args, kwargs)
+    return dispatch(sess, func, args, kwargs)
+
+
+def _failed_in_backward(e, func, args, kwargs):
+    """An op failed on PyTorch's autograd thread, where an exception would
+    abort the process (ADR-053). Keep the error for the backward call (or
+    the session's next read) and return placeholders: tensors of the op's
+    output shapes whose reads raise it. Later backward ops on them fail the
+    same way without server work. A tensor the op writes to (an accumulated
+    gradient) raises it too, instead of keeping its old value; an op with no
+    outputs (a check such as _linalg_check_errors) returns nothing. Without
+    a meta kernel to shape the placeholders, the error goes on to PyTorch."""
+    try:
+        sess, out = _placeholders_for(e, func, args, kwargs)
+    except Exception:  # noqa: BLE001 - cannot stand in for the op: report its own error
+        raise e from None
+    _backward.keep(sess, e)
+    return out
+
+
+def _placeholders_for(e, func, args, kwargs):
+    sess = next(x for x in tree_flatten((args, kwargs))[0] if isinstance(x, RemoteTensor))._rf_storage.session
+    vals = normalize(func, args, kwargs)
+    schema = func._schema
+    rets = schema.returns
+    if all(r.alias_info is not None and r.alias_info.is_write for r in rets):
+        out_meta = None
+    else:
+        out_meta = run_meta(func, args, kwargs)  # before anything is poisoned: it may raise
+    for a, v in zip(schema.arguments, vals, strict=True):
+        if a.alias_info is not None and a.alias_info.is_write:
+            for t in tree_flatten(v)[0]:
+                if isinstance(t, RemoteTensor):
+                    t._rf_storage.poison = e
+    if out_meta is not None:
+        return sess, tree_map(lambda m: _placeholder(sess, m, e) if isinstance(m, torch.Tensor) else m, out_meta)
+    # In place or out=: the op returns the tensors it wrote, which now raise.
+    outs = [next(v for a, v in zip(schema.arguments, vals, strict=True)
+                 if a.alias_info is not None and a.alias_info.before_set == r.alias_info.before_set) for r in rets]
+    return sess, (None if not outs else outs[0] if len(outs) == 1 else tuple(outs))
+
+
+def _safe_hook(hook, tensor, post: bool):
+    """A gradient hook on a reflop tensor, run on the autograd thread: an
+    error is kept (ADR-053), and the gradient it would have changed raises it
+    when read."""
+    @functools.wraps(hook)
+    def run(arg):
+        if not _backward.in_backward():
+            return hook(arg)
+        try:
+            return hook(arg)
+        except Exception as e:
+            sess = tensor._rf_storage.session
+            if post:  # hook(tensor) after tensor.grad was accumulated
+                g = arg.grad
+                if not isinstance(g, RemoteTensor):
+                    raise
+                _backward.keep(sess, e)
+                g._rf_storage.poison = e
+                return None
+            if not isinstance(arg, RemoteTensor):
+                raise
+            _backward.keep(sess, e)
+            return _placeholder(sess, arg._rf_meta, e)
+    return run
+
+
+def _placeholder(sess, meta, e):
+    st = Storage(sess, meta, None)
+    st.poison = e
+    return RemoteTensor(meta, st)
+
+
+def _backward_safe(meta_of):
+    """For the Python kernels that C++ calls directly (factories, empty):
+    on the autograd thread, keep an error as __torch_dispatch__ does.
+    meta_of(*args, **kwargs) is the kernel's output on the meta device."""
+    def wrap(kernel):
+        @functools.wraps(kernel)
+        def run(*args, **kwargs):
+            if not _backward.in_backward():
+                return kernel(*args, **kwargs)
+            try:
+                return kernel(*args, **kwargs)
+            except Exception as e:
+                sess = _backward_session()
+                try:
+                    with torch._C._DisableTorchDispatch():
+                        meta = meta_of(*args, **kwargs)
+                except Exception:  # noqa: BLE001 - no shape: report the kernel's own error
+                    raise e from None
+                _backward.keep(sess, e)
+                return _placeholder(sess, meta, e)
+        return run
+    return wrap
+
+
+def _backward_session():
+    from . import session
+
+    c = _backward.context()
+    return c.session if c is not None and c.session is not None else session.current()
+
+
 # OpOverload.__str__ formats the name on every call, and dispatch asks for it
 # several times per op. Overloads are singletons, so the cache stays small.
 _OP_NAMES: dict = {}
@@ -265,8 +389,13 @@ def _split_copy(args, kwargs):
 _DEVICE_PREFIXES = ("reflop", "cpu", "cuda", "meta", "mps")
 # Calls that may legitimately reach other sessions (backward through a
 # differentiable move between sessions) or that name a device themselves.
-_NO_CALL_SESSION = {torch.Tensor.to, torch.Tensor.cuda, torch.Tensor.type, torch.Tensor.backward,
-                    torch.autograd.backward, torch.autograd.grad}
+_NO_CALL_SESSION = {torch.Tensor.to, torch.Tensor.cuda, torch.Tensor.type}
+# They run on PyTorch's autograd thread: _backward.run carries the caller's
+# placement mode and session there and raises an error an op kept there.
+_BACKWARD_CALLS = {torch.Tensor.backward, torch.autograd.backward, torch.autograd.grad}
+# Their hooks run on the autograd thread too (module backward hooks register
+# through register_hook): _safe_hook keeps an error as _failed_in_backward does.
+_HOOK_REGISTRATIONS = {torch.Tensor.register_hook, torch.Tensor.register_post_accumulate_grad_hook}
 
 
 def _call_session(func, args, kwargs):
@@ -404,6 +533,8 @@ def value_of(t: RemoteTensor) -> Value:
         from .errors import SessionLostError
 
         raise SessionLostError(18, st.lost)
+    if st.poison is not None:
+        raise st.poison
     if st.value is None:
         st.set(sess.record_simple("aten.full.default", aten.full.default,
                                   [list(st.meta.shape), 0, st.meta.dtype, None, torch.device("reflop"), None],
@@ -1301,6 +1432,13 @@ def _session_for(device):
         if isinstance(device, (str, int)):
             device = torch.device(device) if isinstance(device, str) else torch.device("reflop", device)
         idx = device.index if isinstance(device, torch.device) and device.index is not None else 0
+        # A backward formula that creates a tensor runs on PyTorch's autograd
+        # thread outside any op, and C++ names every session reflop:0: use
+        # the session of the backward call's root (ADR-053).
+        ctx = _backward.context() if idx == 0 else None
+        if ctx is not None and ctx.session is not None:
+            target = ctx.session
+    if target is None:
         try:
             target = session.by_index(idx)
         except KeyError:
@@ -1348,6 +1486,8 @@ def _new_empty(size, dtype, stride=None, device=None):
     return RemoteTensor(meta, Storage(sess, meta, None))
 
 
+@_backward_safe(lambda size, dtype=None, *a, **k: torch.empty(size, dtype=dtype or torch.get_default_dtype(),
+                                                               device="meta"))
 def _empty_memory_format(size, dtype=None, layout=None, device=None, pin_memory=None, memory_format=None):
     t = _new_empty(size, dtype, device=device)
     if memory_format not in (None, torch.contiguous_format, torch.preserve_format):
@@ -1357,6 +1497,8 @@ def _empty_memory_format(size, dtype=None, layout=None, device=None, pin_memory=
     return t
 
 
+@_backward_safe(lambda size, stride, dtype=None, *a, **k: torch.empty_strided(
+    size, stride, dtype=dtype or torch.get_default_dtype(), device="meta"))
 def _empty_strided(size, stride, dtype=None, layout=None, device=None, pin_memory=None):
     return _new_empty(size, dtype, stride, device=device)
 
@@ -1373,6 +1515,7 @@ FACTORIES = [
 def _factory_kernel(op):
     name = str(op)
 
+    @_backward_safe(lambda *args, **kwargs: op(*args, **dict(kwargs, device=torch.device("meta"))))
     def kernel(*args, **kwargs):
         sess = _session_for(kwargs.get("device"))
         if name not in sess.enabled:
@@ -1392,8 +1535,14 @@ def _copy_from(src, dst, non_blocking=False):
     # device=reflop) builds on CPU and copies into an empty remote tensor).
     target = dst if isinstance(dst, RemoteTensor) else src
     sess = target._rf_storage.session
-    with sess.lock:
-        _copy_(sess, aten.copy_.default, (dst, src), {})
+    try:
+        with sess.lock:
+            _copy_(sess, aten.copy_.default, (dst, src), {})
+    except Exception as e:
+        if not _backward.in_backward() or not isinstance(dst, RemoteTensor):
+            raise
+        _backward.keep(sess, e)  # see _failed_in_backward
+        dst._rf_storage.poison = e
     return dst
 
 
