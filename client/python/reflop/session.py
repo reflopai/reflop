@@ -142,6 +142,7 @@ def tensor_bytes(t: torch.Tensor) -> bytes:
 
 class Session:
     unread_error: BaseException | None = None  # raised once but swallowed by repr (see keep_unread)
+    backward_error: BaseException | None = None  # an op failed on the autograd thread (_backward.keep)
 
     def __init__(self, conn, device_index: int | None, gdevice: gpb.Device, caps, *,
                  allow_local_fallback: bool = True, make_default: bool = True) -> None:
@@ -316,6 +317,9 @@ class Session:
     def raise_async(self) -> None:
         if self.unread_error is not None:
             e, self.unread_error = self.unread_error, None
+            raise e
+        if self.backward_error is not None:
+            e, self.backward_error = self.backward_error, None
             raise e
         e = self.async_error
         if e is not None:

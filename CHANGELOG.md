@@ -10,6 +10,19 @@
   PyTorch's own `LinAlgError` for a singular or non-positive-definite
   matrix. They used to be refused, or to run on your machine under the
   default placement.
+- An error in backward (an operation the server cannot run, a lost session,
+  a tensor hook that raises) is raised by `.backward()` or
+  `torch.autograd.grad()`. It used to abort the process with `terminate
+  called without an active exception`. Gradients the failed operation would
+  have produced raise the same error when read.
+- Backward follows the caller's `placement()`: under `"local"` it no longer
+  runs on the server, and under `"remote"` it no longer falls back to your
+  machine. Tensors that backward creates go to the session of the tensor
+  `.backward()` was called on.
+- Known limits: a local CUDA backward in a process that uses reFLOP still
+  fails inside PyTorch, and an exception from a `grad_fn` or module backward
+  hook still ends the process. See "What works and what does not" in the
+  Guest guide.
 - A 0-dim tensor from another session joins an operation the way a 0-dim
   CPU tensor joins one on CUDA, so `clip_grad_norm_` works on a model that
   is not in session 0. A 0-dim tensor that needs a gradient, or that the
