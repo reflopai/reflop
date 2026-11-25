@@ -15,6 +15,12 @@
 - C API: `reflop_fetch` with `buf == NULL` (a size query) answers from the
   handle's known size, without downloading the tensor (114 ms for 64 MiB
   before, on a local connection).
+- The worker refuses an `_embedding_bag_backward` whose offsets have one
+  entry more than the bags (the `include_last_offset` layout) but whose last
+  offset is less than the number of indices. The CPU kernel read past the
+  end of `grad` for it. `nn.EmbeddingBag` training sends the last offset
+  equal to the number of indices and is not affected.
+- The parity tests generate the same inputs in every run.
 - Threads can share a reFLOP device. Each session records and runs one
   operation at a time, so a thread that flushes (for example `.item()`)
   while another records no longer crashes with `IndexError`.

@@ -57,8 +57,17 @@ func unpairServer(t *testing.T) (*Server, *syncBuf, string) {
 func dialPipe(t *testing.T, s *Server) (*wire.Writer, *wire.Reader, []byte, chan struct{}) {
 	t.Helper()
 	client, srvSide := net.Pipe()
-	t.Cleanup(func() { client.Close() })
 	done := make(chan struct{})
+	// Wait for the connection to end: it writes its audit record on the way
+	// out, which must happen before the test's temporary directory goes.
+	t.Cleanup(func() {
+		client.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("the connection did not end after its client closed")
+		}
+	})
 	go func() {
 		s.handleConn(srvSide, "tls", "10.0.0.2:1", "", nil)
 		close(done)

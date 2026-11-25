@@ -1871,3 +1871,35 @@ Quotas stored the old way stay until the Owner clears them; `quota show`
 points them out. `revoke`, `users delete` and `unpair` still take the full
 selector: they already fail loudly ("no identity named") instead of doing
 nothing.
+## ADR-056: Embedding bag backward checks the last offset
+
+**Context.** With an empty `offset2bag`, `_embedding_bag_backward` rebuilds
+each index's bag from `offsets` (ADR-042). The runtime check accepted
+offsets with one entry per bag or one more, starting at 0, non-decreasing
+and at most the number of indices. With one more (the `include_last_offset`
+layout), a last offset below the number of indices puts the indices after
+it in a bag that `grad` does not have, and PyTorch's CPU kernel reads past
+`grad`'s end: values from other memory reach the output, and a large enough
+count crashes the worker. The parity test found it on CI only by chance:
+`parity._retensor` seeded its generator with `hash()` of a string, which
+Python salts per process, so each run checked different offsets, and the
+values read past `grad` matched the reference in most processes.
+
+**Decision.** `embedding_bag_backward_runtime` treats offsets with one
+entry more than `grad`'s bags as `include_last_offset`: the last must equal
+the number of indices, as the forward's check already requires.
+`_retensor` seeds with `zlib.crc32` of the shape and dtype, so every run
+generates the same inputs. `tests/security/corpus/test_kernel_bounds.py`
+has the refused call and what autograd passes after an
+`include_last_offset` forward.
+
+**Alternatives.** Requiring exactly one offset per bag: the backward of an
+`include_last_offset` forward passes one more. Rebuilding `offset2bag` in
+the worker before the kernel runs: it would duplicate PyTorch's logic,
+where checking the input it reads keeps the kernel's own.
+
+**Consequences.** No legitimate call changes: autograd passes the forward's
+offsets, whose last entry the forward's check already pins to the number
+of indices. The parity test now checks the same cases in every run; a
+mutation whose values a seed never draws stays unchecked until a seed
+does.
