@@ -1809,3 +1809,32 @@ and from module backward hooks (which use them) still abort, as does a local
 CUDA backward next to reFLOP: once a PrivateUse1 backend is registered,
 PyTorch treats it as the accelerator, and `Node::stream()` then ignores CUDA.
 Both need changes in PyTorch.
+
+## ADR-054: The upload quota covers every byte a Guest sends
+
+**Context.** `reflopd quota set <guest> --upload-bandwidth` throttled only
+dataset chunks (`PackChunk`). Tensor uploads, tensors sent inline with an
+`Execute`, and graph registrations (whose constants carry data) were not
+limited, so a Guest who uploads a batch every step, the normal way to train,
+was not limited at all ([#17](https://github.com/reflopai/reflop/issues/17)).
+The Owner guide and the limit advertised to the Guest
+(`Limits.quota_upload_bytes_per_sec`) both read as covering every upload.
+
+**Decision.** `clientConn.loop` charges every frame it reads from an
+authenticated connection, length prefix included, to the identity's token
+bucket, before the message is handled. One bucket per identity is shared by
+its connections. The bucket sleeps the reading goroutine, so the connection
+stops reading and TCP slows the sender; responses keep flowing, since the
+worker's answers are written from another goroutine. The `PackChunk`
+throttle is gone (it would count dataset bytes twice).
+
+**Alternatives.** Throttling only the tensor data paths (dataset chunks,
+`UploadTensor`, inline bindings): graphs and future message types would
+stay outside the limit. Renaming the flag to `--dataset-upload-bandwidth`:
+per-step uploads would stay unlimited.
+
+**Consequences.** A limited Guest's training runs at most at the quota's
+rate for the bytes each step uploads, and a request behind a large upload
+waits for it, as dataset chunks already did. The Guest client has no read or
+ping timeout that this can trip. Pre-authentication frames are not charged:
+they are capped at a few KiB and have no identity yet.

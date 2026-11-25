@@ -657,7 +657,7 @@ usage among themselves. Only the values you pass change.
 	set.Flags().StringVar(&wallMS, "execute-wall-ms", "", "wall-clock limit per execute, kills the worker (or unlimited)")
 	set.Flags().StringVar(&flops, "execute-flops", "", "estimated FLOPs per execute (or unlimited)")
 	set.Flags().StringVar(&storage, "storage", "", "dataset storage (or unlimited)")
-	set.Flags().StringVar(&bw, "upload-bandwidth", "", "dataset upload bandwidth per second (or unlimited)")
+	set.Flags().StringVar(&bw, "upload-bandwidth", "", "bytes per second the Guest may send: tensors, datasets, graphs (or unlimited)")
 	set.Flags().StringVar(&setGPU, "gpu", "", "physical GPU index or UUID")
 	clear := &cobra.Command{
 		Use:   "clear <name>",

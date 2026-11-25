@@ -263,6 +263,17 @@ A quota of 0 is rejected: an unset quota means no limit, so 0 would read as
 quota counts uploads still in progress as well as stored datasets, and an
 upload with no progress for 7 days is deleted.
 
+`--upload-bandwidth` limits every byte the Guest sends, on all of their
+connections together: tensors moved to the device, datasets, graphs and
+requests. Training that uploads a batch every step runs no faster than the
+batch size divided by this rate. In reFLOP 0.3.0 and earlier it limited
+dataset uploads only.
+
+A Guest paired with one GPU (`reflopd invite --gpu`, as every invite since
+0.2.10 is) has an identity per GPU. Name the GPU when you set their quotas
+(`reflopd quota set alice --gpu 0 ...`); `reflopd quota show` lists the
+identity each quota applies to.
+
 ## Controls while Guests train
 
 ```sh

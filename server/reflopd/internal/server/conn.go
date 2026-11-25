@@ -43,6 +43,7 @@ type clientConn struct {
 	bytesDown atomic.Uint64
 	eventsRID atomic.Uint64
 	account   atomic.Pointer[string] // identity name, readable from other goroutines
+	lastFrame int                    // bytes of the last frame read, with its length prefix
 }
 
 // handleConn serves one connection. adm (from admit) is released by the
@@ -103,6 +104,7 @@ func (c *clientConn) read(timeout time.Duration) (*pb.Envelope, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.lastFrame = len(b) + frameHeaderBytes
 	env := &pb.Envelope{}
 	if err := wire.Unmarshal(b, env); err != nil {
 		return nil, fmt.Errorf("%w: %v", errDecode, err)
@@ -114,6 +116,9 @@ func (c *clientConn) read(timeout time.Duration) (*pb.Envelope, error) {
 }
 
 var errDecode = errors.New("malformed message")
+
+// frameHeaderBytes is the length prefix of every frame (pkg/wire).
+const frameHeaderBytes = 4
 
 // handshake: Hello → HelloResponse → (Pair →) Authenticate → AuthResult.
 func (c *clientConn) handshake() error {
@@ -238,6 +243,13 @@ func (c *clientConn) loop() {
 		if !c.srv.ids.IsActive(c.identity.ID) {
 			c.sendErr(env.RequestId, pb.ErrorCode_ERROR_UNAUTHENTICATED, revokedMessage)
 			return
+		}
+		// The upload-bandwidth quota covers every byte the Guest sends
+		// (GH#17): datasets, tensor uploads, inline tensors, graphs and
+		// control messages, on all of the identity's connections. Not
+		// reading meanwhile makes TCP slow the sender down.
+		if q := c.srv.quota(c.identity.Name); q.UploadBytesPerSec > 0 {
+			c.srv.throttle(c.identity.ID, uint64(c.lastFrame), uint64(q.UploadBytesPerSec))
 		}
 		if err := c.route(env); err != nil {
 			if !errors.Is(err, errUnpaired) {

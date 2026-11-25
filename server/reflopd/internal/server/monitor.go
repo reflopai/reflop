@@ -217,7 +217,9 @@ func (s *Server) foreignGPUProcesses() bool {
 	return false
 }
 
-// bucket is a simple token bucket for the optional upload-bandwidth quota.
+// bucket is a simple token bucket for the optional upload-bandwidth quota,
+// one per identity, shared by its connections. throttle charges n bytes and
+// sleeps until the identity is back under its rate.
 type bucket struct {
 	mu   sync.Mutex
 	last time.Time

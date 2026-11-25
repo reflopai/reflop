@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -132,6 +133,104 @@ type conn struct {
 	caps   *pb.ServerCapabilities
 	device *pb.Device
 	chunk  int
+
+	// Byte sizes of the handles this connection made (uploads and graph
+	// outputs), so a size-only reflop_fetch needs no request, and of each
+	// registered graph's declared outputs. The server checks declared
+	// output metas, so a graph's outputs have these sizes.
+	sizesMu  sync.Mutex
+	sizes    map[[16]byte]uint64
+	outSizes map[[32]byte][]uint64
+}
+
+func (c *conn) setSize(h [16]byte, n uint64) {
+	c.sizesMu.Lock()
+	defer c.sizesMu.Unlock()
+	if c.sizes == nil {
+		c.sizes = map[[16]byte]uint64{}
+	}
+	c.sizes[h] = n
+}
+
+// size is a handle's byte size if this connection knows it.
+func (c *conn) size(h []byte) (uint64, bool) {
+	if len(h) != 16 {
+		return 0, false
+	}
+	c.sizesMu.Lock()
+	defer c.sizesMu.Unlock()
+	n, ok := c.sizes[[16]byte(h)]
+	return n, ok
+}
+
+// register registers a graph and remembers its declared output sizes.
+func (c *conn) register(g *pb.Graph) ([]byte, error) {
+	var sizes []uint64
+	for _, m := range g.OutputMeta {
+		n, err := tensorBytes(m)
+		if err != nil {
+			sizes = nil // unknown: size queries ask the server
+			break
+		}
+		sizes = append(sizes, n)
+	}
+	r, err := c.call(&pb.Envelope{Body: &pb.Envelope_RegisterGraph{RegisterGraph: &pb.RegisterGraph{Graph: g}}})
+	if err != nil {
+		return nil, err
+	}
+	h := r.GetGraphRegistered().GetGraphHash()
+	if len(h) == 32 {
+		c.sizesMu.Lock()
+		if c.outSizes == nil {
+			c.outSizes = map[[32]byte][]uint64{}
+		}
+		if sizes != nil {
+			c.outSizes[[32]byte(h)] = sizes
+		} else {
+			delete(c.outSizes, [32]byte(h))
+		}
+		c.sizesMu.Unlock()
+	}
+	return h, nil
+}
+
+// execute runs a registered graph on input handles and stores its outputs
+// in nOut new handles.
+func (c *conn) execute(graphHash []byte, inputs [][]byte, nOut int) ([][16]byte, error) {
+	ex := &pb.Execute{GraphHash: graphHash}
+	for _, h := range inputs {
+		ex.Bindings = append(ex.Bindings, &pb.Binding{Value: &pb.Binding_Handle{Handle: h}})
+	}
+	out := make([][16]byte, nOut)
+	for i := range out {
+		out[i] = c.newHandle()
+		ex.Outputs = append(ex.Outputs, &pb.OutputSpec{Kind: pb.OutputSpec_KIND_STORE, Handle: out[i][:]})
+	}
+	if _, err := c.call(&pb.Envelope{Body: &pb.Envelope_Execute{Execute: ex}}); err != nil {
+		return nil, err
+	}
+	if len(graphHash) == 32 {
+		c.sizesMu.Lock()
+		sizes := c.outSizes[[32]byte(graphHash)]
+		c.sizesMu.Unlock()
+		if len(sizes) == nOut {
+			for i, h := range out {
+				c.setSize(h, sizes[i])
+			}
+		}
+	}
+	return out, nil
+}
+
+// free frees a handle on the server and forgets its size.
+func (c *conn) free(h []byte) error {
+	if len(h) == 16 {
+		c.sizesMu.Lock()
+		delete(c.sizes, [16]byte(h))
+		c.sizesMu.Unlock()
+	}
+	_, err := c.call(&pb.Envelope{Body: &pb.Envelope_Free{Free: &pb.Free{Handles: [][]byte{h}}}})
+	return err
 }
 
 type pipeRW struct {
@@ -465,6 +564,7 @@ func (c *conn) upload(meta *pb.TensorMeta, data []byte) ([16]byte, error) {
 		if e := r.GetError(); e != nil {
 			return h, fmt.Errorf("[%s] %s", e.Code.String(), sanitize(e.Message))
 		}
+		c.setSize(h, uint64(len(data)))
 		return h, nil
 	}
 }

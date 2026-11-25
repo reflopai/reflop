@@ -203,6 +203,14 @@ func reflop_fetch(s C.reflop_session, h C.reflop_handle, buf unsafe.Pointer, cap
 	if buf == nil && capacity > 0 {
 		return fail(errors.New("buf is NULL but cap is not 0"))
 	}
+	if buf == nil {
+		// Size query: known for every handle this session made, without a
+		// request (a fetch would download the whole tensor).
+		if n, known := c.size(handle(h)); known {
+			*nbytes = C.size_t(n)
+			return ok()
+		}
+	}
 	data, err := c.fetch(handle(h))
 	if err != nil {
 		return fail(err)
@@ -227,7 +235,7 @@ func reflop_free(s C.reflop_session, h C.reflop_handle) C.int {
 	if !found {
 		return fail(errBad("session"))
 	}
-	if _, err := c.call(&pb.Envelope{Body: &pb.Envelope_Free{Free: &pb.Free{Handles: [][]byte{handle(h)}}}}); err != nil {
+	if err := c.free(handle(h)); err != nil {
 		return fail(err)
 	}
 	return ok()
@@ -395,11 +403,13 @@ func reflop_register(s C.reflop_session, g C.reflop_graph, out *C.reflop_graph_i
 			}
 		}
 	}
-	r, err := c.call(&pb.Envelope{Body: &pb.Envelope_RegisterGraph{RegisterGraph: &pb.RegisterGraph{Graph: gr}}})
+	h, err := c.register(gr)
 	if err != nil {
 		return fail(err)
 	}
-	h := r.GetGraphRegistered().GetGraphHash()
+	if len(h) != 32 {
+		return fail(errors.New("the server sent a graph hash of the wrong length"))
+	}
 	C.memcpy(unsafe.Pointer(&out.bytes[0]), unsafe.Pointer(&h[0]), 32)
 	return ok()
 }
@@ -414,17 +424,13 @@ func reflop_execute(s C.reflop_session, id C.reflop_graph_id, inputs *C.reflop_h
 	if nIn < 0 || nOut < 0 || (nIn > 0 && inputs == nil) || (nOut > 0 && outputs == nil) {
 		return fail(errors.New("invalid input or output array"))
 	}
-	ex := &pb.Execute{GraphHash: C.GoBytes(unsafe.Pointer(&id.bytes[0]), 32)}
+	var in [][]byte
 	for _, h := range unsafe.Slice(inputs, int(nIn)) {
-		ex.Bindings = append(ex.Bindings, &pb.Binding{Value: &pb.Binding_Handle{Handle: handle(h)}})
+		in = append(in, handle(h))
 	}
 	outs := unsafe.Slice(outputs, int(nOut))
-	newH := make([][16]byte, nOut)
-	for i := range outs {
-		newH[i] = c.newHandle()
-		ex.Outputs = append(ex.Outputs, &pb.OutputSpec{Kind: pb.OutputSpec_KIND_STORE, Handle: newH[i][:]})
-	}
-	if _, err := c.call(&pb.Envelope{Body: &pb.Envelope_Execute{Execute: ex}}); err != nil {
+	newH, err := c.execute(C.GoBytes(unsafe.Pointer(&id.bytes[0]), 32), in, int(nOut))
+	if err != nil {
 		return fail(err)
 	}
 	for i := range outs {

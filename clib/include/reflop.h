@@ -54,7 +54,8 @@ int reflop_close(reflop_session s);
 int reflop_upload(reflop_session s, reflop_dtype dtype, int ndim, const int64_t *shape, const void *data,
                   size_t nbytes, reflop_handle *out);
 /* *nbytes (required) receives the tensor size. With buf == NULL and cap == 0
- * only the size is returned. If the tensor does not fit in cap bytes,
+ * only the size is returned, without a request for handles this session
+ * made (uploads and graph outputs). If the tensor does not fit in cap bytes,
  * nothing is copied and REFLOP_ERANGE is returned. */
 int reflop_fetch(reflop_session s, reflop_handle h, void *buf, size_t cap, size_t *nbytes);
 int reflop_free(reflop_session s, reflop_handle h);
