@@ -160,3 +160,70 @@ def test_capture_does_not_replay_stale_uploads(devs):
     with pytest.warns(RuntimeWarning, match="modifies a CPU argument in place"):
         for i in range(5):
             assert s(torch.full((4,), float(i + 1))).item() == 40.0 * (i + 1)
+
+
+@pytest.mark.parametrize("clip", ["norm", "value"])
+def test_gradient_clipping_on_a_model_outside_session_0(devs, clip):
+    # Every reflop tensor is reflop:0 to C++, so clip_grad_norm_'s
+    # clip_coef.to(device) moves the coefficient to session 0; the 0-dim
+    # coefficient then joins the gradients' session (#4, bench B4).
+    _, d1 = devs
+    g = torch.Generator().manual_seed(0)
+    x, y = torch.randn(16, 8, generator=g), torch.randint(0, 3, (16,), generator=g)
+    runs = []
+    for dev in (None, d1):
+        torch.manual_seed(0)
+        m = nn.Sequential(nn.Linear(8, 16), nn.ReLU(), nn.Linear(16, 3))
+        m = m if dev is None else m.to(dev)
+        o = torch.optim.SGD(m.parameters(), 0.5)
+        run = []
+        for _ in range(3):
+            loss = F.cross_entropy(m(x if dev is None else x.to(dev)), y if dev is None else y.to(dev))
+            o.zero_grad()
+            loss.backward()
+            if clip == "norm":
+                run.append(float(torch.nn.utils.clip_grad_norm_(m.parameters(), 0.05)))
+            else:
+                torch.nn.utils.clip_grad_value_(m.parameters(), 0.01)
+            o.step()
+            run.append(loss.item())
+        if dev is not None:
+            assert {sess(p) for p in m.parameters()} == {1}
+            assert {sess(p.grad) for p in m.parameters()} == {1}
+        runs.append((run, [p.detach().cpu() for p in m.parameters()]))
+    (want, wp), (got, gp) = runs
+    assert got == pytest.approx(want, rel=1e-5)
+    for a, b in zip(gp, wp, strict=True):
+        assert torch.allclose(a, b, atol=1e-6)
+
+
+def test_0dim_tensors_join_ops_in_another_session(devs):
+    d0, d1 = devs
+    a = torch.tensor([1.0, -2.0, 3.0]).to(d1).requires_grad_()
+    s = torch.tensor(2.0).to(d0)
+    for out, want in ((a * s, [2.0, -4.0, 6.0]), (torch.where(a > s, a, s), [2.0, 2.0, 3.0]),
+                      (torch.clamp(a, max=s), [1.0, -2.0, 2.0])):
+        assert sess(out) == 1 and out.cpu().tolist() == want
+    (a * s).sum().backward()
+    assert sess(a.grad) == 1 and a.grad.cpu().tolist() == [2.0, 2.0, 2.0]
+    assert sess(s) == 0 and s.cpu().item() == 2.0
+    with torch.no_grad():
+        a.mul_(s)  # a write to the larger tensor's session
+    assert sess(a) == 1 and a.cpu().tolist() == [2.0, -4.0, 6.0]
+
+
+def test_cross_session_ops_that_cannot_move_a_0dim_tensor_still_raise(devs):
+    d0, d1 = devs
+    a = torch.ones(3).to(d1)
+    s1, s0 = torch.tensor(1.0).to(d1), torch.tensor(5.0).to(d0)
+    with pytest.raises(RuntimeError, match="different server sessions"):
+        a + torch.ones(3).to(d0)  # neither is 0-dim
+    with pytest.raises(RuntimeError, match="different server sessions"):
+        s1 + s0  # no session holds the larger tensors
+    with pytest.raises(RuntimeError, match="different server sessions"):
+        torch.sum(a, 0, out=s0)  # the write would go to a copy
+    assert s0.cpu().item() == 5.0
+    # Its gradient would come back in the other session (and through
+    # backward ops that mix sessions, abort the Guest: #27).
+    with pytest.raises(RuntimeError, match="different server sessions"):
+        a * torch.tensor(2.0).to(d0).requires_grad_()

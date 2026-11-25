@@ -457,7 +457,14 @@ b = (a @ a).to(gpu)                    # moving between sessions goes through yo
 `t.to(other.device)`, `t.to(other)` and `model.to(cpu)` follow the session.
 (PyTorch's autograd internally sees a single device.) Moves between sessions are differentiable. An
 operation mixing tensors from two sessions raises an error asking you to move
-one.
+one. The exception is a 0-dim tensor, which joins the session of the other
+tensors as a 0-dim CPU tensor joins a CUDA operation (this costs a round trip),
+so `torch.nn.utils.clip_grad_norm_` works on a model in any session. A 0-dim
+tensor that needs a gradient, or that the operation writes to, is not moved,
+and the operation raises.
+
+Threads can share a session: it runs their operations one at a time, in the
+order they reach it.
 
 Opening a new session explicitly makes it the default for calls such as
 `reflop.load(name)`. A CPU session opened automatically by
