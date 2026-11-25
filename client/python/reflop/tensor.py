@@ -342,9 +342,9 @@ _UNCACHED_FLAGS = None
 def _sig(x):
     if isinstance(x, RemoteTensor):
         m = x._rf_meta
-        return ("T", m.dtype, tuple(m.shape), m.stride(), m.storage_offset())
+        return ("T", m.dtype, tuple(m.shape), m.stride(), m.storage_offset(), m.is_conj(), m.is_neg())
     if isinstance(x, torch.Tensor):
-        return ("C", x.dtype, tuple(x.shape), x.stride(), x.device.type)
+        return ("C", x.dtype, tuple(x.shape), x.stride(), x.storage_offset(), x.is_conj(), x.is_neg(), x.device.type)
     if isinstance(x, float):
         return ("f",)
     if isinstance(x, (list, tuple)):
@@ -354,6 +354,24 @@ def _sig(x):
     if isinstance(x, (int, bool, str, type(None), torch.dtype, torch.memory_format, torch.layout, complex)):
         return (type(x).__name__, x)
     raise TypeError  # unknown: do not cache
+
+
+def _restore_meta(sh, st, dt, offset=0, is_conj=False, is_neg=False):
+    if offset == 0 and all(s >= 0 for s in st):
+        res = torch.empty_strided(sh, st, dtype=dt, device="meta")
+    else:
+        max_idx = offset
+        for d, s in zip(sh, st):
+            if d > 0 and s > 0:
+                max_idx += (d - 1) * s
+        size = max(max_idx + 1, 1)
+        base = torch.empty_strided((size,), (1,), dtype=dt, device="meta")
+        res = base.as_strided(sh, st, offset)
+    if is_conj:
+        res = torch.conj(res)
+    if is_neg:
+        res = torch._neg_view(res)
+    return res
 
 
 def meta_cached(func, args, kwargs, cuda: bool = False):
@@ -370,12 +388,13 @@ def meta_cached(func, args, kwargs, cuda: bool = False):
     hit = _META_CACHE.get(key)
     if hit is not None:
         spec, leaves = hit
-        return tree_unflatten([torch.empty_strided(sh, st, dtype=dt, device="meta") if sh is not None else v
-                               for sh, st, dt, v in leaves], spec)
+        return tree_unflatten([_restore_meta(sh, st, dt, off, is_conj, is_neg) if sh is not None else v
+                               for sh, st, dt, off, is_conj, is_neg, v in leaves], spec)
     out = device_meta(func, args, kwargs, cuda)
     flat, spec = tree_flatten(out)
-    leaves = [(tuple(t.shape), t.stride(), t.dtype, None) if isinstance(t, torch.Tensor) else (None, None, None, t)
-              for t in flat]
+    leaves = [(tuple(t.shape), t.stride(), t.dtype, t.storage_offset(), t.is_conj(), t.is_neg(), None)
+              if isinstance(t, torch.Tensor)
+              else (None, None, None, None, False, False, t) for t in flat]
     if len(_META_CACHE) < _META_CACHE_MAX:
         _META_CACHE[key] = (spec, leaves)
     return out
