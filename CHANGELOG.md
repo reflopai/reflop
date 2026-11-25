@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 (2026-11-25)
+
+Fixes for the Python client, the daemon's quotas and the worker. Update the
+client and the daemon; they work with each other's previous versions.
+Owners who set quotas without `--gpu` since 0.2.10: run `reflopd quota
+show` after updating (see the quota entry below).
 
 - The `--upload-bandwidth` quota limits every byte a Guest sends (tensor
   uploads, tensors sent with a graph, datasets, graphs), on all of the
