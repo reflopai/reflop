@@ -158,13 +158,21 @@ class Session:
         self.registered: set[bytes] = set()
         self.storages: weakref.WeakValueDictionary = weakref.WeakValueDictionary()  # handle → Storage
         self.checkpoints = None  # checkpoints.AutoCheckpoint when the Guest turned them on
+        # Handles to free on the server. Storage.__del__ appends to it from
+        # whichever thread runs the GC, without the lock; _send_frees only
+        # removes from the front, so an append is never lost.
         self.pending_free: list[bytes] = []
+        self._sending_frees = False
         self.upload_log: list | None = None  # set by reflop.capture while it records a step
         self.async_error: BaseException | None = None
         self.async_what = ""  # the request kind async_error came from (see _ASYNC_WHAT)
         self.inflight: list = []
         self.depth = 0
         self.epoch = 0  # increments at every flush (invalidates cached view replays)
+        # Held for every op (tensor.dispatch) and every flush, upload and fetch:
+        # threads that share a session record and flush one at a time, so an
+        # op's values and the trace it appends to come from one trace (#6).
+        # Taken for several sessions at once only through tensor._locked.
         self.lock = threading.RLock()
         self._prefix = secrets.token_bytes(8)
         self._ctr = 0
@@ -239,11 +247,12 @@ class Session:
     def upload_value(self, t: torch.Tensor, source: torch.Tensor | None = None) -> Value:
         """Upload a CPU tensor. `source` is the tensor the program moved (before
         any dtype cast); reflop.capture uses it to rebind per-step uploads."""
-        h = self.new_handle()
-        self._upload(h, t)
-        if self.upload_log is not None and source is not None:
-            self.upload_log.append((h, source, (source._version, tuple(source.shape), source.stride(),
-                                                source.dtype), t.dtype))
+        with self.lock:
+            h = self.new_handle()
+            self._upload(h, t)
+            if self.upload_log is not None and source is not None:
+                self.upload_log.append((h, source, (source._version, tuple(source.shape), source.stride(),
+                                                    source.dtype), t.dtype))
         return Value(HANDLE, t.to("meta") if t.dim() else torch.empty((), dtype=t.dtype, device="meta"), handle=h)
 
     def upload_tensor(self, t: torch.Tensor, source: torch.Tensor | None = None):
@@ -260,14 +269,29 @@ class Session:
         self._track(fut, "upload")
 
     def release(self, h: bytes) -> None:
+        # Storage.__del__ runs on whichever thread triggers the GC, possibly
+        # while another thread holds the lock and waits for the GIL: never
+        # wait for the lock here.
         self.pending_free.append(h)
-        if len(self.pending_free) >= 4096 and self.depth == 0 and len(self.trace) == 0:
-            self._send_frees()
+        if len(self.pending_free) >= 4096 and self.lock.acquire(blocking=False):
+            try:
+                if self.depth == 0 and len(self.trace) == 0:
+                    self._send_frees()
+            finally:
+                self.lock.release()
 
     def _send_frees(self) -> None:
-        if self.pending_free:
-            hs, self.pending_free = self.pending_free, []
+        """Send pending frees. The caller holds the lock."""
+        if self._sending_frees or not self.pending_free:
+            return  # a GC inside this call released more: the next call sends them
+        self._sending_frees = True
+        try:
+            n = len(self.pending_free)
+            hs = self.pending_free[:n]
+            del self.pending_free[:n]  # keeps what other threads appended meanwhile
             self._track(self.conn.request(cpb.Envelope(free=cpb.Free(handles=hs))), "free")
+        finally:
+            self._sending_frees = False
 
     # -------------------------------------------------------------- async errors
 
@@ -347,6 +371,7 @@ class Session:
     # -------------------------------------------------------------- flush
 
     def maybe_flush(self) -> None:
+        """Flush a long trace between ops. The caller holds the lock."""
         if self.depth == 0 and len(self.trace) >= FLUSH_NODES:
             self.flush()
 
@@ -544,6 +569,10 @@ class Session:
     # -------------------------------------------------------------- fetch
 
     def fetch_handles(self, handles: list[bytes]) -> list[torch.Tensor]:
+        with self.lock:
+            return self._fetch_handles(handles)
+
+    def _fetch_handles(self, handles: list[bytes]) -> list[torch.Tensor]:
         frames = self.conn.request_stream(cpb.Envelope(fetch=cpb.Fetch(handles=handles))).result()
         # Executes are sent without waiting. One that failed left the handles it
         # would have rebound with their old contents, so this data may be
@@ -575,8 +604,9 @@ class Session:
     def set_seed(self, n: int) -> None:
         _seeding.active, prev = True, getattr(_seeding, "active", False)
         try:
-            self.flush()
-            self.conn.reseed(n)
+            with self.lock:
+                self.flush()
+                self.conn.reseed(n)
         finally:
             _seeding.active = prev
 

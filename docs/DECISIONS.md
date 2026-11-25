@@ -1697,3 +1697,60 @@ version could let the server pick the attention backend for an
 ran the math kernel, and LSTM and GRU layers already ran as cells. The math
 kernel is slower and uses more memory for long sequences. A C API program
 that sent these ops gets a V2 error.
+
+## ADR-052: One lock per client session; 0-dim tensors cross sessions
+
+**Context.** The client's session state (the trace, its `depth`, the set of
+written tensors) had no lock while ops were recorded: `sess.lock` was taken
+only in `flush` and `synchronize`. When one thread flushed and replaced the
+trace while another appended nodes, the second thread's node indexes pointed
+into the trace that had been sent, and `GraphBuilder` raised `IndexError`
+(bench B6). Separately, every reflop tensor is `reflop:0` to C++, so
+`clip_grad_norm_`'s `clip_coef.to(device)` moved the coefficient to session
+0, and the next `mul_` mixed sessions with a model in any other session
+(bench B4). And `torch.linalg.inv`, `solve` and `cholesky` call
+`aten._linalg_check_errors`, which is not in the opset (bench B11).
+
+**Decision.**
+- `tensor.dispatch` holds `sess.lock` (reentrant) for each op, and so do the
+  factory kernels, `_copy_from`, uploads, fetches, reseeding, checkpoint
+  cuts and captured replays. The lock is never held across `.backward()`:
+  PyTorch runs this device's backward on its own thread while the caller
+  waits. `Storage.__del__` can run on any thread during GC, so a release
+  only appends to `pending_free` and sends frees only if it gets the lock
+  without waiting. `_send_frees` takes entries from the front of the list,
+  so an append made meanwhile is kept.
+- An op that needs two sessions' locks (a move between sessions, or the
+  0-dim case below) takes them through `tensor._locked`, in device index
+  order, at the start of the op. Two threads moving in opposite directions
+  cannot deadlock.
+- When an op mixes sessions and every tensor from the other sessions is
+  0-dim, those tensors are copied (fetch, upload) into the session of the
+  larger tensors, as PyTorch lets a 0-dim CPU tensor join a CUDA op. This
+  happens in `__torch_dispatch__`, below autograd, which has already
+  recorded the op on the original tensors. The gradient of a moved tensor
+  would therefore come back in the target session, and a later backward op
+  that combined it with that tensor's own history would mix sessions in
+  backward, which aborts the Guest ([#48](https://github.com/reflopai/reflop/issues/48)). So a 0-dim tensor that needs a
+  gradient (grad mode on and `requires_grad`) is not moved, and neither is
+  one the op writes to or returns a view of. Those ops raise as before.
+- `aten._linalg_check_errors` is a client special: it fetches `info` (one
+  sync, as PyTorch does on CUDA) and runs PyTorch's own check on the client.
+
+**Alternatives.** Raising when a second thread uses a session, and
+per-thread traces merged at flush (which breaks the one ordered trace per
+session). For the 0-dim case: special-casing `clip_grad_norm_` (other
+utilities use the same `.to("reflop:0")` pattern), and real C++ device
+indexes per session (autograd relies on one device). Moving the tensor with
+the differentiable `_move_session` above autograd, in `__torch_function__`,
+would send gradients back to their session, but C++ composites never pass
+through `__torch_function__`, and an op that writes to the moved tensor is
+hard to recognize there. That can follow the backward work in [#48](https://github.com/reflopai/reflop/issues/48).
+
+**Consequences.** Threads that share a session run their client-side work
+one op at a time; the server ran them in order anyway. An uncontended lock
+per op costs about 1% of client time for small ops, and ResNet-18 eager
+steps on the in-process worker did not change measurably. Each 0-dim move
+costs a fetch and an upload; `clip_grad_norm_` makes two per step outside
+session 0. A learnable 0-dim parameter used with tensors from another
+session still needs an explicit `.to()`.

@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Threads can share a reFLOP device. Each session records and runs one
+  operation at a time, so a thread that flushes (for example `.item()`)
+  while another records no longer crashes with `IndexError`.
+- `torch.linalg.inv`, `solve` and `cholesky` (and `Tensor.inverse`) run on
+  the server. The client fetches the small `info` tensor and raises
+  PyTorch's own `LinAlgError` for a singular or non-positive-definite
+  matrix. They used to be refused, or to run on your machine under the
+  default placement.
+- A 0-dim tensor from another session joins an operation the way a 0-dim
+  CPU tensor joins one on CUDA, so `clip_grad_norm_` works on a model that
+  is not in session 0. A 0-dim tensor that needs a gradient, or that the
+  operation writes to, still raises the "different server sessions" error.
+
 ## 0.3.0 (2026-11-25)
 
 The worker checks more of what a Guest sends (ADR-049 to ADR-051). Update

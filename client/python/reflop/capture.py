@@ -131,10 +131,12 @@ class Captured:
         hs = []
         for a in _arg_tensors(args):
             if isinstance(a, RemoteTensor):
-                v = value_of(a)
-                if v.kind != HANDLE:
-                    a._rf_storage.session.flush()
+                sess = a._rf_storage.session
+                with sess.lock:
                     v = value_of(a)
+                    if v.kind != HANDLE:
+                        sess.flush()
+                        v = value_of(a)
                 hs.append(("handle", v.handle))
             else:
                 hs.append(("cpu", None))
@@ -286,6 +288,10 @@ class Captured:
         return out
 
     def _replay(self, sess, args):
+        with sess.lock:
+            return self._replay_locked(sess, args)
+
+    def _replay_locked(self, sess, args):
         if len(sess.trace):
             sess.flush()
         sess.raise_async()

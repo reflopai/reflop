@@ -83,13 +83,14 @@ class AutoCheckpoint:
         if not self.due(now):
             return
         sess = self.sess
-        sess.flush()  # the cut must see every operation recorded so far
-        sess._send_frees()
-        self.last_try = now
-        try:
-            fut = sess.conn.request(cpb.Envelope(checkpoint=cpb.Checkpoint(tag=self.tag)))
-        except SessionLostError:
-            return  # the program finds out on its next request
+        with sess.lock:
+            sess.flush()  # the cut must see every operation recorded so far
+            sess._send_frees()
+            self.last_try = now
+            try:
+                fut = sess.conn.request(cpb.Envelope(checkpoint=cpb.Checkpoint(tag=self.tag)))
+            except SessionLostError:
+                return  # the program finds out on its next request
         self.inflight = fut
         fut.add_done_callback(self._done)
 
@@ -199,7 +200,7 @@ def _adopt(sess, rec) -> None:
     sess.inflight.clear()
     sess.async_error = None
     sess.epoch += 1
-    sess.pending_free = [h for h in sess.pending_free if h in restored]
+    sess.pending_free[:] = [h for h in sess.pending_free if h in restored]  # the same list: see Session
     alive = set()
     for h, st in list(sess.storages.items()):
         if h in restored and st.handle == h:

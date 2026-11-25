@@ -14,6 +14,7 @@ turned into a functional op plus an inverse "scatter" back into the base.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import itertools
 import threading
@@ -115,17 +116,23 @@ class RemoteTensor(torch.Tensor):
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
         sess = None
+        mixed = False
         for x in itertools.chain(tree_flatten(args)[0], tree_flatten(kwargs)[0]):
             if isinstance(x, RemoteTensor):
                 s = x._rf_storage.session
                 if sess is None:
                     sess = s
-                elif s is not sess and _op_name(func) != "aten._to_copy.default":
-                    raise RuntimeError(
-                        f"{func}: these reflop tensors live in different server sessions (device "
-                        f"{sess.device_index} and {s.device_index}); move one with .to(reflop.device(i))")
+                elif s is not sess:
+                    mixed = True
         if sess is None:  # pragma: no cover - torch only calls us with a RemoteTensor
             return func(*args, **kwargs)
+        if func is aten._to_copy.default:
+            target = _copy_target(sess, kwargs.get("device"))
+            if target is not None:
+                with _locked(sess, target):  # the move holds both (see _locked)
+                    return dispatch(sess, func, args, kwargs)
+        elif mixed:
+            return _cross_session(func, args, kwargs)
         return dispatch(sess, func, args, kwargs)
 
     # ---------------------------------------------------------------- python API
@@ -610,16 +617,70 @@ _warned_local: set[str] = set()
 
 
 def dispatch(sess, func, args, kwargs):
-    if sess.depth == 0:
-        sess.maybe_flush()
-    sess.depth += 1
-    prev = getattr(_active, "sess", None)
-    _active.sess = sess
-    try:
-        return _dispatch(sess, func, args, kwargs)
-    finally:
-        sess.depth -= 1
-        _active.sess = prev
+    # One op at a time per session (#6): a flush by another thread between
+    # reading an input's value and recording the op would leave the op
+    # pointing into a trace that was already sent. The lock is reentrant for
+    # nested ops, and never held across .backward(), which PyTorch runs on its
+    # own thread for this device while the calling thread waits.
+    with sess.lock:
+        if sess.depth == 0:
+            sess.maybe_flush()
+        sess.depth += 1
+        prev = getattr(_active, "sess", None)
+        _active.sess = sess
+        try:
+            return _dispatch(sess, func, args, kwargs)
+        finally:
+            sess.depth -= 1
+            _active.sess = prev
+
+
+@contextlib.contextmanager
+def _locked(*sessions):
+    """Hold the locks of several sessions, taken in device index order, so
+    two threads that move tensors between the same two sessions in opposite
+    directions cannot deadlock. A thread takes a second session's lock only
+    here, at the start of an op (__torch_dispatch__) or of a move between
+    sessions; nested ops find their locks already held."""
+    with contextlib.ExitStack() as stack:
+        for s in sorted({id(s): s for s in sessions}.values(), key=lambda s: s.device_index):
+            stack.enter_context(s.lock)
+        yield
+
+
+def _cross_session(func, args, kwargs):
+    """An op on tensors from several sessions. As PyTorch lets a 0-dim CPU
+    tensor join an op on CUDA tensors, 0-dim tensors from other sessions are
+    copied into the one session that holds the larger tensors (a fetch and an
+    upload each). clip_grad_norm_ needs this: every reflop tensor is reflop:0
+    to C++, so its clip_coef.to(device) moves the coefficient to session 0
+    (#4). It runs below autograd, which recorded the op on the original
+    tensors, so the gradient of a moved tensor would come back in the
+    target session and a later backward op could mix sessions there (an
+    error in backward aborts the Guest, #27): a tensor that needs a gradient
+    is not moved. Nor is one the op writes to or returns a view of, since the
+    copy would get the write or the view. Those raise, as before."""
+    tensors = [x for x in tree_flatten((args, kwargs))[0] if isinstance(x, RemoteTensor)]
+    big = {id(x._rf_storage.session): x._rf_storage.session for x in tensors if x.dim() > 0}
+    if len(big) == 1:
+        (target,) = big.values()
+        aliased = set()
+        for a, v in zip(func._schema.arguments, normalize(func, args, kwargs)):
+            if a.alias_info is not None:
+                aliased.update(id(t) for t in tree_flatten(v)[0] if isinstance(t, RemoteTensor))
+        moved = [x for x in tensors if x._rf_storage.session is not target]
+        grad = torch.is_grad_enabled()
+        if not any(id(x) in aliased or (grad and x.requires_grad) for x in moved):
+            with _locked(target, *(x._rf_storage.session for x in moved)):
+                a, kw = tree_map(lambda x: _move_raw(x, target, x.dtype)
+                                 if isinstance(x, RemoteTensor) and x._rf_storage.session is not target else x,
+                                 (args, kwargs))
+                return dispatch(target, func, a, kw)
+    s0 = tensors[0]._rf_storage.session
+    s1 = next(x._rf_storage.session for x in tensors if x._rf_storage.session is not s0)
+    raise RuntimeError(
+        f"{func}: these reflop tensors live in different server sessions (device "
+        f"{s0.device_index} and {s1.device_index}); move one with .to(reflop.device(i))")
 
 
 def _placement_local(sess, func, args, kwargs):
@@ -955,8 +1016,10 @@ def _local_scalar(sess, func, args, kwargs):
 
 
 def _move_raw(x, target, dtype):
-    cpu = x._rf_storage.session.fetch(value_of(x), x._rf_meta)
-    return target.upload_tensor(cpu.to(dtype=dtype))
+    src = x._rf_storage.session
+    with _locked(src, target):
+        cpu = src.fetch(value_of(x), x._rf_meta)
+        return target.upload_tensor(cpu.to(dtype=dtype))
 
 
 class _MoveSession(torch.autograd.Function):
@@ -993,14 +1056,25 @@ def _to_copy(sess, func, args, kwargs):
     if not isinstance(src, RemoteTensor):
         t = src.to(dtype=dtype or src.dtype)
         return _session_for(device).upload_tensor(t, source=src)
-    # reflop:0 here is what C++ reports for every session (autograd's
-    # ToCopyBackward passes it), so it means "stay"; RemoteTensor.to handles
-    # explicit moves between sessions.
-    if device is not None and _target_index(device) != 0:
-        target = _session_for(device)
-        if target is not src._rf_storage.session:
-            return _move_raw(src, target, dtype or src.dtype)
+    target = _copy_target(src._rf_storage.session, device)
+    if target is not None:
+        return _move_raw(src, target, dtype or src.dtype)
     return _functional(sess, func, args, kwargs)
+
+
+def _copy_target(sess, device):
+    """The other session that _to_copy on a tensor in sess moves to, or None.
+    reflop:0 is what C++ reports for every session (autograd's ToCopyBackward
+    passes it), so it means "stay"; RemoteTensor.to handles explicit moves
+    between sessions. Inside an op, other indexes name the op's own session
+    too (_session_for), which placement("remote-cpu") maps to its CPU
+    session."""
+    if device is None or torch.device(device).type != "reflop" or _target_index(device) == 0:
+        return None
+    from . import _placement
+
+    target = _cpu_session(sess) if _placement.mode() == "remote-cpu" else sess
+    return target if target is not sess else None
 
 
 def _copy_(sess, func, args, kwargs):
@@ -1084,6 +1158,18 @@ def _is_nonzero(sess, func, args, kwargs):
 
 def _is_same_size(sess, func, args, kwargs):
     return tuple(args[0].shape) == tuple(args[1].shape)
+
+
+def _linalg_check_errors(sess, func, args, kwargs):
+    """torch.linalg.inv, solve, cholesky, ... run the _ex kernel and then this
+    check, which raises PyTorch's error for a nonzero `info`. It is not in the
+    opset: fetch `info` (one sync, as PyTorch does on CUDA) and run the check
+    on the client (#15)."""
+    info, api_name, is_matrix = normalize(func, args, kwargs)
+    if isinstance(info, RemoteTensor):
+        info = sess.fetch(value_of(info), info._rf_meta)
+    with torch._C._DisableTorchDispatch():
+        return func(info, api_name, is_matrix=is_matrix)
 
 
 def _refuse(msg):
@@ -1179,6 +1265,7 @@ _SPECIALS = {
     "aten.equal.default": _equal,
     "aten.is_nonzero.default": _is_nonzero,
     "aten.is_same_size.default": _is_same_size,
+    "aten._linalg_check_errors.default": _linalg_check_errors,
     "aten.index.Tensor": _index_tensor,
     "aten.index_put.default": _index_put,
     "aten.index_put_.default": _index_put,
@@ -1294,8 +1381,9 @@ def _factory_kernel(op):
         with torch._C._DisableTorchDispatch():
             meta = op(*args, **meta_kw)
         vals = normalize(op, args, kwargs)
-        out = sess.record_values(name, op, vals, [meta])[0]
-        return RemoteTensor(meta, Storage(sess, meta, out))
+        with sess.lock:
+            out = sess.record_values(name, op, vals, [meta])[0]
+            return RemoteTensor(meta, Storage(sess, meta, out))
     return kernel
 
 
@@ -1304,7 +1392,8 @@ def _copy_from(src, dst, non_blocking=False):
     # device=reflop) builds on CPU and copies into an empty remote tensor).
     target = dst if isinstance(dst, RemoteTensor) else src
     sess = target._rf_storage.session
-    _copy_(sess, aten.copy_.default, (dst, src), {})
+    with sess.lock:
+        _copy_(sess, aten.copy_.default, (dst, src), {})
     return dst
 
 
