@@ -53,7 +53,29 @@ func TestGPUInvitesOnOneTLSListener(t *testing.T) {
 		defer close(done)
 		s.acceptTLS(ctx, ln)
 	}()
-	t.Cleanup(func() { cancel(); ln.Close(); <-done })
+	// Cleanups run last first, so the connections' own cleanups below have
+	// closed them by now. acceptTLS returns without waiting for its
+	// connections, and each one writes its "disconnect" audit record on the
+	// way out; wait until all have ended (nconns drops after handleConn
+	// returns), or a late record recreates the audit file while the test's
+	// temporary directory is being removed.
+	t.Cleanup(func() {
+		cancel()
+		ln.Close()
+		<-done
+		for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
+			s.mu.Lock()
+			n := s.nconns
+			s.mu.Unlock()
+			if n == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Errorf("%d connections did not end after their clients closed", n)
+				return
+			}
+		}
+	})
 	cert, err := x509.ParseCertificate(s.key.Cert.Certificate[0])
 	if err != nil {
 		t.Fatal(err)
