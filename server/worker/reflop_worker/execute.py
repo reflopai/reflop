@@ -14,7 +14,7 @@ import time
 import torch
 from torch.utils._pytree import tree_flatten
 
-from . import dtypes, natives, validators
+from . import dtypes, natives, validators, writes
 from ._pb import compute_pb2 as cpb
 from ._pb import graph_pb2 as gpb
 from .errors import FatalError, ReflopError
@@ -279,7 +279,8 @@ class Executor:
                 outs.append((r, m.dtype, tuple(m.shape), r in prog.last_use))
             plans.append((node, node.op.fn, natives.is_native(node.op), args, outs,
                           validators.has_runtime(node.op), bool(node.op.flags & FLAG_UNINIT),
-                          expiring.get(node.index, ()), PRE.get(node.op.name), POST.get(node.op.name)))
+                          expiring.get(node.index, ()), PRE.get(node.op.name), POST.get(node.op.name),
+                          writes.plan(node.op)))
         prog._compiled = plans
         return plans
 
@@ -293,9 +294,10 @@ class Executor:
         t0 = time.perf_counter()
         dev = self.device
         node = None
+        moved: dict = {}  # tensors written by a kernel: their copies (writes.py)
         try:
             with torch.inference_mode():
-                for node, fn, native, args, outs, check, uninit, free, pre, post in plans:
+                for node, fn, native, args, outs, check, uninit, free, pre, post, wplan in plans:
                     pos, kw = [], {}
                     for is_kw, name, kind, val in args:
                         if kind == 0:
@@ -317,6 +319,7 @@ class Executor:
                         validators.check_runtime(node, pos, kw)
                     if pre is not None:
                         pre(node, pos, kw, dev.type == "cuda")
+                    written = writes.copy_written(wplan, pos, kw) if wplan is not None else None
                     out = natives.call(node.op.name, pos, kw, dev) if native else fn(*pos, **kw)
                     if isinstance(out, torch.Tensor):
                         flat = [out]
@@ -339,6 +342,8 @@ class Executor:
                         if uninit:
                             t.zero_()  # never return stale memory (I13)
                         env[r] = t
+                    if written:
+                        writes.adopt(node, written, env, moved, E3)
                     for r in free:
                         env.pop(r, None)
                 # No device sync here: the next execute's Python dispatch overlaps
@@ -361,6 +366,9 @@ class Executor:
         K = cpb.OutputSpec
         from .safetensors import resolved
 
+        # Before the outputs, so that an output stored or rebound to the
+        # same handle replaces the written copy.
+        writes.commit(moved, self.handles)
         for spec, r in zip(ex.outputs, prog.outputs):
             # Handles hold plain values: a conj() or _neg_view() output would
             # keep its lazy bit, and later raw copies (reads, snapshots) drop it.
