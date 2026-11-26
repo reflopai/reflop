@@ -853,7 +853,19 @@ def _dispatch(sess, func, args, kwargs):
     special = _SPECIALS.get(name)
     if special is not None:
         return special(sess, func, args, kwargs)
-    if torch.Tag.inplace_view in func.tags:
+    inplace_view = torch.Tag.inplace_view in func.tags
+    # Decompositions run below autograd, where a CompositeImplicitAutograd op
+    # no longer decomposes by itself: its kernel sits on the autograd and
+    # backend keys, not on the Python key. Such an op called from inside a
+    # decomposition reaches this function (where.ScalarSelf's kernel calls
+    # to.dtype). A functional one falls back as usual, but a view op the
+    # server lacks would join a view chain that no read can materialize, so
+    # decompose it here, as PyTorch would above autograd (GH#56).
+    if (func.is_view or inplace_view) and not sess.op_enabled(name) and hasattr(func, "decompose"):
+        r = func.decompose(*args, **kwargs)
+        if r is not NotImplemented:
+            return r
+    if inplace_view:
         return _inplace_view(sess, func, args, kwargs)
     if func.is_view:
         return _view(sess, func, args, kwargs)
@@ -974,11 +986,23 @@ def _functional(sess, func, args, kwargs):
 def _fallback(sess, func, args, kwargs):
     """Not in the opset: decompose, else run locally, else fail (§11.2 step 2)."""
     name = _op_name(func)
+    from . import _placement as placement
     from .decomp import TABLE as REFLOP_DECOMP
 
+    local_ok = sess.allow_local_fallback and placement.mode() != "remote"
     d = REFLOP_DECOMP.get(func) or _decomp_table().get(func)
     if d is not None:
-        r = d(*args, **kwargs)
+        try:
+            r = d(*args, **kwargs)
+        except UnsupportedOperatorError:
+            # The decomposition reached something the server cannot run and
+            # could not fall back by itself (GH#56). Where fallback is
+            # allowed, run the whole op on the client instead. Only the
+            # client raises this error, so nothing from the server is lost;
+            # values the decomposition recorded are unused and freed.
+            if not local_ok:
+                raise
+            r = NotImplemented
         if r is not NotImplemented:
             return r
     if hasattr(func, "decompose"):
@@ -988,9 +1012,8 @@ def _fallback(sess, func, args, kwargs):
                 return r
         except Exception:  # noqa: BLE001 - not every op can decompose
             pass
-    from . import _placement as placement
 
-    if sess.allow_local_fallback and placement.mode() != "remote":
+    if local_ok:
         if name not in _warned_local:
             _warned_local.add(name)
             warnings.warn(f"reflop: {name} is not supported by the server; running it on the client CPU",

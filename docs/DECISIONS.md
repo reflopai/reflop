@@ -1903,3 +1903,46 @@ offsets, whose last entry the forward's check already pins to the number
 of indices. The parity test now checks the same cases in every run; a
 mutation whose values a seed never draws stays unchecked until a seed
 does.
+
+## ADR-057: Decompositions that reach a missing operator
+
+**Context.** When the server lacks an operator, the client decomposes it
+and, under `"auto"`, runs it on the client if no decomposition exists
+(PLAN §11.2 step 2). Decompositions run inside `__torch_dispatch__`, below
+autograd. A CompositeImplicitAutograd operator has its kernel on the
+autograd and backend dispatch keys but not on the Python key, so one called
+from inside a decomposition reaches `__torch_dispatch__` instead of
+decomposing. With `threshold_backward` disabled, its decomposition calls
+`where.ScalarSelf`, whose kernel calls `to.dtype`. `to.dtype` returns an
+alias, so the client recorded it as a step in a view chain, and the first
+read failed: the server has no `to.dtype`. The exception left `_fallback`,
+so the operation failed under `"auto"` too, though the Guest guide says an
+operation the server cannot run falls back to the client (GH#56).
+
+**Decision.** Two changes in `tensor.py`:
+
+- `_dispatch` decomposes a view or in-place view operator that the session
+  does not enable and that has a CompositeImplicitAutograd kernel
+  (`func.decompose`), as PyTorch would above autograd. Functional operators
+  keep their path through `_fallback`, which tries reFLOP's and PyTorch's
+  Python decompositions first.
+- `_fallback` catches `UnsupportedOperatorError` from a decomposition. Where
+  local fallback is allowed (the session's `allow_local_fallback` and a
+  placement other than `"remote"`), the operation then runs on the client;
+  otherwise the error is raised as before.
+
+**Alternatives.** Decomposing every CompositeImplicitAutograd operator the
+server lacks in `_dispatch`, functional ones included: for 30 of them,
+PyTorch's Python decomposition differs from the C++ kernel (`one_hot`,
+`lstm`, `matmul`, ...) and `_fallback` prefers the Python one, so this would
+change paths that work. Catching every exception from a decomposition: a
+bug in a decomposition or a shape error would be hidden behind a local run.
+Only the second change: `"remote"` would still fail for an operation the
+server can run in decomposed form.
+
+**Consequences.** `UnsupportedOperatorError` is raised only by the client,
+so the catch cannot hide a server error. Values that a failed decomposition
+recorded are never read and are freed with their tensors. A decomposition
+may have drawn from the server's RNG before it failed; the client's run then
+draws from the client's. `"remote"` and sessions opened with
+`allow_local_fallback=False` still raise.

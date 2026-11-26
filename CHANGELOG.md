@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- An operation the server lacks no longer fails when its decomposition uses
+  another operation the server lacks. `threshold_backward` (ReLU's backward), for
+  example, failed with "aten.to.dtype is not available on this server", even
+  under the default `"auto"` placement. A view operation reached from inside a
+  decomposition, such as `to.dtype`, now decomposes on the client, so
+  `threshold_backward` runs on the server, also under `"remote"`. Under
+  `"auto"`, any decomposition that still cannot run on the server runs the
+  whole operation on your CPU, with the usual one-time warning (GH#56).
+
 ## 0.3.1 (2026-11-25)
 
 Fixes for the Python client, the daemon's quotas and the worker. Update the
