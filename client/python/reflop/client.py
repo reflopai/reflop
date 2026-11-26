@@ -538,9 +538,10 @@ def pairing_online(entry: ServerEntry) -> bool:
 
 
 class RemoteConnection(Connection):
-    def __init__(self, entry: ServerEntry, kind: str = "auto", *, key=None) -> None:
+    def __init__(self, entry: ServerEntry, kind: str = "auto", *, key=None, numerics: dict | None = None) -> None:
         super().__init__()
         self.entry = entry
+        self.want_numerics = numerics
         self.key = keys.pairing_key(entry.key_id) if key is None else key
         self.fp = bytes.fromhex(entry.fingerprint)
         self.session_id = b""
@@ -604,13 +605,26 @@ class RemoteConnection(Connection):
         return self.caps
 
     def open_session(self, seed: int | None = None) -> None:
+        from . import _numerics
+
         req = cpb.OpenSession(device=self.gdevice)
         if seed is not None:
             req.has_seed, req.seed = True, seed
+        if self.want_numerics:
+            # The server takes all four switches from a request: the ones
+            # not asked for keep the Owner's defaults.
+            req.numerics.CopyFrom(_numerics.request(self.caps.numerics, self.want_numerics))
         _debug.log("opening a session")
         r = self.call(cpb.Envelope(open_session=req), timeout=300)
         _debug.log("session opened")
         self.session_id = r.session_opened.session_id
+        self.numerics = r.session_opened.numerics
+        if self.want_numerics:
+            got = _numerics.as_dict(self.numerics)
+            off = {k: v for k, v in self.want_numerics.items() if got[k] != v}
+            if off:  # __init__ closes the connection, and with it the session
+                raise ReflopError(f"the server did not apply the requested numerics {off}; it runs this session "
+                                  f"with {got}. Update reflopd, or open the device without numerics=")
         if r.session_opened.enabled_op_ids:
             # This session's device may support fewer operators than the
             # server's first device (e.g. CUDA-only fused kernels on the CPU).
@@ -662,6 +676,7 @@ class RemoteConnection(Connection):
                       timeout=60)
         if not r.session_opened.resumed:
             raise SessionLostError(cpb.ERROR_SESSION_LOST, "the server session could not be resumed")
+        self.numerics = r.session_opened.numerics
         _debug.log("session resumed")
 
     def _keepalive(self) -> None:
@@ -772,9 +787,9 @@ def forget(cfg: ClientConfig, name: str) -> None:
         _sshhost.forget(entry.fingerprint, entry.key_id)
 
 
-def connect(server: str | None = None, kind: str = "auto") -> RemoteConnection:
+def connect(server: str | None = None, kind: str = "auto", numerics: dict | None = None) -> RemoteConnection:
     entry = ClientConfig.load().get(server)
-    return RemoteConnection(entry, kind=kind)
+    return RemoteConnection(entry, kind=kind, numerics=numerics)
 
 
 def admin(server: str | None = None):

@@ -10,6 +10,7 @@
   "repeats": 3,
   "correctness_steps": 8,
   "cpu_threads": 4,
+  "server_cpu_threads": null,
   "rtol": 0.002,
   "atol": 0.0002,
   "low_precision_rtol": 0.05,

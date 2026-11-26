@@ -1998,3 +1998,58 @@ the channel count. A tensor that only aliases a written one (a view stored
 under another handle, a dataset tensor) is no longer changed with it; no
 client relies on that. `atan2.out` with a differently shaped `out` is
 refused at V4.
+
+## ADR-059: Session numerics are requested, reported and kept per session
+
+**Context.** A session's numerics (TF32 for matmuls and cuDNN, cuDNN
+benchmark, deterministic algorithms) decide whether two runs round alike.
+reflopd accepted them in `OpenSession.numerics` and reported the effective
+ones in `SessionOpened.numerics`, but the Python client sent none and kept
+none, so a Guest always got the Owner's defaults without knowing them. An
+in-process worker (`LocalConnection`) applied its session's switches to the
+whole process when it started and left them, so native code that ran
+afterwards, and later in-process sessions, ran with them (BUGS.md #18).
+The benchmark's correctness suite compared every remote run with native
+CPU (GH#19): CUDA runs, with TF32 on and non-deterministic kernels, against
+a CPU, and server-CPU runs against a reference on 4 threads where the
+worker used 16, or on a Mac where the Owner was x86. ResNet-18 failed both.
+
+**Decision.**
+
+- `reflop.device(numerics={...})` requests settings when the session opens.
+  The client fills the settings left out from the Owner's defaults in the
+  capabilities, because the server takes all four from a request, and
+  raises when the session reports other values than requested. Opening an
+  open device again with other numerics raises. `reflop.numerics(device)`
+  returns the session's settings.
+- `LocalConnection` takes a snapshot of the caller's switches before its
+  worker starts and before each request, applies the worker's for the
+  request, and restores the caller's after it (`_numerics.py`). PyTorch
+  2.15 remembers whether the legacy (`allow_tf32`) or the new
+  (`fp32_precision`) API set a TF32 value and raises when one API reads
+  what the other set, so each switch is written back through the API the
+  caller's state can be read with, and only when its value differs.
+- The benchmark's correctness cases open the remote device with
+  `deterministic` on and `cudnn_benchmark` off, and compare remote CUDA with
+  native CUDA on the same GPU and remote CPU with native CPU, running the
+  reference under the session's reported numerics, the workers'
+  `CUBLAS_WORKSPACE_CONFIG`, and for the CPU the worker's thread count
+  (`server_cpu_threads`, else PyTorch's default on that machine).
+
+**Alternatives.** Documenting #18 in the test fixtures only: the benchmark
+and `reflop verify` use in-process sessions too. Saving and restoring only
+the legacy flags: a caller on the new API would read errors afterwards.
+Looser tolerances: they would hide a real regression, and on the Owner the
+CPU runs match bit for bit once the thread count matches. Reporting the
+worker's thread count in `RuntimeInfo`: a protocol change; the default on
+the Owner is enough for the benchmark, which runs its native references
+there.
+
+**Consequences.** A Guest can ask for deterministic or TF32-free sessions
+and can see what a session runs with. An in-process session leaves the
+caller's effective precision, cuDNN benchmark and deterministic mode as it
+found them; PyTorch's record of which TF32 API last wrote a value may
+differ, so a getter that raised before (the APIs were mixed) may answer
+afterwards. Remote CUDA correctness cases now need a local GPU and report
+a missing prerequisite elsewhere instead of failing against the CPU. A
+server-CPU reference on another architecture still differs.
