@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextlib
 import copy
 import json
 import math
@@ -179,20 +178,30 @@ def compare(got,want,c,low=False):
 CHECK_NUMERICS = {"deterministic":True,"cudnn_benchmark":False}
 
 
-def reference_device(ctx,target):
-    """Where the reference runs: the remote run's kind of device on this
-    machine, so both sides run the same kernels (GH#19)."""
+def reference_run(ctx,reference,x,y,loss_fn,dev,check_remote,dtype):
+    """The native reference trajectory for a correctness check: on the
+    remote run's kind of device on this machine, so both sides run the same
+    kernels, under the remote session's numerics (GH#19)."""
     import platform
 
     import torch
-    if target == "remote_cuda":
-        ctx.details["reference_device"] = "native CUDA"
-        return ctx.device("native_cuda")
-    ctx.details["reference_device"] = "native CPU"
+
+    from . import reference as refmod
+    p,c = ctx.p,ctx.c
+    if not check_remote:
+        return refmod.trajectory(p,c,reference,x,y,loss_fn,torch.device("cpu"))
+    n = ctx.rf.numerics(dev)
+    if p["target"] == "remote_cuda":
+        if not torch.cuda.is_available():
+            raise MissingPrerequisite("the native CUDA reference must run on the Owner's GPU, as the remote run does")
+        ctx.details["reference_device"] = "native CUDA, in a separate process, BatchNorm on PyTorch's kernel"
+        return refmod.in_child(ctx.path/"reference",p,c,reference,x,y,n,dtype)
     # A server CPU of another architecture (an x86 Owner, an arm64 Mac
     # Guest) runs other vector kernels; compare only on the same kind.
-    ctx.details["reference_arch"] = platform.machine()
-    return torch.device("cpu")
+    threads = server_cpu_threads(c)
+    ctx.details.update(reference_device="native CPU",reference_arch=platform.machine(),reference_threads=threads)
+    with native_numerics(n,threads):
+        return refmod.trajectory(p,c,reference,x,y,loss_fn,torch.device("cpu"))
 
 
 def server_cpu_threads(c):
@@ -221,13 +230,10 @@ class native_numerics:
     def __enter__(self):
         import torch
         from reflop import _numerics
+
+        from .reference import apply_numerics
         self.saved,self.saved_threads = _numerics.snapshot(),torch.get_num_threads()
-        torch.backends.cuda.matmul.allow_tf32 = self.n["tf32_matmul"]
-        torch.backends.cudnn.allow_tf32 = self.n["tf32_cudnn"]
-        torch.backends.cudnn.benchmark = self.n["cudnn_benchmark"]
-        torch.use_deterministic_algorithms(self.n["deterministic"],warn_only=True)
-        if self.threads:
-            torch.set_num_threads(self.threads)
+        apply_numerics(self.n,self.threads)
 
     def __exit__(self,*exc):
         import torch
@@ -259,18 +265,13 @@ def train(ctx):
         x = x.to(dtype)
     if y.is_floating_point():
         y = y.to(dtype)
-    reference = copy.deepcopy(model) if p["check"] else None
-    ref_dev = reference_device(ctx,p["target"]) if check_remote else torch.device("cpu")
-    if reference is not None:
-        reference = reference.to(ref_dev)
-    ref_numerics = contextlib.nullcontext()
-    if check_remote:
-        threads = server_cpu_threads(c) if p["target"] == "remote_cpu" else None
-        ctx.details["reference_threads"] = threads
-        ref_numerics = native_numerics(ctx.rf.numerics(dev),threads)
+    ref = None
+    if p["check"]:
+        ctx.phase = "cpu_reference"
+        ref = reference_run(ctx,copy.deepcopy(model),x,y,loss_fn,dev,check_remote,dtype)
+        assert all(math.isfinite(v) for v in ref["losses"]),"nonfinite native reference loss"
     model = model.to(dev)
     opt = optimizer(model,p["optimizer"],remote=remote or dev.type=="cuda")
-    ref_opt = optimizer(reference,p["optimizer"]) if reference is not None else None
     if dtype_name=="amp_fp16":
         scaler = torch.amp.GradScaler(dev.type)
     else:
@@ -315,31 +316,15 @@ def train(ctx):
                 ctx.remote().step_boundary()
             losses.append(result.item())
             assert math.isfinite(losses[-1]),"nonfinite training loss"
-            ctx.phase = "cpu_reference"
-            def ref_closure(a=a.to(ref_dev),b=b.to(ref_dev)):
-                ref_opt.zero_grad(set_to_none=p.get("zero_none",True))
-                # The reference computes in the requested storage dtype. AMP
-                # reference is fp32; tolerance is explicit in the result.
-                value = loss_fn(reference(a),b)
-                value.backward()
-                return value
-            with ref_numerics:
-                if p["optimizer"]=="lbfgs":
-                    ref_loss = ref_opt.step(ref_closure)
-                else:
-                    ref_loss = ref_closure()
-                    ref_opt.step()
-            ref_losses.append(ref_loss.item())
-            assert math.isfinite(ref_losses[-1]),"nonfinite native reference loss"
+            ref_losses.append(ref["losses"][i])
             ctx.phase = "correctness"
             torch.testing.assert_close(torch.tensor(losses[-1]),torch.tensor(ref_losses[-1]),
                 rtol=c["low_precision_rtol"] if low else c["rtol"],atol=c["low_precision_atol"] if low else c["atol"])
             ctx.event("step",step=i,loss=losses[-1],reference_loss=ref_losses[-1])
         ctx.phase = "correctness"
-        checks = compare(model.state_dict(),reference.state_dict(),c,low)
+        checks = compare(model.state_dict(),ref["state"],c,low)
         # Compare gradients as well as final weights; finite loss alone is insufficient.
-        gradients = compare({k:v.grad for k,v in model.named_parameters() if v.grad is not None},
-                            {k:v.grad for k,v in reference.named_parameters() if v.grad is not None},c,low)
+        gradients = compare({k:v.grad for k,v in model.named_parameters() if v.grad is not None},ref["grads"],c,low)
         write_json(ctx.path/"correctness.json",{"losses":losses,"reference_losses":ref_losses,
                                               "parameters":checks,"gradients":gradients})
         ctx.details["reference"] = (f"{ctx.details.get('reference_device','native CPU')}, identical initial state "

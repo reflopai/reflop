@@ -2034,13 +2034,28 @@ worker used 16, or on a Mac where the Owner was x86. ResNet-18 failed both.
   native CUDA on the same GPU and remote CPU with native CPU, running the
   reference under the session's reported numerics, the workers'
   `CUBLAS_WORKSPACE_CONFIG`, and for the CPU the worker's thread count
-  (`server_cpu_threads`, else PyTorch's default on that machine).
+  (`server_cpu_threads`, else PyTorch's default on that machine). The
+  native CUDA reference trains in a process of its own
+  (`benchmark/bench/reference.py`), because a local CUDA backward fails in
+  a process where reFLOP's device is registered (GH#55), and runs
+  BatchNorm on PyTorch's own CUDA kernel rather than cuDNN's: the client
+  sends `_native_batch_norm_legit_functional`, which the worker runs on
+  that kernel. With cuDNN's, the forward differs by about 1e-7 from the
+  first BatchNorm on, and ResNet-18 at batch 8 turns that into 1.9% by the
+  second step, native against native; with the same kernel it is
+  bit-identical. Its optimizers use PyTorch's single-tensor code, as they
+  do for reFLOP's tensors (foreach does not accept their type); on CUDA
+  they default to the foreach code, whose SGD with Nesterov adds the
+  momentum into `.grad` in place, so the final gradients differed.
 
 **Alternatives.** Documenting #18 in the test fixtures only: the benchmark
 and `reflop verify` use in-process sessions too. Saving and restoring only
 the legacy flags: a caller on the new API would read errors afterwards.
 Looser tolerances: they would hide a real regression, and on the Owner the
-CPU runs match bit for bit once the thread count matches. Reporting the
+runs match bit for bit once the thread count and the BatchNorm kernel
+match. Sending cuDNN's BatchNorm from the client: `cudnn_batch_norm` is not
+in the opset, and the statistics update would again depend on a kernel's
+side effect (ADR-058). Reporting the
 worker's thread count in `RuntimeInfo`: a protocol change; the default on
 the Owner is enough for the benchmark, which runs its native references
 there.
@@ -2052,4 +2067,7 @@ found them; PyTorch's record of which TF32 API last wrote a value may
 differ, so a getter that raised before (the APIs were mixed) may answer
 afterwards. Remote CUDA correctness cases now need a local GPU and report
 a missing prerequisite elsewhere instead of failing against the CPU. A
-server-CPU reference on another architecture still differs.
+server-CPU reference on another architecture still differs. A reFLOP CUDA
+run of a model with BatchNorm differs from native PyTorch's default by the
+BatchNorm kernel; for well-conditioned training that is within rounding,
+and the Guest guide says so.

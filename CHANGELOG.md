@@ -16,14 +16,19 @@
   them too. Each request now runs with the session's switches, and yours
   are back when it returns.
 - Benchmark: the correctness suite compares like with like (GH#19).
-  Remote CUDA runs are checked against native CUDA on the Owner's GPU
-  under the session's numerics, with deterministic algorithms on both
-  sides, instead of against the CPU. Server-CPU runs are checked against
-  native CPU with the worker's thread count (`server_cpu_threads`,
-  PyTorch's default when unset). The ResNet-18 CPU failures came from the
-  reference: it ran on 4 threads against the worker's 16 (and, in the
-  original run, on a Mac against an x86 Owner). On the Owner, all 20
-  server-CPU correctness cases now match, ResNet-18 bit for bit.
+  Remote CUDA runs are checked against native CUDA on the Owner's GPU,
+  in a separate process, under the session's numerics, with deterministic
+  algorithms on both sides, BatchNorm on PyTorch's own CUDA kernel (the one
+  the worker runs) and single-tensor optimizers (as reFLOP's tensors get);
+  they were checked against the CPU. Server-CPU runs
+  are checked against native CPU with the worker's thread count
+  (`server_cpu_threads`, PyTorch's default when unset). The ResNet-18
+  failures were not reFLOP's: on the CPU the reference ran on 4 threads
+  against the worker's 16 (and, in the original run, on a Mac against an
+  x86 Owner); on CUDA, native PyTorch picks cuDNN's BatchNorm, which sums
+  in another order, and ResNet-18 at batch 8 turns that 1e-7 into 1.9% by
+  the second step, native against native. On the Owner, all 40
+  correctness cases now pass, ResNet-18 bit for bit on both devices.
 
 - The worker no longer changes server tensors in place. Training-mode
   `native_batch_norm`, which clients up to 0.2.3 send for every BatchNorm
