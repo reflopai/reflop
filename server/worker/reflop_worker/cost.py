@@ -116,6 +116,9 @@ def analyze(prog: Program, input_bytes: int = 0) -> None:
             b = 0 if is_view else _bytes(m)
             out_bytes[Ref(node.index, k)] = b
             live += b
+        # Copies of the tensors the kernel writes (writes.py) live until the
+        # execute commits.
+        live += written_bytes(node, metas)
         w = WORKSPACE.get(node.op.name)
         peak = max(peak, live + (w(node, outs) if w else 0))
         for r in expiring.get(node.index, []):
@@ -134,6 +137,27 @@ def analyze(prog: Program, input_bytes: int = 0) -> None:
     prog.view_output_bytes = view_output_bytes(prog, out_bytes)
     prog.flops = flops
     prog.peak_bytes = max(peak, live + prog.view_output_bytes)
+
+
+def written_bytes(node, metas) -> int:
+    """Bytes of the copies writes.copy_written makes for this node: every
+    tensor argument the kernel may write, unless a literal false gates it."""
+    from . import writes
+
+    w = writes.written(node.op.id)
+    if w is None:
+        return 0
+    targets, gate = w
+    if gate is not None and node.args[gate] is False:
+        return 0
+    seen, n = set(), 0
+    for i in targets:
+        a = node.args[i]
+        for b in (a if isinstance(a, list) else [a]):
+            if isinstance(b, Ref) and b not in seen:
+                seen.add(b)
+                n += _bytes(metas[b])
+    return n
 
 
 def alias_last_use(prog: Program) -> dict:

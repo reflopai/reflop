@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- The worker no longer changes server tensors in place. Training-mode
+  `native_batch_norm`, which clients up to 0.2.3 send for every BatchNorm
+  forward, wrote the new running statistics into the bound tensors, and so
+  did `_native_batch_norm_legit`; a checkpoint written at the time could
+  save statistics from a later step, or half of each. The kernels now
+  write copies, and the statistics' handles point at the copies when the
+  execute finishes, so old clients' training keeps updating its statistics.
+  A failed execute no longer leaves them half updated (GH#49).
+- The worker refuses an `atan2.out` whose `out` has another shape than the
+  result. It resized the stored tensor bound to `out`. The Python client
+  never sends `atan2.out`.
 - An operation the server lacks no longer fails when its decomposition uses
   another operation the server lacks. `threshold_backward` (ReLU's backward), for
   example, failed with "aten.to.dtype is not available on this server", even

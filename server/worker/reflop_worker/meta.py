@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 from torch.utils._pytree import tree_flatten
 
-from . import dtypes, natives, outmeta, prechecks, validators
+from . import dtypes, natives, outmeta, prechecks, validators, writes
 from ._pb import compute_pb2 as cpb
 from ._pb import graph_pb2 as gpb
 from .errors import ReflopError, invalid, limit
@@ -508,6 +508,8 @@ def infer(prog: Program, limits: cpb.Limits) -> None:
 
         pos, kw = call_args(node, resolve)
         validators.check_static(node, pos, kw)
+        wplan = writes.plan(node.op)
+        written = writes.shapes(wplan, pos, kw) if wplan is not None else None
         try:
             with torch.inference_mode():
                 a = validators._named(node, pos, kw)
@@ -527,6 +529,13 @@ def infer(prog: Program, limits: cpb.Limits) -> None:
         except Exception as e:  # noqa: BLE001 - every kernel error becomes a structured rejection
             raise ReflopError(cpb.ERROR_SHAPE_MISMATCH, f"{node.op.name}: {str(e)[:500]}", S, node.index,
                               node.op.id) from None
+        # The worker runs the kernel on copies of what it writes (writes.py),
+        # and a copy must keep the shape of the tensor it replaces. The meta
+        # kernel resizes a written meta in place (atan2.out's out), which
+        # would also leave later nodes a wrong meta for that input.
+        if written is not None and writes.shapes(wplan, pos, kw) != written:
+            raise ReflopError(cpb.ERROR_SHAPE_MISMATCH, f"{node.op.name}: the kernel would resize an argument it "
+                              "writes", S, node.index, node.op.id)
         flat = [x for x in tree_flatten(out)[0] if isinstance(x, torch.Tensor)]
         for k, m in enumerate(flat):
             if m.dim() > limits.max_dims:

@@ -2,7 +2,8 @@
 """Snapshot and checkpoint files, written in the background (ADR-029).
 
 Server tensors are never modified in place (a rebind replaces the table
-entry), so holding references to the current tensors gives a consistent
+entry, and kernels that write to arguments write copies, writes.py), so
+holding references to the current tensors gives a consistent
 point-in-time view. The cut is taken on the request thread between two
 requests: requests before it are in the file, later ones are not. A
 background thread then copies the tensors to the host through a small

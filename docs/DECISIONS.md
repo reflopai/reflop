@@ -1946,3 +1946,55 @@ recorded are never read and are freed with their tensors. A decomposition
 may have drawn from the server's RNG before it failed; the client's run then
 draws from the client's. `"remote"` and sessions opened with
 `allow_local_fallback=False` still raise.
+
+## ADR-058: Kernels that write to their arguments run on copies
+
+**Context.** The worker assumes server tensors never change in place.
+Checkpoint cuts hold references to the current tensors as a consistent view
+while a background thread copies them (ADR-029), and a handle changes only
+when an execute commits. Three whitelisted kernels wrote to bound tensors
+anyway (GH#49). `native_batch_norm` in training mode updates `running_mean`
+and `running_var`, although its schema does not mark them as written;
+clients up to 0.2.3 send it for every BatchNorm forward and get their
+statistics only through that write. `_native_batch_norm_legit` (training)
+and `atan2.out` declare the write, and `atan2.out` also resized a stored
+tensor bound to `out` to the result's shape. No official client sends
+either: the client rewrites both to functional forms. A checkpoint taken
+before a legacy BatchNorm step could save statistics from after it, or a
+mix of both, and an execute that failed after the kernel left them
+changed. The writes stayed in the Guest's own buffers. The bounds cache
+(`validators`) covers only integer tensors, which these kernels refuse to
+write, so no bounds check was affected.
+
+**Decision.** `writes.py` lists the arguments each op's kernel may write:
+those its schema marks as written, plus `native_batch_norm`'s statistics,
+and for the two BatchNorm ops only when `training` is true. Before such a
+kernel runs, the executor copies each of those tensors (one copy for a
+tensor passed twice) and the kernel writes the copy. Later nodes of the
+graph read the copy where they read the original, and when the execute
+commits, every handle that held the original holds the final copy, before
+the graph's own outputs are stored or rebound. V4 refuses a node whose meta
+kernel changes the shape of a written argument, and the executor checks it
+again after the kernel. V5 counts the copies as live until the end of the
+graph. `test_in_place_writes.py` lists the ops that write, so a new opset
+entry that writes an argument fails until it is reviewed.
+
+**Alternatives.** Refusing training-mode `native_batch_norm` (or running it
+on copies that are dropped): clients up to 0.2.3 would train with frozen
+statistics, an error or a silent regression. Keeping the in-place write and
+documenting it as an exception: every later feature that relies on
+unchanged tensors (checkpoints, replay in GH#2, caches) would have to know
+about it, and checkpoints would need a lock against the kernels. Gating on
+the client version: reflopd treats `client_version` as informational, and
+the copies make no gate necessary. Rewriting the graph at V2 into
+`_native_batch_norm_legit_functional` with extra outputs: the same effect
+with more validation code and new output indexes.
+
+**Consequences.** Old clients keep their statistics, and checkpoint cuts
+stay consistent. A failed execute leaves the statistics as they were, where
+the in-place kernel had already changed them. Each written tensor costs one
+extra copy until the execute commits; for BatchNorm that is two vectors of
+the channel count. A tensor that only aliases a written one (a view stored
+under another handle, a dataset tensor) is no longer changed with it; no
+client relies on that. `atan2.out` with a differently shaped `out` is
+refused at V4.
