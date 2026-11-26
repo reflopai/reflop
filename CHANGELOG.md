@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.3.2 (2026-11-26)
+
+Fixes for the worker and the Python client, and session numerics the
+client can ask for. Update the daemon for the worker fixes and the client
+for the rest; they work with each other's previous versions, and
+`numerics=` works with every reflopd.
 
 - `reflop.device(numerics={...})` opens a session with the numerics you
   ask for (`tf32_matmul`, `tf32_cudnn`, `deterministic`,
@@ -29,7 +34,6 @@
   in another order, and ResNet-18 at batch 8 turns that 1e-7 into 1.9% by
   the second step, native against native. On the Owner, all 40
   correctness cases now pass, ResNet-18 bit for bit on both devices.
-
 - The worker no longer changes server tensors in place. Training-mode
   `native_batch_norm`, which clients up to 0.2.3 send for every BatchNorm
   forward, wrote the new running statistics into the bound tensors, and so
