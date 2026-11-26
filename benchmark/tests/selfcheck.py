@@ -203,6 +203,29 @@ class NativeReferences(unittest.TestCase):
             self.assertEqual(len(result["samples_per_second"]),2)
             self.assertIsNone(ctx.rf)
 
+    def test_native_correctness_path(self):
+        # The reference trajectory runs before the measured model; a
+        # native target checks against itself, step by step (GH#19).
+        from benchmark.bench.worker import Context, train
+        c = load_config()
+        c.update(correctness_steps=3)
+        params = {"model":"cnn","mode":"eager","target":"native_cpu","check":True,
+                  "batch":2,"residency":"upload","sync_every":1,"optimizer":"nesterov"}
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = Context({"case":{"params":params},"config":c,"run_dir":tmp},Path(tmp))
+            train(ctx)
+            out = json.loads((Path(tmp)/"correctness.json").read_text())
+            self.assertEqual(len(out["losses"]),3)
+            self.assertEqual(out["losses"],out["reference_losses"])
+            self.assertIsNone(ctx.rf)
+
+    def test_reference_process_never_imports_reflop(self):
+        # A local CUDA backward fails in a process where reFLOP's device is
+        # registered (GH#55), so the CUDA reference must stay free of it.
+        src = (ROOT/"bench/reference.py").read_text()
+        self.assertNotIn("import reflop",src)
+        self.assertNotIn("from reflop",src)
+
 
 from .test_compare_cuda import CudaComparison as CudaComparison  # noqa: E402
 

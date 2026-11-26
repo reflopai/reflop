@@ -644,7 +644,11 @@ lifetime: opening an open device again with other numerics raises. To
 compare a reFLOP run with a native one, run the native code with the same
 settings; `reflop.numerics()` reports them. A server-CPU run also rounds
 like a native one only with the same number of threads (PyTorch's default
-on the Owner) and on the same CPU architecture.
+on the Owner) and on the same CPU architecture. On the GPU, BatchNorm runs
+on PyTorch's own CUDA kernel, where native PyTorch picks cuDNN's; the two
+differ in the last bits, so compare with
+`torch.backends.cudnn.flags(enabled=False)` around the native BatchNorm
+layers.
 
 An in-process session (`local=`) sets these switches for each of its
 requests and puts yours back afterwards, so it does not change the

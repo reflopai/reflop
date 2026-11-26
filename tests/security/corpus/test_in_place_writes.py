@@ -144,9 +144,12 @@ def test_two_batch_norms_on_the_same_statistics(sess):
 
 def test_one_handle_bound_as_both_statistics(sess):
     # The kernel writes the same memory twice; a single copy keeps that.
+    # Which write lands last is the device kernel's: compute the expected
+    # value on the session's device (the CPU and CUDA kernels differ).
     x, (rm, _) = _x(), _stats()
-    want = rm.clone()
-    A.native_batch_norm.default(x, None, None, want, want, True, 0.1, 1e-5)
+    want = rm.clone().to(sess.device)
+    A.native_batch_norm.default(x.to(sess.device), None, None, want, want, True, 0.1, 1e-5)
+    want = want.cpu()
     old = _store(sess, HM, rm)
     e = _execute(sess, _bn_graph(sess, BN), [x, HM, HM], [DISCARD])
     assert e.WhichOneof("body") == "execute_result", e
