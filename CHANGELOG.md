@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- `reflop.device(numerics={...})` opens a session with the numerics you
+  ask for (`tf32_matmul`, `tf32_cudnn`, `deterministic`,
+  `cudnn_benchmark`); the ones you leave out keep the Owner's defaults.
+  `reflop.numerics(device)` reports what a session runs with. reflopd
+  already accepted these requests, but the client never sent them. A
+  server that does not apply a requested setting makes `reflop.device()`
+  raise.
+- An in-process session (`reflop.device(local=...)`) no longer leaves its
+  numerics in your process. It applied its TF32, cuDNN benchmark and
+  deterministic switches to the whole process and kept them, so native
+  PyTorch code that ran afterwards, and later in-process sessions, used
+  them too. Each request now runs with the session's switches, and yours
+  are back when it returns.
+- Benchmark: the correctness suite compares like with like (GH#19).
+  Remote CUDA runs are checked against native CUDA on the Owner's GPU
+  under the session's numerics, with deterministic algorithms on both
+  sides, instead of against the CPU. Server-CPU runs are checked against
+  native CPU with the worker's thread count (`server_cpu_threads`,
+  PyTorch's default when unset). The ResNet-18 CPU failures came from the
+  reference: it ran on 4 threads against the worker's 16 (and, in the
+  original run, on a Mac against an x86 Owner). On the Owner, all 20
+  server-CPU correctness cases now match, ResNet-18 bit for bit.
+
 - The worker no longer changes server tensors in place. Training-mode
   `native_batch_norm`, which clients up to 0.2.3 send for every BatchNorm
   forward, wrote the new running statistics into the bound tensors, and so

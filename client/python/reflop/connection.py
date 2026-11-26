@@ -102,6 +102,9 @@ class Connection:
         self.max_response_bytes = max_response_bytes
         self.closed = False
         self.on_event = self._print_event
+        # The session's numerics as the worker reports them (kpb.Numerics),
+        # once a session is open.
+        self.numerics = None
 
     @staticmethod
     def _print_event(ev: cpb.Event) -> None:
@@ -269,7 +272,8 @@ class LocalConnection(Connection):
     > 0 turns checkpoints on, as `reflopd checkpoints on` does).
     """
 
-    def __init__(self, device: str = "cpu", seed: int = 0, limits=None, checkpoint_interval_s: int = 0) -> None:
+    def __init__(self, device: str = "cpu", seed: int = 0, limits=None, checkpoint_interval_s: int = 0,
+                 numerics: dict | None = None) -> None:
         super().__init__()
         from reflop_worker._pb import capabilities_pb2 as kpb
         from reflop_worker._pb import graph_pb2 as gpb
@@ -284,11 +288,14 @@ class LocalConnection(Connection):
             init.device.index = int(device.split(":")[1]) if ":" in device else 0
         init.limits.CopyFrom(limits or default_limits(kpb))
         init.numerics.tf32_cudnn = os.environ.get("REFLOP_LOCAL_TF32", "1") == "1"
+        for k, v in (numerics or {}).items():
+            setattr(init.numerics, k, v)
         self._init = init
         self._Session = Session
         self.worker = self._new_worker()
         self.gdevice = init.device
-        self.ready = self.worker.ready(wpb.SandboxReport())
+        self.ready = self._worker_turn(lambda: self.worker.ready(wpb.SandboxReport()))
+        self.numerics = self.ready.numerics
         self._wlock = threading.Lock()
         self.session_id = os.urandom(16)
         self.checkpoint_interval_s = int(checkpoint_interval_s or os.environ.get("REFLOP_LOCAL_CHECKPOINT_S", "0"))
@@ -317,16 +324,40 @@ class LocalConnection(Connection):
         self._dead = True
 
     def _new_worker(self):
+        from . import _numerics
         from . import session as _s
 
         # Worker startup seeds PyTorch. Skip the client seed hook because this
         # worker lives in the same process as the client.
         prev = getattr(_s._seeding, "active", False)
         _s._seeding.active = True
+        caller = _numerics.snapshot()
         try:
-            return self._Session(self._init)
+            worker = self._Session(self._init)
+            # The worker applied its numerics to the whole process (#18):
+            # keep them for its requests and give the caller's back.
+            self._worker_numerics = _numerics.snapshot()
+            return worker
         finally:
+            _numerics.restore(caller)
             _s._seeding.active = prev
+
+    def _worker_turn(self, f):
+        """Run f with the worker's numerics switches, then the caller's again.
+
+        In reflopd every worker is a process with its own; here worker and
+        caller share one process, so without the swap one in-process
+        session's switches would apply to the caller's native code and to
+        later in-process sessions (BUGS.md #18)."""
+        from . import _numerics
+
+        caller = _numerics.snapshot()
+        _numerics.restore(self._worker_numerics)
+        try:
+            return f()
+        finally:
+            self._worker_numerics = _numerics.snapshot()
+            _numerics.restore(caller)
 
     def new_session(self) -> None:
         with self._wlock:
@@ -361,10 +392,10 @@ class LocalConnection(Connection):
             if self._dead:
                 return self._error(env, cpb.ERROR_SESSION_LOST, "session lost: the worker died")
             if which in ("snapshot", "checkpoint"):
-                return self._write(env, which)
+                return self._worker_turn(lambda: self._write(env, which))
             if which in ("restore", "recover_session"):
-                return self._read(env, which)
-            self.worker.handle(env, self._deliver)
+                return self._worker_turn(lambda: self._read(env, which))
+            self._worker_turn(lambda: self.worker.handle(env, self._deliver))
 
     def _error(self, env, code, msg) -> None:
         self._deliver(cpb.Envelope(request_id=env.request_id, end=True, error=cpb.Error(code=code, message=msg)))

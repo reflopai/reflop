@@ -16,6 +16,7 @@ from .api import (
     device,
     fetch,
     load,
+    numerics,
     placement,
     recover,
     save,
@@ -33,7 +34,7 @@ from .trace import UnsupportedOperatorError
 __version__ = "0.3.1"
 
 __all__ = [
-    "device", "capture", "CaptureError", "fetch", "placement", "seed", "step_boundary", "synchronize", "close", "stats", "usage",
+    "device", "numerics", "capture", "CaptureError", "fetch", "placement", "seed", "step_boundary", "synchronize", "close", "stats", "usage",
     "save", "load", "snapshots", "delete_snapshot", "checkpoint_tag", "recover",
     "ReflopError", "ReflopRemoteError", "OutOfMemoryError", "SessionLostError", "UnsupportedOperatorError",
     "dataset", "__version__",

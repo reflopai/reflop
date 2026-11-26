@@ -28,7 +28,8 @@ def _open_session(conn, index: int | None, *, allow_local_fallback: bool = True,
 
 
 def device(index: int = 0, *, server: str | None = None, kind: str = "auto", local: str | None = None,
-           allow_local_fallback: bool = True, checkpoint: bool = False, checkpoint_interval=None) -> torch.device:
+           allow_local_fallback: bool = True, checkpoint: bool = False, checkpoint_interval=None,
+           numerics: dict | None = None) -> torch.device:
     """Connect (once) and return the remote device.
 
     index:  session index, an integer from 0 through 127.
@@ -41,7 +42,14 @@ def device(index: int = 0, *, server: str | None = None, kind: str = "auto", loc
             worker is lost. The Owner must allow it.
     checkpoint_interval: seconds (or a timedelta) between checkpoints; the
             default and the minimum are the Owner's interval.
+    numerics: the session's numerics, as a dict of tf32_matmul, tf32_cudnn,
+            deterministic and cudnn_benchmark (True or False); settings
+            left out keep the Owner's defaults. reflop.numerics() reports
+            what the session runs with.
     """
+    from . import _numerics
+
+    numerics = _numerics.check(numerics)
     if not isinstance(index, Integral) or isinstance(index, bool):
         raise TypeError("reFLOP device index must be an integer")
     index = operator.index(index)
@@ -53,6 +61,12 @@ def device(index: int = 0, *, server: str | None = None, kind: str = "auto", loc
     natives.register()
     try:
         sess = _session.by_index(index)
+        if numerics:
+            have = _numerics.as_dict(sess.conn.numerics) if sess.conn.numerics is not None else {}
+            off = {k: v for k, v in numerics.items() if have.get(k) != v}
+            if off:
+                raise ValueError(f"reFLOP device {index} is already open with numerics {have}; close it to "
+                                 f"open it with {off}")
         if checkpoint:
             from . import checkpoints
 
@@ -64,11 +78,11 @@ def device(index: int = 0, *, server: str | None = None, kind: str = "auto", loc
     if local:
         from .connection import LocalConnection
 
-        conn = LocalConnection(local)
+        conn = LocalConnection(local, numerics=numerics)
     else:
         from .client import connect
 
-        conn = connect(server=server, kind=kind)
+        conn = connect(server=server, kind=kind, numerics=numerics)
     sess = _open_session(conn, index, allow_local_fallback=allow_local_fallback)
     if checkpoint:
         from . import checkpoints
@@ -79,6 +93,26 @@ def device(index: int = 0, *, server: str | None = None, kind: str = "auto", loc
             sess.close()
             raise
     return dev
+
+
+def numerics(device: torch.device | int | None = None) -> dict:
+    """The numerics a reFLOP device's session runs with: tf32_matmul,
+    tf32_cudnn, deterministic and cudnn_benchmark, as the server reports
+    them. device: a reflop device or its index (default: the current one)."""
+    from . import _numerics
+    from .errors import ReflopError
+
+    if device is None:
+        sess = _session.current()
+    else:
+        i = device.index if isinstance(device, torch.device) else device
+        try:
+            sess = _session.by_index(operator.index(i or 0))
+        except KeyError:
+            raise ValueError(f"reFLOP device {i} is not open") from None
+    if sess.conn.numerics is None:
+        raise ReflopError("the server did not report this session's numerics")
+    return _numerics.as_dict(sess.conn.numerics)
 
 
 def step_boundary() -> None:

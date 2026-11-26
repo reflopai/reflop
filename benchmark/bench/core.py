@@ -57,6 +57,9 @@ def load_config():
                 "recovery_deadline_seconds", "max_graph_chain"):
         if not isinstance(c[key], int) or isinstance(c[key], bool) or c[key] <= 0:
             raise ValueError(f"{key} must be a positive integer")
+    st = c.setdefault("server_cpu_threads", None)
+    if st is not None and (not isinstance(st, int) or isinstance(st, bool) or st <= 0):
+        raise ValueError("server_cpu_threads must be null or a positive integer")
     if c["warmup_steps"] < 3:
         raise ValueError("warmup_steps must be >= 3 so capture can stabilize")
     if c["remote_kind"] not in ("cuda", "cpu"):

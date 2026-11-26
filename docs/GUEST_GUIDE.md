@@ -17,6 +17,7 @@ values you ask for. Your machine needs no CUDA: a MacBook works.
 - [Saving checkpoints](#saving-checkpoints)
 - [Mixed precision](#mixed-precision)
 - [What works and what does not](#what-works-and-what-does-not)
+- [Numerics](#numerics)
 - [CLI reference](#cli-reference)
 - [Privacy](#privacy)
 
@@ -623,6 +624,31 @@ Does not work:
 
 GPU results can differ from your CPU's in the last bits (TF32 is on for
 convolutions by default, and some GPU kernels are not deterministic).
+
+## Numerics
+
+A session runs with the Owner's numerics unless you ask for others when
+you open it:
+
+```python
+dev = reflop.device(numerics={"deterministic": True, "tf32_cudnn": False})
+reflop.numerics(dev)
+# {'tf32_matmul': False, 'tf32_cudnn': False, 'deterministic': True, 'cudnn_benchmark': False}
+```
+
+The four settings are `tf32_matmul` and `tf32_cudnn` (TF32 for matmuls and
+for cuDNN convolutions and RNNs), `deterministic`
+(`torch.use_deterministic_algorithms`) and `cudnn_benchmark`. Settings you
+leave out keep the Owner's defaults. They are fixed for the session's
+lifetime: opening an open device again with other numerics raises. To
+compare a reFLOP run with a native one, run the native code with the same
+settings; `reflop.numerics()` reports them. A server-CPU run also rounds
+like a native one only with the same number of threads (PyTorch's default
+on the Owner) and on the same CPU architecture.
+
+An in-process session (`local=`) sets these switches for each of its
+requests and puts yours back afterwards, so it does not change the
+numerics of the rest of your program.
 
 ## Troubleshooting
 

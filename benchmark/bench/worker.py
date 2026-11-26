@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import copy
 import json
 import math
@@ -25,6 +26,10 @@ class Context:
         self.details = {}
         self.execution_metrics = []
         self.connection_count = 0
+        if self.p.get("check") and self.p.get("target") == "remote_cuda":
+            # The native CUDA reference runs deterministic cuBLAS, as reflopd's
+            # workers do (they get this variable). Before any CUDA context.
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         if self.c.get("client_home"):
             os.environ["REFLOP_CLIENT_HOME"] = str(Path(self.c["client_home"]).expanduser())
         if self.c.get("server"):
@@ -49,7 +54,7 @@ class Context:
             self.rf = reflop
         return self.rf
 
-    def device(self, target=None, index=0, server=None):
+    def device(self, target=None, index=0, server=None, numerics=None):
         import torch
         target = target or "remote_"+self.c["remote_kind"]
         if target == "native_cpu":
@@ -71,7 +76,7 @@ class Context:
             rf = self.remote()
             self.phase = "connect"
             device = rf.device(index, server=server or os.environ.get("REFLOP_SERVER"),
-                               kind=target.removeprefix("remote_"), allow_local_fallback=False)
+                               kind=target.removeprefix("remote_"), allow_local_fallback=False, numerics=numerics)
             from reflop import session
             s = session.by_index(index)
             deliver = s.conn._deliver
@@ -88,7 +93,8 @@ class Context:
             write_json(self.path/cap_file,MessageToDict(s.caps,preserving_proto_field_name=True))
             record = {"kind":int(s.gdevice.kind),"device_index":index,"capabilities_file":cap_file,
                 "enabled_ops":len(s.enabled),"session_id":getattr(s.conn,"session_id",b"").hex(),
-                "server":getattr(getattr(s.conn,"entry",None),"name",server)}
+                "server":getattr(getattr(s.conn,"entry",None),"name",server),
+                "numerics":rf.numerics(device)}
             self.details.setdefault("remote_devices",{})[str(index)] = record
             self.details.setdefault("connection_history",[]).append(record)
             self.devices[index] = device
@@ -167,6 +173,69 @@ def compare(got,want,c,low=False):
     return {"equal":True}
 
 
+# Correctness cases ask for deterministic kernels: on CUDA, cuDNN's and the
+# pooling backward's atomics otherwise make two runs of the same training
+# differ (GH#19), native or remote.
+CHECK_NUMERICS = {"deterministic":True,"cudnn_benchmark":False}
+
+
+def reference_device(ctx,target):
+    """Where the reference runs: the remote run's kind of device on this
+    machine, so both sides run the same kernels (GH#19)."""
+    import platform
+
+    import torch
+    if target == "remote_cuda":
+        ctx.details["reference_device"] = "native CUDA"
+        return ctx.device("native_cuda")
+    ctx.details["reference_device"] = "native CPU"
+    # A server CPU of another architecture (an x86 Owner, an arm64 Mac
+    # Guest) runs other vector kernels; compare only on the same kind.
+    ctx.details["reference_arch"] = platform.machine()
+    return torch.device("cpu")
+
+
+def server_cpu_threads(c):
+    """Threads the server CPU worker computes with. reflopd leaves PyTorch's
+    default, and conv and reduction kernels split work by thread count, so a
+    reference with another count rounds differently (GH#19: 4 here, 16 in
+    the worker). Without server_cpu_threads in the config: PyTorch's default
+    on this machine, for a run on the Owner."""
+    if c.get("server_cpu_threads"):
+        return c["server_cpu_threads"]
+    import subprocess
+    env = {k:v for k,v in os.environ.items() if k not in ("OMP_NUM_THREADS","MKL_NUM_THREADS")}
+    r = subprocess.run([sys.executable,"-c","import torch; print(torch.get_num_threads())"],
+                       env=env,capture_output=True,text=True,check=True,timeout=120)
+    return int(r.stdout.strip())
+
+
+class native_numerics:
+    """Run the native reference with the remote session's numerics (and,
+    for the server CPU, its thread count), and give the process's own back
+    afterwards."""
+
+    def __init__(self,n,threads=None):
+        self.n,self.threads = n,threads
+
+    def __enter__(self):
+        import torch
+        from reflop import _numerics
+        self.saved,self.saved_threads = _numerics.snapshot(),torch.get_num_threads()
+        torch.backends.cuda.matmul.allow_tf32 = self.n["tf32_matmul"]
+        torch.backends.cudnn.allow_tf32 = self.n["tf32_cudnn"]
+        torch.backends.cudnn.benchmark = self.n["cudnn_benchmark"]
+        torch.use_deterministic_algorithms(self.n["deterministic"],warn_only=True)
+        if self.threads:
+            torch.set_num_threads(self.threads)
+
+    def __exit__(self,*exc):
+        import torch
+        from reflop import _numerics
+        _numerics.restore(self.saved)
+        torch.set_num_threads(self.saved_threads)
+
+
 def delta(before,after):
     return {str(k):{n:v-before.get(k,{}).get(n,0) for n,v in counters.items()} for k,counters in after.items()}
 
@@ -176,7 +245,8 @@ def train(ctx):
 
     from .models import build, optimizer
     p,c = ctx.p,ctx.c
-    dev = ctx.device(p["target"])
+    check_remote = bool(p["check"]) and p["target"].startswith("remote_")
+    dev = ctx.device(p["target"],numerics=CHECK_NUMERICS if check_remote else None)
     remote = dev.type=="reflop"
     dtype_name = p.get("dtype","float32")
     dtype = getattr(torch,dtype_name) if not dtype_name.startswith("amp_") else torch.float32
@@ -190,6 +260,14 @@ def train(ctx):
     if y.is_floating_point():
         y = y.to(dtype)
     reference = copy.deepcopy(model) if p["check"] else None
+    ref_dev = reference_device(ctx,p["target"]) if check_remote else torch.device("cpu")
+    if reference is not None:
+        reference = reference.to(ref_dev)
+    ref_numerics = contextlib.nullcontext()
+    if check_remote:
+        threads = server_cpu_threads(c) if p["target"] == "remote_cpu" else None
+        ctx.details["reference_threads"] = threads
+        ref_numerics = native_numerics(ctx.rf.numerics(dev),threads)
     model = model.to(dev)
     opt = optimizer(model,p["optimizer"],remote=remote or dev.type=="cuda")
     ref_opt = optimizer(reference,p["optimizer"]) if reference is not None else None
@@ -238,18 +316,19 @@ def train(ctx):
             losses.append(result.item())
             assert math.isfinite(losses[-1]),"nonfinite training loss"
             ctx.phase = "cpu_reference"
-            def ref_closure(a=a,b=b):
+            def ref_closure(a=a.to(ref_dev),b=b.to(ref_dev)):
                 ref_opt.zero_grad(set_to_none=p.get("zero_none",True))
-                # CPU reference computes in the requested storage dtype. AMP
+                # The reference computes in the requested storage dtype. AMP
                 # reference is fp32; tolerance is explicit in the result.
                 value = loss_fn(reference(a),b)
                 value.backward()
                 return value
-            if p["optimizer"]=="lbfgs":
-                ref_loss = ref_opt.step(ref_closure)
-            else:
-                ref_loss = ref_closure()
-                ref_opt.step()
+            with ref_numerics:
+                if p["optimizer"]=="lbfgs":
+                    ref_loss = ref_opt.step(ref_closure)
+                else:
+                    ref_loss = ref_closure()
+                    ref_opt.step()
             ref_losses.append(ref_loss.item())
             assert math.isfinite(ref_losses[-1]),"nonfinite native reference loss"
             ctx.phase = "correctness"
@@ -263,7 +342,8 @@ def train(ctx):
                             {k:v.grad for k,v in reference.named_parameters() if v.grad is not None},c,low)
         write_json(ctx.path/"correctness.json",{"losses":losses,"reference_losses":ref_losses,
                                               "parameters":checks,"gradients":gradients})
-        ctx.details["reference"] = "native CPU, identical initial state and batches"
+        ctx.details["reference"] = (f"{ctx.details.get('reference_device','native CPU')}, identical initial state "
+                                    "and batches, the remote session's numerics")
     else:
         for _ in range(c["warmup_steps"]):
             out = fn(*args)
