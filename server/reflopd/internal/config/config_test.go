@@ -113,3 +113,46 @@ func TestCheckpointIntervalFloor(t *testing.T) {
 		t.Fatal("settings with a 2m checkpoint interval loaded")
 	}
 }
+
+// RAM checkpoints (ADR-061) are on unless the Owner turns them off, every
+// minute by default, never under 30 s and never less often than the disk.
+func TestRAMCheckpointSettings(t *testing.T) {
+	d := Defaults().Checkpoints
+	if !d.RAMOn() || d.RAMEvery() != time.Minute || d.GuestInterval() != time.Minute {
+		t.Fatalf("defaults: on=%v every=%s guest=%s", d.RAMOn(), d.RAMEvery(), d.GuestInterval())
+	}
+	off := false
+	if c := (Checkpoints{Interval: Duration(10 * time.Minute), RAM: &off}); c.RAMOn() || c.GuestInterval() != 10*time.Minute {
+		t.Fatalf("off: %+v", c)
+	}
+	for _, r := range []time.Duration{time.Second, 29 * time.Second, 11 * time.Minute} {
+		if (Checkpoints{Interval: Duration(10 * time.Minute), RAMInterval: Duration(r)}).Validate() == nil {
+			t.Errorf("ram_interval %s accepted", r)
+		}
+	}
+	for _, r := range []time.Duration{30 * time.Second, 2 * time.Minute, 10 * time.Minute} {
+		if err := (Checkpoints{Interval: Duration(10 * time.Minute), RAMInterval: Duration(r)}).Validate(); err != nil {
+			t.Errorf("ram_interval %s: %v", r, err)
+		}
+	}
+	// A settings file written before RAM checkpoints existed turns them on.
+	dir := t.TempDir()
+	sf := filepath.Join(dir, "settings.json")
+	os.WriteFile(sf, []byte(`{"checkpoints":{"enabled":true,"interval":"10m0s"}}`), 0o600)
+	c, err := Load(filepath.Join(dir, "none.toml"), sf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Checkpoints.Enabled || !c.Checkpoints.RAMOn() || c.Checkpoints.GuestInterval() != time.Minute {
+		t.Fatalf("old settings: %+v", c.Checkpoints)
+	}
+	cf := filepath.Join(dir, "reflopd.toml")
+	os.WriteFile(cf, []byte("[checkpoints]\nenabled = true\nram = false\n"), 0o600)
+	if c, err = Load(cf, filepath.Join(dir, "none.json")); err != nil || c.Checkpoints.RAMOn() {
+		t.Fatalf("ram = false in the config file: %+v (%v)", c.Checkpoints, err)
+	}
+	os.WriteFile(cf, []byte("[checkpoints]\nenabled = true\nram_interval = \"10s\"\n"), 0o600)
+	if _, err = Load(cf, filepath.Join(dir, "none.json")); err == nil {
+		t.Fatal("a 10s ram_interval loaded")
+	}
+}

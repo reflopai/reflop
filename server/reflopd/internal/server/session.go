@@ -64,10 +64,17 @@ type Session struct {
 	// Snapshots and checkpoints (snapshots.go).
 	writing        *pendingWrite // at most one write in progress
 	final          bool          // ended on purpose: no checkpoint survives it
-	lastCheckpoint time.Time
+	lastCheckpoint time.Time     // the last checkpoint saved, in RAM or on disk
 	checkpointGen  uint64
-	// suspended: the worker's GPU memory is in host RAM (ADR-030).
+	lastDisk       time.Time      // the last checkpoint that reached the disk
+	diskGen        uint64         // its generation
+	ram            *ramCheckpoint // the newest checkpoint, when kept in RAM (ADR-061)
+	ramRefused     uint64         // the size of the last checkpoint that did not fit in RAM
+	stalled        bool           // the worker copies a checkpoint before serving requests
+	// suspended: the worker's GPU memory is in host RAM (ADR-030), or, with
+	// frozen, a CPU worker is frozen (ADR-061). Either way it runs nothing.
 	suspended bool
+	frozen    bool
 }
 
 func (s *Server) openSession(c *clientConn, req *pb.OpenSession) (*Session, error) {
@@ -418,12 +425,22 @@ func (s *Session) lost(why string) {
 	s.routes = map[uint64]*route{}
 	held := s.dropHeldLocked()
 	pw := s.writing
+	rc, final := s.ram, s.final
+	s.ram = nil
 	s.mu.Unlock()
 	if pw != nil {
-		os.Remove(pw.tmp)
 		s.clearWrite(pw)
 	}
 	s.srv.removeSession(s)
+	// The newest checkpoint may be in RAM only (ADR-061): write it to disk
+	// for RecoverSession, unless the session was ended on purpose.
+	if rc != nil {
+		if final {
+			s.srv.releaseRAM(rc)
+		} else {
+			s.persistInBackground(rc, "worker ended: "+trunc(why, 100), true)
+		}
+	}
 	if conn != nil {
 		for _, r := range routes {
 			if r.gen == conn.gen {

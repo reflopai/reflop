@@ -76,7 +76,8 @@ message DatasetClose {
   bytes dataset_id = 1;
 }
 
-// SnapshotWrite/SnapshotRead: one fd follows on the fd channel.
+// SnapshotWrite/SnapshotRead: one fd follows on the fd channel (a checkpoint
+// write may have two: see SnapshotWrite.targets).
 //
 // A write is asynchronous (ADR-029): the worker takes references to the
 // tensors between two requests (the cut), reports the file size in
@@ -91,6 +92,12 @@ message SnapshotWrite {
   bool checkpoint = 4;
   bytes tag = 5;
   uint64 generation = 6;
+  // Number of fds that follow: 0 or 1 = one; 2 = a RAM checkpoint (a memfd)
+  // and a disk file. SnapshotGo.target says which one to write (ADR-061).
+  uint32 targets = 7;
+  // When the GPU has no room for a second copy of the state, copy it now,
+  // holding later requests until it is copied, instead of skipping.
+  bool allow_stall = 8;
 }
 
 message SnapshotRead {
@@ -105,6 +112,9 @@ message SnapshotRead {
 message SnapshotCut {
   uint64 request_id = 1;
   uint64 bytes = 2;
+  // The worker copies the state before it serves any other request (the GPU
+  // has no room for a background copy; SnapshotWrite.allow_stall).
+  bool stall = 3;
 }
 
 // SnapshotGo (reflopd → worker): write the file, or drop the references.
@@ -113,6 +123,7 @@ message SnapshotGo {
   bool proceed = 2;
   ErrorCode code = 3;  // when !proceed
   string reason = 4;
+  uint32 target = 5;   // index of the fd to write (SnapshotWrite.targets); the others are closed
 }
 
 message StatsRequest {}

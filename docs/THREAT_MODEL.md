@@ -155,7 +155,8 @@ size before writing, and reflopd reserves it against the disk rail and the
 quota or refuses it (ADR-028).
 
 Checkpoints are off unless the Owner turns them on, and then at most one per
-session per interval, never more often than every 5 minutes (ADR-029).
+session per interval: on disk never more often than every 5 minutes
+(ADR-029), in RAM never more often than every 30 seconds (ADR-061).
 
 ## Client protection
 
@@ -186,7 +187,8 @@ session per interval, never more often than every 5 minutes (ADR-029).
 | The Owner sees Guests' data | by design (non-goal N1) |
 | Checkpoints wearing the Owner's SSD | Owner opt-in, off by default; a hard 5-minute floor on the interval, enforced by reflopd; a red worst-case warning every time they are turned on; the disk rail and quotas bound the space. The write volume itself is the cost the Owner accepts (ADR-029) |
 | Kernels that write to their arguments | `native_batch_norm` (training) and `_native_batch_norm_legit` update their running statistics, and `atan2.out` writes its `out`. The worker runs them on copies and points the handles at the copies when the execute commits (ADR-058), so server tensors never change in place: a checkpoint cut stays consistent and a failed execute changes no handle. A write that would resize its tensor is refused at V4. `test_in_place_writes.py` fails when a new opset entry writes an argument, until it is reviewed |
-| A checkpoint doubling the Guest's GPU memory for a moment | the worker refuses the cut when the GPU lacks that much free memory, so a checkpoint never pushes another Guest into OUT_OF_MEMORY; references are dropped tensor by tensor as they are copied |
+| A checkpoint doubling the Guest's GPU memory for a moment | the worker refuses a background cut when the GPU lacks that much free memory, so a checkpoint never pushes another Guest into OUT_OF_MEMORY; references are dropped tensor by tensor as they are copied. When reflopd allows a stall (the checkpoint that goes to disk), the worker copies before it serves any request instead, which needs no second copy; the watchdog does not count that pause (ADR-061) |
+| RAM checkpoints (ADR-061) holding Guest data in the Owner's RAM | reflopd creates each memfd, seals it (no write, grow or shrink, also through the worker's descriptor) and checks its size before keeping it; it never maps it and copies it to disk in the kernel (`sendfile`). The pages count against the RAM rail (the writing worker's cgroup, then the shared one); reflopd reserves the size first, caps all RAM checkpoints at half of the workers' budget and drops them before any worker is limited or killed. An end on purpose drops them unwritten. The disk copy is parsed in full on recovery like any checkpoint (I6) |
 | A revived session the Owner ended | kill, revoke, unpair and CloseSession delete the session's checkpoint, and a late write of that session is never published; RecoverSession reads only the calling identity's own directory and checks the file in full (Go and Python parsers) before anything is allocated |
 | The suspend helper (ADR-030) | it runs four CUDA driver calls on one pid. The driver's checkpoint API works between processes of one user without ptrace, so the helper is limited to reflop workers: reflopd passes only its own workers' pids, and the helper refuses any process whose parent is not its own parent or whose command line is not the worker's. It reads no Guest data; the driver moves GPU memory into the worker's own host memory |
 | A tampered client on PyPI | `pip` and `uv` do not check the offline signature. Only `pypi.yml`, through Trusted Publishing and the `pypi` GitHub environment, can upload, and only signed files. Someone who controls the PyPI account or the repository's Actions could still upload a different file. `install.sh` and `reflop update` check the signature on the Guest's machine |
@@ -206,7 +208,7 @@ session per interval, never more often than every 5 minutes (ADR-029).
    since the last one and recovers in the same process; what the Guest keeps
    on its own machine is not rewound. Long jobs can also `reflop.save`
    periodically. `reflopd pause --now` suspends GPU workers instead of killing
-   them when host RAM allows.
+   them when host RAM allows, and freezes CPU workers.
 7. At Level 0 a sandbox escape would land in the Owner's account. Level 1 is stronger.
 8. Without quotas, Guests can starve each other of GPU memory. That is by
    design; contention produces errors, not damage.

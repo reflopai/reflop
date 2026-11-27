@@ -424,7 +424,10 @@ class LocalConnection(Connection):
                 return self._error(env, cpb.ERROR_RESOURCE_LIMIT, "the Owner allows one checkpoint every "
                                    f"{self.checkpoint_interval_s}s")
             final = self._ckpt_path(self.session_id)
-            msg = wpb.SnapshotWrite(request_id=rid, checkpoint=True, tag=env.checkpoint.tag, generation=self._gen + 1)
+            # Every in-process checkpoint goes to disk: a state that fills the
+            # GPU is copied while requests wait (ADR-061), as reflopd allows.
+            msg = wpb.SnapshotWrite(request_id=rid, checkpoint=True, tag=env.checkpoint.tag, generation=self._gen + 1,
+                                    allow_stall=True)
         else:
             name = env.snapshot.name
             final = os.path.join(self._root(), name + ".safetensors")
@@ -433,7 +436,7 @@ class LocalConnection(Connection):
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         sid = self.session_id
 
-        def cut(r, _n):
+        def cut(r, _n, _stall=False):
             self.worker.writer.on_go(wpb.SnapshotGo(request_id=r, proceed=True))
 
         def done(resp):
@@ -455,7 +458,7 @@ class LocalConnection(Connection):
             self._deliver(resp)
 
         try:
-            self.worker.snapshot_write(msg, fd, cut, done)
+            self.worker.snapshot_write(msg, fd, cut, done, lambda gate: gate.wait())
         except Exception as e:  # noqa: BLE001 - as the worker's main loop
             from reflop_worker.errors import ReflopError as WorkerError
 

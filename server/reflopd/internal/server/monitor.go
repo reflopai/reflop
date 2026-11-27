@@ -115,6 +115,20 @@ func (s *Server) ramRail() {
 	r := s.cfg().Rails
 	using := s.workersMemory()
 	budget := rails.WorkerBudget(r, m, using)
+	// RAM checkpoints go before any worker is limited or killed (ADR-061).
+	// With a cgroup, workersMemory includes their pages; without, add them.
+	ramUsing := using
+	if s.cg == nil {
+		s.ramMu.Lock()
+		ramUsing += s.ramHeld
+		s.ramMu.Unlock()
+	}
+	if s.trimRAMCheckpoints(rails.WorkerBudget(r, m, ramUsing), sub64(m.Available, rails.RAMFloor(r, m.Total))) > 0 {
+		if s.cg == nil {
+			return // freed now; look again next tick before killing anything
+		}
+		using = s.workersMemory()
+	}
 	if s.cg != nil {
 		if ceiling := m.Total - rails.RAMFloor(r, m.Total); ceiling > 512<<20 {
 			s.cg.SetDaemonMemoryMax(ceiling)
@@ -160,9 +174,11 @@ func (s *Server) watchdog() {
 		}
 		limit := time.Duration(q.ExecuteWallMS) * time.Millisecond
 		sess.mu.Lock()
-		if sess.suspended {
+		if sess.suspended || sess.stalled {
+			// Suspended by the Owner, or copying a checkpoint that fills
+			// the GPU (ADR-061): its executes are not running.
 			sess.mu.Unlock()
-			continue // the Owner suspended it: its executes are not running
+			continue
 		}
 		over := false
 		for _, r := range sess.routes {

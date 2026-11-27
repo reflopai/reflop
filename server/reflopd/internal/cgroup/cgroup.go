@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -199,6 +200,39 @@ func (w *Worker) OOMKills() uint64 {
 		}
 	}
 	return 0
+}
+
+// Freeze stops (on) or resumes every process in the worker cgroup and waits
+// until the kernel reports that state in cgroup.events. A frozen process
+// uses no CPU and keeps its memory; a fatal signal still ends it.
+func (w *Worker) Freeze(on bool, timeout time.Duration) error {
+	v, want := "0", "frozen 0"
+	if on {
+		v, want = "1", "frozen 1"
+	}
+	if err := write(w.Dir, "cgroup.freeze", v); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(timeout)
+	for {
+		b, err := os.ReadFile(filepath.Join(w.Dir, "cgroup.events"))
+		if err == nil && hasLine(string(b), want) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s did not report %q within %s", w.Dir, want, timeout)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func hasLine(s, want string) bool {
+	for _, l := range strings.Split(s, "\n") {
+		if strings.TrimSpace(l) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Kill kills every process in the worker cgroup.

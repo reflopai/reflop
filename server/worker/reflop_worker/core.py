@@ -336,9 +336,9 @@ class Session:
         if ds is not None:
             ds.close()
 
-    def snapshot_write(self, msg: wpb.SnapshotWrite, fd: int, cut, done) -> None:
-        """Start a background write (see checkpoint.Writer)."""
-        self.writer.start(msg, fd, cut, done)
+    def snapshot_write(self, msg: wpb.SnapshotWrite, fds, cut, done, wait_go=None) -> None:
+        """Start a background write, or a stalled one (see checkpoint.Writer)."""
+        self.writer.start(msg, fds, cut, done, wait_go)
 
     def snapshot_read(self, msg: wpb.SnapshotRead, fd: int) -> None:
         """Restore tensors from a snapshot or checkpoint file: all or nothing.

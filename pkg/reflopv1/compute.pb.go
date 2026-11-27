@@ -2354,11 +2354,17 @@ func (x *Checkpoint) GetTag() []byte {
 }
 
 type CheckpointSaved struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Bytes         uint64                 `protobuf:"varint,1,opt,name=bytes,proto3" json:"bytes,omitempty"`
-	Generation    uint64                 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"` // 1, 2, ... within the session that took it
-	Skipped       bool                   `protobuf:"varint,3,opt,name=skipped,proto3" json:"skipped,omitempty"`       // nothing was written (reason says why); the previous checkpoint stays
-	Reason        string                 `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"`
+	state      protoimpl.MessageState `protogen:"open.v1"`
+	Bytes      uint64                 `protobuf:"varint,1,opt,name=bytes,proto3" json:"bytes,omitempty"`
+	Generation uint64                 `protobuf:"varint,2,opt,name=generation,proto3" json:"generation,omitempty"` // 1, 2, ... within the session that took it
+	Skipped    bool                   `protobuf:"varint,3,opt,name=skipped,proto3" json:"skipped,omitempty"`       // nothing was written (reason says why); the previous checkpoint stays
+	Reason     string                 `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"`
+	// Kept in the Owner's RAM; it reaches the disk at the Owner's disk
+	// interval, or when the session ends (ADR-061).
+	InRam bool `protobuf:"varint,5,opt,name=in_ram,json=inRam,proto3" json:"in_ram,omitempty"`
+	// The state filled the GPU, so the copy was made while the session's
+	// requests waited this long (instead of skipping the checkpoint).
+	PausedMs      uint32 `protobuf:"varint,6,opt,name=paused_ms,json=pausedMs,proto3" json:"paused_ms,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -2419,6 +2425,20 @@ func (x *CheckpointSaved) GetReason() string {
 		return x.Reason
 	}
 	return ""
+}
+
+func (x *CheckpointSaved) GetInRam() bool {
+	if x != nil {
+		return x.InRam
+	}
+	return false
+}
+
+func (x *CheckpointSaved) GetPausedMs() uint32 {
+	if x != nil {
+		return x.PausedMs
+	}
+	return 0
 }
 
 // RecoverSession restores, into this new and still empty session, the last
@@ -4186,14 +4206,16 @@ const file_reflop_v1_compute_proto_rawDesc = "" +
 	"\x04name\x18\x01 \x01(\tR\x04name\"\x1e\n" +
 	"\n" +
 	"Checkpoint\x12\x10\n" +
-	"\x03tag\x18\x01 \x01(\fR\x03tag\"y\n" +
+	"\x03tag\x18\x01 \x01(\fR\x03tag\"\xad\x01\n" +
 	"\x0fCheckpointSaved\x12\x14\n" +
 	"\x05bytes\x18\x01 \x01(\x04R\x05bytes\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x02 \x01(\x04R\n" +
 	"generation\x12\x18\n" +
 	"\askipped\x18\x03 \x01(\bR\askipped\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"8\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\x12\x15\n" +
+	"\x06in_ram\x18\x05 \x01(\bR\x05inRam\x12\x1b\n" +
+	"\tpaused_ms\x18\x06 \x01(\rR\bpausedMs\"8\n" +
 	"\x0eRecoverSession\x12&\n" +
 	"\x0ffrom_session_id\x18\x01 \x01(\fR\rfromSessionId\"\xae\x01\n" +
 	"\x10SessionRecovered\x12\x18\n" +

@@ -13,9 +13,14 @@ descriptor reflopd passed. Execution continues meanwhile.
 Costs, measured on an RTX 5070 (docs/fault_tolerance.md):
 - GPU memory: a tensor rebound during the copy keeps its old version
   allocated until it has been copied, so the session's state can need up to
-  twice its size. The cut is refused when the GPU does not have that much
-  free memory, and each reference is dropped as soon as its tensor has been
-  copied.
+  twice its size. Each reference is dropped as soon as its tensor has been
+  copied. When the GPU does not have that much free memory, the cut is
+  skipped, or, when reflopd allows it (SnapshotWrite.allow_stall), the state
+  is copied on the request thread before any later request runs: no tensor
+  is rebound meanwhile, so no second copy is needed, and the session's
+  requests wait for the copy (ADR-061).
+- Targets: reflopd may pass two descriptors, a memfd for a RAM checkpoint and
+  a disk file, and picks one when it answers the cut (SnapshotGo.target).
 - Host memory: two RING-byte buffers per session, pinned once.
 - Nothing is cached between checks; the file is plain safetensors and is
   validated again in full when it is read back (I6, I9).
@@ -125,10 +130,12 @@ class Writer:
 
     # -------------------------------------------------------------- the cut
 
-    def plan(self, msg: wpb.SnapshotWrite) -> tuple[list, bytes, int]:
-        """Take the cut. Returns (items, header bytes, total file bytes).
+    def plan(self, msg: wpb.SnapshotWrite) -> tuple[list, bytes, int, bool]:
+        """Take the cut. Returns (items, header bytes, total file bytes, stall).
 
-        items = [(key, tensor)] in file order. Runs on the request thread."""
+        items = [(key, tensor)] in file order; stall: copy now, on the
+        request thread (the GPU has no room for a background copy). Runs on
+        the request thread."""
         sess = self.sess
         if self.busy():
             raise ReflopError(cpb.ERROR_BUSY, "a snapshot or checkpoint of this session is still being written")
@@ -164,30 +171,50 @@ class Writer:
             hb, data = header([(k, t.dtype, tuple(t.shape)) for k, t in items])
         except SafetensorsError as e:
             raise ReflopError(cpb.ERROR_RESOURCE_LIMIT, str(e)) from None
-        if sess.device.type == "cuda":
-            on_device = sum(t.numel() * t.element_size() for _k, t in items if t.device.type == "cuda")
-            free = free_device_bytes(sess.device)
-            if on_device + GPU_MARGIN > free:
-                raise Skip(f"the GPU has {free >> 20} MiB free; a checkpoint of {on_device >> 20} MiB of state "
-                           f"needs that much again (plus {GPU_MARGIN >> 20} MiB) while it is copied")
-        return items, hb, len(hb) + data
+        stall = False
+        short = self.copy_room(items)
+        if short:
+            if not msg.allow_stall:
+                raise Skip(f"{short}. The next checkpoint that goes to the Owner's disk copies it while your "
+                           "requests wait instead")
+            stall = True
+        return items, hb, len(hb) + data, stall
+
+    def copy_room(self, items) -> str:
+        """Why the GPU has no room for a background copy of items, or ""."""
+        sess = self.sess
+        if sess.device.type != "cuda":
+            return ""
+        on_device = sum(t.numel() * t.element_size() for _k, t in items if t.device.type == "cuda")
+        free = free_device_bytes(sess.device)
+        if on_device + GPU_MARGIN > free:
+            return (f"the GPU has {free >> 20} MiB free; a background copy of {on_device >> 20} MiB of state needs "
+                    f"that much again (plus {GPU_MARGIN >> 20} MiB)")
+        return ""
 
     # -------------------------------------------------------------- start / go
 
-    def start(self, msg: wpb.SnapshotWrite, fd: int, cut, done) -> None:
-        """Cut now, report the size with cut(rid, bytes), wait for go, write.
+    def start(self, msg: wpb.SnapshotWrite, fds, cut, done, wait_go=None) -> None:
+        """Cut now, report the size with cut(rid, bytes, stall), wait for go,
+        write to the descriptor go names.
 
-        done(envelope) is called once, from the writer thread or from here."""
+        fds: one descriptor, or the list SnapshotWrite.targets announced.
+        done(envelope) is called once, from the writer thread or from here.
+        For a stalled cut, wait_go(gate) must deliver SnapshotGo (by reading
+        the control channel) when cut() did not already."""
         rid = msg.request_id
+        fds = [fds] if isinstance(fds, int) else list(fds)
         try:
-            items, hb, total = self.plan(msg)
+            items, hb, total, stall = self.plan(msg)
+            if stall and wait_go is None:
+                raise Skip("the GPU has no room for a background copy of the state")
         except Skip as e:
-            os.close(fd)
+            _close_all(fds)
             done(cpb.Envelope(request_id=rid, end=True, checkpoint_saved=cpb.CheckpointSaved(
                 skipped=True, reason=str(e), generation=msg.generation)))
             return
         except BaseException:
-            os.close(fd)
+            _close_all(fds)
             raise
         ev = None
         if self.sess.device.type == "cuda":
@@ -199,10 +226,19 @@ class Writer:
             self.go[rid] = (gate, verdict)
         if self.ring is None:
             self.ring = Ring(self.sess.device)
-        self.thread = threading.Thread(target=self._run, args=(msg, fd, items, hb, total, ev, gate, verdict, done),
+        if stall:
+            # No request runs until the state is copied, so nothing is
+            # rebound and the GPU needs no second copy.
+            t0 = time.monotonic()
+            cut(rid, total, True)
+            if not gate.is_set():
+                wait_go(gate)
+            self._run(msg, fds, items, hb, total, ev, gate, verdict, done, stalled_since=t0)
+            return
+        self.thread = threading.Thread(target=self._run, args=(msg, fds, items, hb, total, ev, gate, verdict, done),
                                        name="reflop-snapshot", daemon=True)
         self.thread.start()
-        cut(rid, total)
+        cut(rid, total, False)
 
     def on_go(self, g: wpb.SnapshotGo) -> None:
         with self.lock:
@@ -213,7 +249,7 @@ class Writer:
 
     # -------------------------------------------------------------- the thread
 
-    def _run(self, msg, fd, items, hb, total, ev, gate, verdict, done) -> None:
+    def _run(self, msg, fds, items, hb, total, ev, gate, verdict, done, stalled_since=None) -> None:
         rid = msg.request_id
         try:
             gate.wait()
@@ -223,10 +259,16 @@ class Writer:
                 done(cpb.Envelope(request_id=rid, end=True, error=cpb.Error(
                     code=g.code or cpb.ERROR_SAFETY_RAIL, message=g.reason[:500])))
                 return
+            if g.target >= len(fds):
+                raise ValueError(f"write target {g.target} of {len(fds)}")
+            fd = fds[g.target]
+            _close_all(fds[:g.target] + fds[g.target + 1:])
+            fds = [fd]
             self._write(fd, items, hb, ev)
             if msg.checkpoint:
+                paused = 0 if stalled_since is None else int((time.monotonic() - stalled_since) * 1000)
                 done(cpb.Envelope(request_id=rid, end=True, checkpoint_saved=cpb.CheckpointSaved(
-                    bytes=total, generation=msg.generation)))
+                    bytes=total, generation=msg.generation, paused_ms=max(paused, 1) if stalled_since else 0)))
             else:
                 done(cpb.Envelope(request_id=rid, end=True, snapshot_saved=cpb.SnapshotSaved(bytes=total)))
         except BaseException as e:  # noqa: BLE001 - the thread must always answer
@@ -235,7 +277,7 @@ class Writer:
             done(cpb.Envelope(request_id=rid, end=True, error=cpb.Error(
                 code=cpb.ERROR_INTERNAL, message=f"{what} write failed: {type(e).__name__}: {str(e)[:300]}")))
         finally:
-            os.close(fd)
+            _close_all(fds)
 
     def _write(self, fd: int, items: list, hb: bytes, ev) -> None:
         _write_all(fd, memoryview(hb))
@@ -287,6 +329,14 @@ class Writer:
                 del src, flat_src, t
             if pending is not None:
                 flush_pending()
+
+
+def _close_all(fds) -> None:
+    for fd in fds:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
 
 
 def _write_all(fd: int, mv: memoryview) -> None:

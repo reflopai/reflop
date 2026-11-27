@@ -75,4 +75,8 @@ message ServerCapabilities {
   // Checkpoints ("checkpoints" capability): the Owner's interval in seconds,
   // the shortest a Guest may use. 0 = the Owner has not enabled them.
   uint64 checkpoint_interval_s = 9;
+  // How often a checkpoint reaches the Owner's disk. Larger than
+  // checkpoint_interval_s when checkpoints are kept in RAM in between
+  // (ADR-061); 0 from older servers.
+  uint64 checkpoint_disk_interval_s = 10;
 }

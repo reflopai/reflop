@@ -288,7 +288,7 @@ and set it again.
 
 ```sh
 reflopd pause            # new work waits; running work finishes
-reflopd pause --now      # also frees the GPU now: running workers are suspended
+reflopd pause --now      # also frees the GPU now: GPU workers are suspended, CPU workers frozen
 reflopd resume
 reflopd kill alice       # end alice's sessions (or pass a session id prefix)
 reflopd say "pausing in 10 minutes for a deadline run"
@@ -310,9 +310,12 @@ did before, when:
 - suspending it would take host RAM below the RAM floor: it needs about as
   much free RAM as the GPU memory it uses (nvidia-smi shows that);
 - a kernel is still running after 10 seconds;
-- the driver is older than 550, or the worker runs on the CPU.
+- the driver is older than 550.
 
-`pause --now` prints how many sessions it suspended and killed, and why.
+CPU sessions hold no GPU memory: `pause --now` freezes them (the kernel stops
+every thread of the worker; it uses no CPU and keeps its memory) and `resume`
+thaws them (ADR-061). `pause --now` prints how many sessions it suspended,
+froze and killed, and why.
 `reflopd status` marks suspended sessions. A killed session's last checkpoint
 (see below) stays, so the Guest can recover from it.
 
@@ -326,9 +329,12 @@ and only as much as the GPU memory it moves.
 ## Guest checkpoints
 
 Checkpoints are off by default. When you turn them on, a Guest can have its
-session saved to this machine's disk at a step boundary, at most once per
-interval. A worker crash, a `reflopd` restart or a `pause --now` that had to
-kill the worker then costs the Guest at most one interval of work.
+session saved at a step boundary. The newest checkpoint of each session is
+kept in this machine's RAM, taken at most once a minute by default, and
+written to disk every 10 minutes by default, when the session's worker ends,
+and when reflopd stops (ADR-061). A worker crash, the watchdog, a rail,
+eviction, a `reflopd` restart or a `pause --now` that had to kill the worker
+then costs the Guest at most one RAM interval of work.
 
 > [!WARNING]
 > **Checkpoints wear out SSDs and use extra GPU memory.**
@@ -343,14 +349,22 @@ kill the worker then costs the Guest at most one interval of work.
 > - While a checkpoint is copied, the GPU memory for the Guest's state
 >   doubles: a tensor that changes during the copy keeps its old version
 >   until that version is copied. A checkpoint that does not fit in free GPU
->   memory is skipped, never forced, so it cannot take memory from another
->   Guest.
+>   memory never takes memory from another Guest: the one that goes to disk
+>   is copied while that Guest's work waits (8 GiB took about 1.2 s), and the
+>   others are skipped.
+> - RAM checkpoints use host RAM: up to each Guest's state size, twice that
+>   while the next one is written. All of them together use at most half of
+>   the RAM workers may use (the RAM rail's budget), and they are dropped
+>   first, before any worker is limited or killed, when you need the memory.
+>   A Guest whose state does not fit gets disk checkpoints only.
 
 ```sh
-reflopd checkpoints on                  # at most one per session every 10 minutes
-reflopd checkpoints on --interval 30m   # less often
+reflopd checkpoints on                      # in RAM every minute, on disk every 10 minutes
+reflopd checkpoints on --interval 30m       # to disk less often
+reflopd checkpoints on --ram-interval 5m    # in RAM less often (at least 30s)
+reflopd checkpoints on --ram=false          # disk only, once per --interval
 reflopd checkpoints off
-reflopd checkpoints                     # show the setting
+reflopd checkpoints                         # show the setting
 ```
 
 Every time you turn them on, reflopd prints a red warning with the worst case
@@ -364,11 +378,16 @@ WARNING: checkpoints wear out SSDs and use extra GPU memory.
   up to 72 GiB written per hour of use (1.7 TiB per day).
   Each GiB of Guest state writes 6 GiB per hour.
   While a checkpoint is copied, the GPU memory for the Guest's state doubles.
+  Between disk writes, a checkpoint is taken every 1m0s and kept in RAM: up to the
+  Guest's state size per session (twice that while a new one is written), at most half of the
+  RAM workers may use, dropped first when the RAM rail needs the memory.
 ```
 
-The interval cannot be shorter than 5 minutes. No flag, setting or Guest
-request goes below that. Guests use your interval or a longer one, and
-reflopd refuses a checkpoint that comes sooner.
+The disk interval cannot be shorter than 5 minutes and the RAM interval not
+shorter than 30 seconds. No flag, setting or Guest request goes below that.
+Guests use your interval (the RAM one, when RAM checkpoints are on) or a
+longer one, and reflopd refuses a checkpoint that comes sooner.
+`reflopd status` shows how many RAM checkpoints there are and their size.
 
 Each session keeps one checkpoint, replaced atomically, in
 `snapshots/<identity>/.checkpoints/`. Checkpoints count against the disk rail
@@ -381,6 +400,8 @@ Guest can recover from it.
 Measured on an RTX 5070 with 3.3 GiB of Guest state, a checkpoint took about
 3.4 seconds to reach the disk and did not slow training measurably; the extra
 GPU memory was held for about 0.6 seconds ([fault_tolerance.md](fault_tolerance.md)).
+RAM checkpoints every 30 seconds did not slow training either (1.9 GiB of
+state), and reflopd wrote an 8 GiB RAM checkpoint to disk in 1.8 seconds.
 
 ## Monitoring and the audit log
 
@@ -475,9 +496,11 @@ tf32_cudnn = true
 ttl = "30m"       # how long a disconnected session's state is kept; a kept
                   # session is evicted early when a new session needs its GPU memory
 
-[checkpoints]     # also set by `reflopd checkpoints on|off`
+[checkpoints]          # also set by `reflopd checkpoints on|off`
 enabled = false
-interval = "10m"  # never below 5m
+interval = "10m"       # to disk; never below 5m
+ram = true             # keep the newest checkpoint in RAM in between
+ram_interval = "1m"    # never below 30s
 
 [yield]
 suspend = false   # `yield --auto --suspend`

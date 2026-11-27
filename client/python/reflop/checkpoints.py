@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -104,13 +105,18 @@ class AutoCheckpoint:
         if e is None:
             r = fut.result().checkpoint_saved
             if r.skipped:
-                self._warn("skip:" + r.reason[:40], f"checkpoint skipped: {sanitize(r.reason, 300)} "
+                # Once per kind of reason: the free memory in it changes every time.
+                self._warn("skip:" + re.sub(r"[0-9]+", "#", r.reason[:60]), f"checkpoint skipped: {sanitize(r.reason, 300)} "
                            f"(trying again in {_minutes(min(RETRY_S, self.interval))})")
                 return
             with self.lock:
                 self.last_ok = time.monotonic()
                 self.saved += 1
                 self.generation = r.generation
+            if r.paused_ms:
+                disk = int(self.sess.caps.checkpoint_disk_interval_s or self.sess.caps.checkpoint_interval_s)
+                self._warn("paused", f"your state fills the GPU, so it was checkpointed while your work waited "
+                           f"({r.paused_ms / 1000:.1f} s; once every {_minutes(disk)})")
             return
         if isinstance(e, SessionLostError):
             return
@@ -143,10 +149,15 @@ def enable(sess, interval=None) -> None:
         sess.checkpoints.disabled = False
         return
     sess.checkpoints = AutoCheckpoint(sess, iv)
+    disk = int(caps.checkpoint_disk_interval_s)  # 0: a server without RAM checkpoints or pauses (ADR-061)
+    where = (f"kept in the Owner's RAM, on the Owner's disk every {_minutes(disk)}" if disk > iv
+             else "on the Owner's disk")
+    short = ("your work waits while the state is copied, once per disk checkpoint" if disk
+             else "the checkpoint is skipped")
     sys.stderr.write(_yellow(
-        f"reflop: checkpoints on (one every {_minutes(iv)}). While a checkpoint is copied, the GPU memory used by\n"
-        "  your session's state (parameters, optimizer state, buffers) doubles. Leave that much GPU memory free,\n"
-        "  or the checkpoint is skipped.") + "\n")
+        f"reflop: checkpoints on (one every {_minutes(iv)}, {where}). While a checkpoint is copied, the GPU memory\n"
+        "  used by your session's state (parameters, optimizer state, buffers) doubles. Leave that much GPU\n"
+        f"  memory free; if you don't, {short}.") + "\n")
 
 
 def set_tag(sess, obj) -> None:

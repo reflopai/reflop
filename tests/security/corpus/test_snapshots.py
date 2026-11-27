@@ -41,7 +41,7 @@ def write(s: Session, msg: wpb.SnapshotWrite, path) -> list:
     out = []
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
 
-    def cut(rid, _n):
+    def cut(rid, _n, _stall=False):
         s.writer.on_go(wpb.SnapshotGo(request_id=rid, proceed=True))
 
     s.snapshot_write(msg, fd, cut, out.append)
@@ -147,7 +147,7 @@ def test_checkpoint_is_the_state_at_the_cut(tmp_path):
     fd = os.open(p, os.O_WRONLY | os.O_CREAT, 0o600)
     gate = []
     s.snapshot_write(wpb.SnapshotWrite(request_id=3, checkpoint=True, tag=b'{"step": 9}', generation=4), fd,
-                     lambda rid, n: gate.append(rid), out.append)
+                     lambda rid, n, _stall=False: gate.append(rid), out.append)
     for _ in range(20):  # training continues before the writer may go
         s.handles.replace(H1, s.handles.t[H1] * 3)
     torch.rand(10)  # the RNG moves on too
@@ -169,7 +169,7 @@ def test_refused_go_writes_nothing(tmp_path):
     s.handles.put_new(H1, torch.ones(4))
     out = []
     fd = os.open(tmp_path / "ck", os.O_WRONLY | os.O_CREAT, 0o600)
-    s.snapshot_write(wpb.SnapshotWrite(request_id=3, checkpoint=True), fd, lambda rid, n: s.writer.on_go(
+    s.snapshot_write(wpb.SnapshotWrite(request_id=3, checkpoint=True), fd, lambda rid, n, _stall=False: s.writer.on_go(
         wpb.SnapshotGo(request_id=rid, proceed=False, code=cpb.ERROR_QUOTA, reason="quota")), out.append)
     s.writer.thread.join()
     assert out[-1].error.code == cpb.ERROR_QUOTA

@@ -291,6 +291,12 @@ message CheckpointSaved {
   uint64 generation = 2;  // 1, 2, ... within the session that took it
   bool skipped = 3;       // nothing was written (reason says why); the previous checkpoint stays
   string reason = 4;
+  // Kept in the Owner's RAM; it reaches the disk at the Owner's disk
+  // interval, or when the session ends (ADR-061).
+  bool in_ram = 5;
+  // The state filled the GPU, so the copy was made while the session's
+  // requests waited this long (instead of skipping the checkpoint).
+  uint32 paused_ms = 6;
 }
 
 // RecoverSession restores, into this new and still empty session, the last
