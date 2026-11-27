@@ -75,7 +75,7 @@ Only these saved invocations were available. The remaining catalog suites—incl
 
 These saved results contain no native CUDA baseline. They cannot establish the percentage of native GPU throughput retained by reFLOP. The root README's 74% ResNet capture result is a separate same-machine experiment and cannot be combined with this run.
 
-Follow the [native comparison workflow](../README.md#compare-native-gpu-and-reflop-throughput) to collect both runs from the current source and generate percentage, samples/second, and milliseconds/step comparisons. The comparator requires matching training-source hashes, runtime versions, numerical policies, and configuration. Collect a fresh remote run alongside the native baseline after changing the harness; do not compare an old run against a different workload implementation.
+Follow the native comparison workflow of that harness (in git history) to collect both runs from the current source and generate percentage, samples/second, and milliseconds/step comparisons. The comparator requires matching training-source hashes, runtime versions, numerical policies, and configuration. Collect a fresh remote run alongside the native baseline after changing the harness; do not compare an old run against a different workload implementation.
 
 The harness now defaults to this repository's source client and C/C++ API. The current catalog excludes ResNet-18 batch 1, reducing the default catalog from the historical 1,396 cases to 1,388. The JSON snapshots and graphs here retain the original run and all eight failures across correctness and throughput. The numerical ResNet failures remain unresolved.
 

@@ -1,5 +1,8 @@
 # reFLOP benchmark results — 15 November 2026 (UTC)
 
+> Historical: made with the harness the [live suite](../../README.md) replaced. The scripts named below
+> (`compare_cuda.sh`, `native_cuda.sh`, `plot_results.py`, ...) are in git history, not in the tree.
+
 **At batch 128 with resident inputs, reFLOP capture retains 35.6–70.1% of native eager GPU throughput for eight workloads; LSTM and GRU retain 4.0–4.6%.** Native PyTorch ran locally on the Linux Owner workstation. The Guest ran on a MacBook Pro over Tailscale TLS to the same RTX 5070. Uploading inputs every step reduces capture throughput to 0.26–10.52% of the corresponding native upload baseline.
 
 These are measured timing ratios, not numerical validation. The available correctness evidence still contains unresolved ResNet-18 failures. The [14 November analysis](historical-2026-11-14.md) and the root README's same-machine 74% ResNet result are separate experiments; neither supplies this comparison's baseline.

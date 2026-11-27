@@ -363,18 +363,18 @@ kind of tensor subclass). `reflop.capture` gives the same benefit.
 
 ## Measuring throughput
 
-Use [`benchmark/`](../benchmark/README.md) to compare reFLOP with native eager
-PyTorch on the same Owner GPU. The Owner collects `native_cuda.sh`; the Guest
-collects `inventory.sh`, `correctness.sh`, and `throughput.sh`. Use the same
-benchmark source, timing configuration, and numerical policy on both sides.
-`compare_cuda.sh` then reports absolute samples/second, milliseconds/step, and
-the percentage of native throughput retained.
+The [live suite](../benchmark/README.md) in `benchmark/` compares reFLOP with
+native PyTorch on the same Owner GPU. From the Guest, `./benchmark/setup.sh`
+and `./benchmark/run_full.sh b01 b02` time ten workloads on reFLOP (b01) and,
+with the Owner's permission (`E2E_OWNER_SSH`), the same workloads natively on
+the Owner (b02). `python -m live.report` then shows milliseconds per step, the
+percentage of native speed kept, and the overhead reFLOP adds.
 
 Compare resident and uploaded inputs separately. Resident cases reuse a batch
 already on the device; uploaded cases include the Guest-to-Owner transfer each
 step. Capture/eager speedup alone does not tell you how much native performance
-you retain. Check correctness failures and missing cases before selecting a
-workload, and record your connection conditions with the results.
+you retain. Check correctness failures and missing cases before choosing a
+workload. The suite records the round trip and network path with each run.
 
 In the 28 November 2026 run (Owner RTX 5070, batch 128, data resident,
 capture on, Guest on another machine), reFLOP kept this share of native CUDA
@@ -384,10 +384,8 @@ nodes per step). Uploading inputs every step was bound by the network (about
 10 MiB/s, 4.1 ms round trip) and kept 0.2–25%. Matmul on the GPU reached the
 same TFLOP/s as native CUDA, and eight processes at once reached 1.77× the
 throughput of one, sharing the GPU evenly. These are synthetic steady-state
-measurements. The [saved report](../benchmark/report/README.md) has an earlier
-run with its raw data. The ResNet-18 correctness failures in that report came
-from the CPU reference, not reFLOP
-([#19](https://github.com/reflopai/reflop/issues/19)).
+measurements. The [report](../benchmark/report/2026-11-28/README.md) has this
+run with its data.
 
 ## Unmodified CUDA scripts
 

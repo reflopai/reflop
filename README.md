@@ -334,8 +334,7 @@ Guest on another machine over the network.
   14.2 ms/step, with flat memory use.
 
 See [`benchmark/`](benchmark/README.md) to reproduce these measurements, and
-the [benchmark report](benchmark/report/README.md) for an earlier, saved run
-with its raw data.
+the [report](benchmark/report/2026-11-28/README.md) for this run with its data.
 
 Steps whose Python numbers change every step (a non-capturable Adam's bias
 correction, a Python learning-rate schedule) are detected and refused; use

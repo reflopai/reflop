@@ -904,15 +904,15 @@ A **test-only build hook** (excluded from release builds) executes probes inside
 | Throughput vs running locally on the server GPU (ResNet-18/CIFAR-10, LAN) | ≥ 70% |
 | Validation time for a 10k-node graph | ≤ 1 s (once per registration) |
 
-The broader workload harness lives in [`benchmark/`](../benchmark/README.md).
-It collects native eager CUDA and remote eager/capture runs separately, retains
-failed and unavailable cases, and produces matched throughput ratios with
-`compare_cuda.sh`. Its offline `selfcheck.sh` needs no daemon. Live correctness,
-operator, transfer, concurrency, checkpoint, and fault suites supplement these
-measurements. They do not replace conformance or the security corpus. Publish
+The broader workload suite lives in [`benchmark/`](../benchmark/README.md):
+the live suite runs against a real reflopd, times remote eager/capture runs
+against native CUDA on the Owner, retains failed and unavailable cases, and
+reports retained throughput with `python -m live.report`. Its correctness,
+operator, transfer, concurrency, checkpoint and Owner-control suites
+supplement these measurements. They do not replace conformance or the security corpus. Publish
 native-relative results only with matching source, configuration, hardware,
 runtime versions, numerical settings, and the measured network conditions.
-The [15 November 2026 report](../benchmark/report/README.md)
+The [15 November 2026 report](../benchmark/report/historical/README.md)
 compares local native execution on the Owner's RTX 5070 with a MacBook Pro
 Guest over Tailscale TLS. Its 156 matched cases quantify retained throughput;
 unrecorded RTT/bandwidth and unresolved correctness checks limit conclusions

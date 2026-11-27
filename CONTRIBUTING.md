@@ -57,25 +57,26 @@ would make a probe skip or pass without testing the sandbox is a failure. See
 
 ## Benchmarks
 
-`benchmark/` contains an offline harness check and live suites for correctness,
-throughput, operators, data movement, concurrency, and recovery. Start with:
+`benchmark/` is the live suite: end-to-end tests and benchmarks against a real
+reflopd (correctness, throughput against native CUDA, data movement, Owner
+controls, recovery). It needs a paired client and a running daemon, so it is
+not part of `make test`; CI runs only its offline tests
+(`tests/benchmark/`). To run it:
 
 ```sh
-./benchmark/scripts/bootstrap.sh
-./benchmark/scripts/selfcheck.sh
+./benchmark/setup.sh                 # benchmark/.venv with this checkout's client
+E2E_QUICK=1 ./benchmark/run_full.sh  # a quick pass over every suite
 ```
 
-Bootstrap installs this checkout's client into `benchmark/.venv`. Live suites
-need a separately started daemon and paired client; they are not part of
-`make test`. Read the [benchmark guide](benchmark/README.md) before running
-`run_all.sh`, which includes long runs and any configured fault hooks.
+Read the [guide](benchmark/README.md) before pointing it at an Owner: Owner
+suites pause, kill and change settings there. When your change alters
+behaviour a live case checks, update the case in the same pull request.
 
-For performance changes, collect `native_cuda.sh` on the Owner GPU and
-`throughput.sh` from the Guest using matching source and configuration. Generate
-native-relative percentages and absolute timings with `compare_cuda.sh`.
-Include correctness outcomes, repeat counts, versions, hardware, numerical
-settings, and network conditions in the PR. Keep raw runs, environments, caches,
-and credentials out of Git; review any report snapshot before adding it.
+For performance changes, run `b01` and `b02` before and after the change and
+compare them with `python -m live.report` (overhead, not raw milliseconds:
+the GPU's speed and the network change between runs). Put the numbers that
+matter in the PR. Raw runs stay out of Git; publish one only through
+`python -m live.sanitize`, and read it before you commit it.
 
 ## Branches
 
@@ -103,6 +104,6 @@ issue or pull request; follow [SECURITY.md](SECURITY.md) first.
 | `clib/` | the C/C++ API |
 | `pkg/` | Go packages shared by reflopd and libreflop |
 | `docs/` | the design (`PLAN.md`), ADRs, threat model, Owner and Guest guides |
-| `benchmark/` | workload suites, native CUDA comparisons, offline checks, and saved reports |
+| `benchmark/` | the live suite (end-to-end tests and benchmarks against a real reflopd) and its reports |
 | `tests/` | conformance, security corpus, isolation, e2e, perf |
 | `spikes/` | M0 spikes |
