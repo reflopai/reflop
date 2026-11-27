@@ -192,6 +192,11 @@ class Session:
                 send(cpb.Envelope(request_id=rid, end=True, reseeded=cpb.Reseeded()))
             elif which == "ping":
                 send(cpb.Envelope(request_id=rid, end=True, pong=cpb.Pong(nonce=env.ping.nonce)))
+            elif which == "native_baseline":
+                from . import nativebench
+
+                send(cpb.Envelope(request_id=rid, end=True,
+                                  native_baseline_result=nativebench.run(self.device, env.native_baseline)))
             else:
                 raise ReflopError(cpb.ERROR_PROTOCOL, f"unexpected request {which}")
         except FatalError:

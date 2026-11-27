@@ -578,6 +578,34 @@ def cmd_verify(a) -> int:
     return 0 if ok else 1
 
 
+# `reflop test` architectures, as in testzoo.WORKLOADS (kept here so the parser does not import torch;
+# tests/client/test_reflop_test.py checks they agree).
+TEST_WORKLOADS = (
+    ("mlp", "3-layer MLP on 784 features"),
+    ("cnn", "3-block CNN with BatchNorm, 32x32 images"),
+    ("resnet", "ResNet-18, 32x32 images"),
+    ("unet", "small U-Net, 64x64 segmentation"),
+    ("lstm", "2-layer LSTM, 64 steps"),
+    ("gru", "2-layer GRU, 64 steps"),
+    ("transformer", "2-layer transformer encoder, 64 tokens"),
+    ("gpt", "4-layer causal GPT, 128 tokens"),
+    ("lora", "LoRA adapters on a frozen 4-layer MLP"),
+    ("autoencoder", "convolutional autoencoder, 32x32 images"),
+)
+TEST_ALL_MINUTES = (2, 5)   # what `reflop test --all` usually takes, and on a slow connection
+
+
+def cmd_test(a) -> int:
+    from .. import speedtest
+
+    names = [n for n, _ in TEST_WORKLOADS] if a.all else [a.workload]
+    if a.all:
+        lo, hi = TEST_ALL_MINUTES
+        print(f"Testing all {len(names)} architectures takes about {lo} minutes, up to {hi} on a slow "
+              "connection. Ctrl-C stops it.", file=sys.stderr)
+    return speedtest.run(names, batch=a.batch, server=a.server, cpu=a.cpu)
+
+
 def cmd_doctor(a) -> int:
     from ..doctor import doctor
 
@@ -654,6 +682,20 @@ def main(argv: list[str] | None = None) -> int:
     p.set_defaults(fn=cmd_run)
     sub.add_parser("verify", help="cross-check small graphs against local CPU").set_defaults(fn=cmd_verify)
     sub.add_parser("doctor", help="diagnose this machine and the connection").set_defaults(fn=cmd_doctor)
+    p = sub.add_parser("test", help="measure training speed over this connection against native speed on the server",
+                       description="Train a small model of the chosen kind on the server for a few seconds and "
+                       "compare it with the same model trained natively on the server's own device. The score is "
+                       "the share of native speed you get over this connection (100% = as fast as running there). "
+                       "Pick the architecture closest to yours; --all tests every one.",
+                       epilog="Nothing runs on this machine's GPU, and no code from this machine runs on the "
+                       "server: it trains reflopd's own copy of the model.")
+    g = p.add_mutually_exclusive_group(required=True)
+    for wname, label in TEST_WORKLOADS:
+        g.add_argument(f"--{wname}", dest="workload", action="store_const", const=wname, help=label)
+    g.add_argument("--all", action="store_true", help="every architecture above (a few minutes)")
+    p.add_argument("--batch", type=int, default=32, choices=(8, 16, 32, 64, 128), help="batch size (default 32)")
+    p.add_argument("--cpu", action="store_true", help="test the server's CPU instead of its GPU")
+    p.set_defaults(fn=cmd_test)
     p = sub.add_parser("update", help="update the reflop client")
     p.add_argument("--check", action="store_true")
     p.add_argument("--version")

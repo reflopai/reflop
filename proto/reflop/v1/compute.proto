@@ -379,6 +379,30 @@ message Unpaired {
   string identity_name = 1;
 }
 
+// NativeBaseline asks how fast one of the built-in `reflop test` workloads
+// trains natively on the session's device (ADR-064). The session's worker
+// runs reflopd's own copy of that model (testzoo.py) with plain PyTorch:
+// nothing the Guest sent runs. reflopd answers from its cache when it has
+// measured this workload before on this device, runtime and numerics, and
+// measures only while no other Guest's session uses the device (else
+// ERROR_BUSY). Unknown workloads and batch sizes get ERROR_PROTOCOL. Servers
+// that list the "native_baseline" capability support it.
+message NativeBaseline {
+  string workload = 1;   // a testzoo name: "mlp", "transformer", "unet", ...
+  uint32 batch = 2;      // one of testzoo.BATCHES
+}
+
+message NativeBaselineResult {
+  string workload = 1;
+  uint32 batch = 2;
+  double ms_per_step = 3;        // median of the repeats
+  repeated double ms_reps = 4;   // each repeat's mean ms per step
+  uint32 steps = 5;              // timed steps per repeat
+  uint32 zoo_version = 6;        // testzoo.ZOO_VERSION the worker ran
+  bool cached = 7;               // answered from reflopd's cache
+  int64 measured_unix = 8;
+}
+
 // ---------------------------------------------------------------- envelope
 
 message Envelope {
@@ -413,6 +437,7 @@ message Envelope {
     Checkpoint checkpoint = 34;
     RecoverSession recover_session = 35;
     DescribeSnapshot describe_snapshot = 36;
+    NativeBaseline native_baseline = 37;
 
     // server → client
     Error error = 100;
@@ -441,5 +466,6 @@ message Envelope {
     CheckpointSaved checkpoint_saved = 123;
     SessionRecovered session_recovered = 124;
     SnapshotDescription snapshot_description = 125;
+    NativeBaselineResult native_baseline_result = 126;
   }
 }

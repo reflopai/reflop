@@ -2316,3 +2316,56 @@ sanitizer cannot know names a run never recorded, so a report is read before
 it is committed. Checks of the old harness that the suite lacks are listed
 in `benchmark/README.md` ("Not covered"); ADR-059's reference now lives in
 `benchmark/live/helpers/reference_train.py`.
+
+## ADR-064: `reflop test` scores a connection against native speed measured by the Owner
+
+**Context.** The README's throughput numbers were measured over a LAN with a
+4 ms round trip. A Guest on another connection gets different numbers, and
+how much of the GPU's speed reaches them depends on their link and on the
+kind of model (an LSTM is slow on reFLOP whatever the link). A Guest needs to
+measure that on their own connection, quickly. "100%" has to be the model's
+native speed on the Owner's GPU: most Guests (a Mac, a laptop) have no CUDA,
+and their own GPU would be another device. reFLOP cannot estimate native time
+from a graph (native PyTorch runs an LSTM as one cuDNN kernel, reFLOP as
+thousands of nodes), and the worker's execute time is Python dispatch without
+a device sync.
+
+**Decision.** (The maintainer chose this on 2026-11-28.)
+
+- `reflop test --<architecture>` (or `--all`) trains one of ten small models
+  (`testzoo.py`) on the Guest's session: with `reflop.capture` and the data on
+  the server, uploading each batch, and eagerly. It also measures the round
+  trip and the upload speed. A spinner shows progress on a terminal.
+- A new request, NativeBaseline (workload name, batch), makes the session's
+  worker train reflopd's own copy of that model with plain PyTorch, timed the
+  same way (`time_steps`), and report ms per step. The Guest sends no code:
+  reflopd and the worker each check the name and the batch against fixed
+  lists, and the model is the worker's. The worker restores the session's RNG
+  streams and releases the run's memory.
+- reflopd keeps each result in `<state>/native_baselines.json`, keyed by GPU
+  UUID, torch and CUDA versions, driver, the session's numerics, ZOO_VERSION,
+  workload and batch, and answers every later request (any Guest) from it.
+  Without a cached result it measures only when no other session uses the
+  device, and one measurement at a time per device; otherwise ERROR_BUSY, and
+  the Guest's test shows its numbers without a score.
+- Score = native ms / reFLOP ms, capped at 100%. The client and the worker
+  carry byte-identical copies of `testzoo.py` (a test checks it); reflopd's
+  lists and version match it (TestNativeZooVersionInSync). Servers advertise
+  the `native_baseline` capability.
+
+**Alternatives.** Comparing with CUDA on the Guest: most Guests have none,
+and a different GPU says nothing about this one. A table of native times per
+GPU model shipped with the client: every GPU, driver and runtime would need
+an entry, and it would go stale. Measuring natively on every test: the same
+GPU's native time does not change, and each run would cost the Owner GPU time
+and slow down anyone else on the GPU.
+
+**Consequences.** The score answers "how much of that GPU's speed do I get
+over this connection", not "is this faster than my machine": the output also
+gives absolute ms per step and samples per second for that. A new combination
+costs the Owner about a second of GPU time once. A cached value can go stale
+when something outside the key changes (clocks, power limits); the Owner
+deletes the file to measure again. Older reflopd answers ERROR_PROTOCOL and
+does not list the capability, so the client shows no score. Tests:
+`baseline_test.go`, `tests/client/test_reflop_test.py`,
+`tests/security/corpus/test_native_baseline.py`.

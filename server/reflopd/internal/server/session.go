@@ -29,6 +29,7 @@ type route struct {
 	nodes  int
 	hash   []byte
 	onDone func(*pb.Envelope)
+	onLost func() // the worker ended before answering (onDone never runs)
 }
 
 // Session is one worker-backed unit of work (PLAN.md §6.1).
@@ -273,6 +274,8 @@ func (s *Session) dispatch(c *clientConn, env *pb.Envelope) error {
 		return s.checkpoint(c, env, b.Checkpoint)
 	case *pb.Envelope_RecoverSession:
 		return s.recoverSession(c, env, b.RecoverSession)
+	case *pb.Envelope_NativeBaseline:
+		return s.nativeBaseline(c, env, b.NativeBaseline)
 	}
 	s.mu.Lock()
 	key := [2]uint64{c.gen, env.RequestId}
@@ -439,6 +442,11 @@ func (s *Session) lost(why string) {
 			s.srv.releaseRAM(rc)
 		} else {
 			s.persistInBackground(rc, "worker ended: "+trunc(why, 100), true)
+		}
+	}
+	for _, r := range routes {
+		if r.onLost != nil {
+			r.onLost()
 		}
 	}
 	if conn != nil {

@@ -26,6 +26,7 @@ Pair once with the invite code the GPU Owner gives you:
 ```sh
 reflop pair reflop1-…
 reflop status
+reflop test --transformer   # optional: your speed over this connection, as a share of native
 ```
 
 `reflop status` shows which pairings are online. Use

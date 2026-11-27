@@ -178,8 +178,8 @@ pip install ./client/python                 # the reFLOP client
 # 0) If ufw is enabled, allow port 7460/tcp
 sudo ufw allow 7460/tcp
 
-# 1) Set up and start on IP address of choice.
-reflopd up --listen <LAN-or-Tailscale-IP-addr>:7460
+# 1) Set up and start on IP address (Tailscale recommended)
+reflopd up --listen <IP-addr>:7460
 
 # 2) To Invite a user, print the pairing code
 reflopd invite --name alice
@@ -191,7 +191,11 @@ reflopd invite --name alice
 reflop pair reflop1-baaraai2b4…
 reflop status
 
-# 4) Train your model
+# 4) Test throughput (Owner must be running reflopd>=0.4.2)
+reflop test --unet
+reflop test --resnet
+
+# 5) Run your training code
 python reflop_train.py          # Embed `reflop` in code
 reflop run python train.py      # Or just add a prefix command
 ```
@@ -333,8 +337,11 @@ Guest on another machine over the network.
 - **Long runs are stable.** A 20-minute soak ran 83,300 steps at a constant
   14.2 ms/step, with flat memory use.
 
-See [`benchmark/`](benchmark/README.md) to reproduce these measurements, and
-the [report](benchmark/report/2026-11-28/README.md) for this run with its data.
+These numbers come from a LAN connection with a 4.1 ms round trip. Yours
+depend on your connection: `reflop test --<architecture>` (for example
+`reflop test --transformer`) measures them in about 10 seconds. See
+[`benchmark/`](benchmark/README.md) to reproduce the full run, and the
+[report](benchmark/report/2026-11-28/README.md) for this run with its data.
 
 Steps whose Python numbers change every step (a non-capturable Adam's bias
 correction, a Python learning-rate schedule) are detected and refused; use
@@ -355,6 +362,7 @@ correction, a Python learning-rate schedule) are detected and refused; use
 | `sudo reflopd install --system` | move reflopd into a dedicated system account |
 | `reflop data build` · `push` · `ls` · `rm` | datasets |
 | `reflop verify` | cross-check small graphs against your CPU |
+| `reflop test --transformer` · `--unet` · `--all` | your training speed over this connection, as a share of the same model's native speed on the server's GPU (about 10 s per architecture) |
 | `with reflop.placement("local"):` | run part of the program on the client |
 
 **Guides:** [Owner guide](docs/OWNER_GUIDE.md) (setup, exposure, Level 1, SSH mode, rails, quotas, troubleshooting)
