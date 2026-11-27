@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.4.2 (2026-11-28)
+
+`reflop test`, which scores your connection against native speed on the
+server's GPU, and Owner commands that reach a GPU-paired Guest by name.
+Update both: the daemon measures and keeps the native times, and an older
+daemon gives `reflop test` no score. The 0.4 clients and daemons otherwise
+work together.
 
 - `reflop test --<architecture>` measures how fast a model of that kind trains
   over your connection, as a share of the same model trained natively on the
@@ -15,8 +21,7 @@
   time. reflopd keeps each result in `native_baselines.json`, keyed by GPU,
   runtime, driver, numerics, model and batch, and serves it to every Guest
   after that; it measures only while no other session uses the device.
-  Update both: an older reflopd gives `reflop test` no score.
-
+  Update both: a reflopd older than 0.4.2 gives `reflop test` no score.
 - `reflopd revoke`, `unpair`, `users delete`, `kill` and `usage` take a
   Guest's name as `reflopd users` shows it (ADR-062). Since 0.2.10 a Guest
   paired with a GPU has an identity per GPU, named `alice@gpu-…`, and these

@@ -394,7 +394,7 @@ none) and no code from your machine runs on the server. reflopd keeps each
 native time and reuses it for every Guest, so usually only the first test of
 an architecture on a GPU measures it. It measures only while no one else is
 using the GPU; if someone is, the test still prints your numbers and says
-that the native time is missing. A reflopd without this feature gives no score.
+that the native time is missing. A reflopd older than 0.4.2 gives no score.
 
 ## Measuring throughput
 

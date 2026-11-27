@@ -27,7 +27,7 @@ else runs.
 | Setup | Client under test | C API suite (a10) builds libreflop from |
 |---|---|---|
 | `./benchmark/setup.sh` | this checkout, editable: test changes before a release | this checkout |
-| `./benchmark/setup.sh --release 0.4.1` | `reflop==0.4.1` from PyPI: test what users install | tag `v0.4.1`, extracted to `benchmark/cache/src-v0.4.1` |
+| `./benchmark/setup.sh --release 0.4.2` | `reflop==0.4.2` from PyPI: test what users install | tag `v0.4.2`, extracted to `benchmark/cache/src-v0.4.2` |
 
 `run_full.sh` works out which one is installed. The daemon under test is whatever the client is paired with.
 

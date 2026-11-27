@@ -129,7 +129,7 @@ def _native(dev, name: str, batch: int) -> tuple[dict | None, str]:
 
     sess = session.by_index(dev.index)
     if "native_baseline" not in sess.caps.capabilities:
-        return None, "this server's reflopd does not measure native baselines yet; ask the Owner to update it"
+        return None, "this server's reflopd does not measure native baselines (0.4.2 or newer does); ask the Owner to update it"
     try:
         r = sess.conn.call(cpb.Envelope(native_baseline=cpb.NativeBaseline(workload=name, batch=batch)))
     except ReflopRemoteError as e:
