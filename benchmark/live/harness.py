@@ -353,7 +353,7 @@ def py(args, guest=None, env=None, timeout=900, cwd=None) -> subprocess.Complete
 
 
 def helper(name: str, *args, guest=None, env=None, timeout=900) -> subprocess.CompletedProcess:
-    """Run e2e/helpers/<name>.py."""
+    """Run live/helpers/<name>.py."""
     return py([E2E / "helpers" / f"{name}.py", *args], guest=guest, env=env, timeout=timeout)
 
 
