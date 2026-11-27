@@ -66,7 +66,7 @@ def test_interval_never_below_the_owners(owner_interval, capsys):
     reflop.device(local="cpu", checkpoint=True, checkpoint_interval=900)
     assert S.current().checkpoints.interval == 900
     err = capsys.readouterr().err
-    assert "checkpoints on (one every 15 min)" in err and "doubles" in err
+    assert "checkpoints on (one every 15 min, on the Owner's disk)" in err and "doubles" in err
 
 
 @pytest.mark.parametrize("mode", ["eager", "capture"])
@@ -305,3 +305,50 @@ def test_recover_keeps_a_tensor_overwritten_from_the_cpu(owner_interval):
     sess.conn.kill_worker()
     reflop.recover()
     assert b.cpu().tolist() == [7.0] * 4
+
+
+def _caps(interval, disk):
+    from reflop._pb import capabilities_pb2 as kpb
+
+    c = kpb.ServerCapabilities(checkpoint_interval_s=interval, checkpoint_disk_interval_s=disk)
+    c.capabilities.append("checkpoints")
+    return c
+
+
+def test_guest_is_told_where_checkpoints_go(capsys):
+    """ADR-061: with RAM checkpoints the Guest's interval is the RAM one, and
+    the message says when they reach the disk; an older server says neither."""
+    from reflop import checkpoints as C
+
+    sess = SimpleNamespace(caps=_caps(60, 600), checkpoints=None)
+    C.enable(sess)
+    err = capsys.readouterr().err
+    assert sess.checkpoints.interval == 60
+    assert "one every 1 min, kept in the Owner's RAM, on the Owner's disk every 10 min" in err
+    assert "your work waits while the state is copied" in err
+    old = SimpleNamespace(caps=_caps(600, 0), checkpoints=None)
+    C.enable(old)
+    err = capsys.readouterr().err
+    assert "one every 10 min, on the Owner's disk)" in err and "the checkpoint is skipped" in err
+
+
+def _fut(saved=None, exc=None):
+    f = Mock()
+    f.exception.return_value = exc
+    f.result.return_value = SimpleNamespace(checkpoint_saved=saved)
+    return f
+
+
+def test_pause_and_skip_warnings_once(capsys):
+    from reflop import checkpoints as C
+    from reflop._pb import compute_pb2 as cpb
+
+    ck = C.AutoCheckpoint(SimpleNamespace(caps=_caps(60, 600)), 60)
+    for _ in range(3):
+        ck._done(_fut(cpb.CheckpointSaved(generation=1, paused_ms=1200, in_ram=True)))
+    for free in (2717, 2721, 2690):
+        ck._done(_fut(cpb.CheckpointSaved(skipped=True, reason=f"the GPU has {free} MiB free; a background copy")))
+    err = capsys.readouterr().err
+    assert err.count("your state fills the GPU") == 1 and "(1.2 s; once every 10 min)" in err
+    assert err.count("checkpoint skipped") == 1
+    assert ck.saved == 3

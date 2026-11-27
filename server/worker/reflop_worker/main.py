@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import collections
 import os
 import socket
 import sys
@@ -42,6 +43,19 @@ def warm_up(device) -> None:
         torch.randn(4, device=device)
         torch.cuda.synchronize(device)
     float(b)
+
+
+def wait_for_go(recv, on_go, pending, gate) -> None:
+    """Read the control channel until a stalled checkpoint has its
+    SnapshotGo (gate set by on_go). Every other message goes to pending, in
+    order, for the main loop; their fds stay queued on the fd channel in the
+    same order, so it stays in sync (ADR-061)."""
+    while not gate.is_set():
+        env = recv()
+        if env.WhichOneof("body") == "snapshot_go":
+            on_go(env.snapshot_go)
+        else:
+            pending.append(env)
 
 
 def main() -> None:
@@ -114,8 +128,15 @@ def main() -> None:
     def send_client(env: cpb.Envelope) -> None:
         ch.send(wpb.WorkerEnvelope(client=env))
 
-    def snapshot_cut(rid: int, nbytes: int) -> None:
-        ch.send(wpb.WorkerEnvelope(snapshot_cut=wpb.SnapshotCut(request_id=rid, bytes=nbytes)))
+    def snapshot_cut(rid: int, nbytes: int, stall: bool = False) -> None:
+        ch.send(wpb.WorkerEnvelope(snapshot_cut=wpb.SnapshotCut(request_id=rid, bytes=nbytes, stall=stall)))
+
+    # Messages that arrived while a stalled checkpoint waited for SnapshotGo
+    # (ADR-061): served next, in order.
+    pending: collections.deque = collections.deque()
+
+    def wait_go(gate) -> None:
+        wait_for_go(ch.recv, session.writer.on_go, pending, gate)
 
     def recv_fds(n: int) -> tuple[bytes, list[int]]:
         msg, fds, _flags, _addr = socket.recv_fds(fdpass, 256, max(n, 1))
@@ -123,7 +144,7 @@ def main() -> None:
 
     while True:
         try:
-            env = ch.recv()
+            env = pending.popleft() if pending else ch.recv()
         except EOFError:
             os._exit(0)
         except Exception as e:  # noqa: BLE001 - malformed internal message
@@ -146,16 +167,18 @@ def main() -> None:
                 session.close_dataset(env.dataset_close.dataset_id)
             elif which in ("snapshot_write", "snapshot_read"):
                 m = env.snapshot_write if which == "snapshot_write" else env.snapshot_read
-                tag, fds = recv_fds(1)
+                want = max(1, m.targets) if which == "snapshot_write" else 1
+                tag, fds = recv_fds(want)
                 rid = m.request_id
                 try:
-                    if len(fds) != 1:
+                    if len(fds) != want or want > 2:
                         for fd in fds:
                             os.close(fd)
                         raise ReflopError(cpb.ERROR_INTERNAL, "missing snapshot descriptor")
                     if which == "snapshot_write":
-                        # Asynchronous: the writer thread answers (ADR-029).
-                        session.snapshot_write(m, fds[0], snapshot_cut, send_client)
+                        # Asynchronous: the writer thread answers (ADR-029),
+                        # unless the state fills the GPU (ADR-061).
+                        session.snapshot_write(m, fds, snapshot_cut, send_client, wait_go)
                     else:
                         session.snapshot_read(m, fds[0])
                         send_client(cpb.Envelope(request_id=rid, end=True, restored=cpb.Restored()))

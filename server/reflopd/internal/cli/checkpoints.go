@@ -18,15 +18,22 @@ import (
 
 // checkpointsCmd turns Guest checkpoints on or off (ADR-029).
 func checkpointsCmd() *cobra.Command {
-	var interval time.Duration
+	var interval, ramInterval time.Duration
+	var ram bool
 	cmd := &cobra.Command{
 		Use:   "checkpoints [on|off]",
-		Short: "Let Guests save checkpoints of their sessions to this machine's disk (off by default)",
-		Long: "Guests can save their session's state (parameters, optimizer state, buffers) at most once per\n" +
-			"interval, so that a worker crash or a restart loses at most that much work.\n\n" +
-			"Every checkpoint writes the Guest's whole state to this machine's disk, which wears out SSDs,\n" +
-			"and the state's GPU memory doubles while it is copied. The interval cannot be below " +
-			config.MinCheckpointInterval.String() + "\n(default " + config.DefaultCheckpointInterval.String() + ").",
+		Short: "Let Guests save checkpoints of their sessions on this machine (off by default)",
+		Long: "Guests can save their session's state (parameters, optimizer state, buffers), so that a worker\n" +
+			"crash or a restart loses little work.\n\n" +
+			"Each session's newest checkpoint is kept in this machine's RAM, taken every --ram-interval\n" +
+			"(default " + config.DefaultRAMCheckpointInterval.String() + ", at least " + config.MinRAMCheckpointInterval.String() +
+			"). RAM checkpoints together use at most half of the RAM\n" +
+			"workers may use, and are dropped first when the RAM rail needs the memory. Every --interval\n" +
+			"(default " + config.DefaultCheckpointInterval.String() + ", at least " + config.MinCheckpointInterval.String() +
+			"), when a session's worker ends, and when reflopd stops, the newest one\n" +
+			"is written to disk, which wears out SSDs. With --ram=false, every checkpoint goes to disk, once\n" +
+			"per --interval. While a checkpoint is copied, the state's GPU memory doubles; a state that fills\n" +
+			"the GPU is copied once per --interval while the Guest's work waits instead.",
 		Args:      cobra.MaximumNArgs(1),
 		ValidArgs: []string{"on", "off"},
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -44,8 +51,8 @@ func checkpointsCmd() *cobra.Command {
 				cur = *s.Checkpoints
 			}
 			if len(args) == 0 {
-				if cmd.Flags().Changed("interval") {
-					return exitWith(ExitUsage, errors.New("pass `on --interval DURATION` to change the interval"))
+				if cmd.Flags().Changed("interval") || cmd.Flags().Changed("ram-interval") || cmd.Flags().Changed("ram") {
+					return exitWith(ExitUsage, errors.New("pass `on --interval DURATION` (or --ram-interval, --ram) to change the settings"))
 				}
 				printCheckpointState(out, cur)
 				return nil
@@ -55,6 +62,12 @@ func checkpointsCmd() *cobra.Command {
 				cur.Enabled = true
 				if cmd.Flags().Changed("interval") {
 					cur.Interval = config.Duration(interval)
+				}
+				if cmd.Flags().Changed("ram-interval") {
+					cur.RAMInterval = config.Duration(ramInterval)
+				}
+				if cmd.Flags().Changed("ram") {
+					cur.RAM = &ram
 				}
 			case "off":
 				cur.Enabled = false
@@ -70,7 +83,7 @@ func checkpointsCmd() *cobra.Command {
 			}
 			notifyReload()
 			if cur.Enabled {
-				warn := checkpointWarning(time.Duration(cur.Interval), gpu.Detect().GPUs)
+				warn := checkpointWarning(cur, gpu.Detect().GPUs)
 				fmt.Fprintln(out, red(out, warn))
 			}
 			printCheckpointState(out, cur)
@@ -78,22 +91,35 @@ func checkpointsCmd() *cobra.Command {
 		},
 	}
 	cmd.Flags().DurationVar(&interval, "interval", config.DefaultCheckpointInterval,
-		"shortest time between two checkpoints of a session, and Guests' default (at least "+
-			config.MinCheckpointInterval.String()+")")
+		"how often a session's checkpoint is written to disk (at least "+config.MinCheckpointInterval.String()+")")
+	cmd.Flags().DurationVar(&ramInterval, "ram-interval", config.DefaultRAMCheckpointInterval,
+		"shortest time between two checkpoints kept in RAM, and Guests' default (at least "+
+			config.MinRAMCheckpointInterval.String()+")")
+	cmd.Flags().BoolVar(&ram, "ram", true, "keep each session's newest checkpoint in RAM between disk writes")
 	return cmd
 }
 
 func printCheckpointState(out io.Writer, c config.Checkpoints) {
-	if !c.Enabled {
-		fmt.Fprintf(out, "checkpoints off (interval when on: %s)\n", time.Duration(c.Interval))
-		return
+	state := "off (when on: "
+	if c.Enabled {
+		state = "on: "
 	}
-	fmt.Fprintf(out, "checkpoints on: Guests may save one every %s or less often\n", time.Duration(c.Interval))
+	if c.RAMOn() {
+		fmt.Fprintf(out, "checkpoints %sone every %s kept in RAM, written to disk every %s", state, c.GuestInterval(),
+			time.Duration(c.Interval))
+	} else {
+		fmt.Fprintf(out, "checkpoints %sone every %s, written to disk (RAM checkpoints off)", state, time.Duration(c.Interval))
+	}
+	if !c.Enabled {
+		fmt.Fprint(out, ")")
+	}
+	fmt.Fprintln(out)
 }
 
 // checkpointWarning is printed every time the Owner turns checkpoints on.
 // The figures are the worst case: Guest state that fills every GPU.
-func checkpointWarning(interval time.Duration, gpus []gpu.GPU) string {
+func checkpointWarning(c config.Checkpoints, gpus []gpu.GPU) string {
+	interval := time.Duration(c.Interval)
 	perHour := float64(time.Hour) / float64(interval)
 	var totalGiB float64
 	var names []string
@@ -116,6 +142,12 @@ func checkpointWarning(interval time.Duration, gpus []gpu.GPU) string {
 	lines = append(lines,
 		fmt.Sprintf("  Each GiB of Guest state writes %.0f GiB per hour.", perHour),
 		"  While a checkpoint is copied, the GPU memory for the Guest's state doubles.")
+	if c.RAMOn() {
+		lines = append(lines,
+			fmt.Sprintf("  Between disk writes, a checkpoint is taken every %s and kept in RAM: up to the", c.GuestInterval()),
+			"  Guest's state size per session (twice that while a new one is written), at most half of the",
+			"  RAM workers may use, dropped first when the RAM rail needs the memory.")
+	}
 	return strings.Join(lines, "\n")
 }
 

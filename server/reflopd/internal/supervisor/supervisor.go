@@ -468,6 +468,20 @@ func (w *Worker) ExitCode() int {
 // PID returns the worker pid.
 func (w *Worker) PID() int { return w.cmd.Process.Pid }
 
+// Freeze stops (on) or resumes the worker. In its cgroup the kernel freezes
+// every thread at once; without one, SIGSTOP and SIGCONT do the same for the
+// worker process. A frozen worker keeps its memory and uses no CPU.
+func (w *Worker) Freeze(on bool) error {
+	if w.cg != nil {
+		return w.cg.Freeze(on, 5*time.Second)
+	}
+	sig := unix.SIGCONT
+	if on {
+		sig = unix.SIGSTOP
+	}
+	return unix.Kill(w.PID(), sig)
+}
+
 // SetMemoryMax sets the worker's own host memory limit (0: none). Without a
 // cgroup it does nothing.
 func (w *Worker) SetMemoryMax(bytes uint64) error {

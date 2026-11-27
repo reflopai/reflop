@@ -878,7 +878,7 @@ func pauseCmd() *cobra.Command {
 			fmt.Fprintln(cmd.OutOrStdout(), "paused")
 			if now {
 				fmt.Fprintf(cmd.OutOrStdout(), "%d session(s) suspended (GPU memory moved to host RAM until `reflopd resume`), "+
-					"%d killed\n", r.Suspended, r.Killed)
+					"%d CPU session(s) frozen, %d killed\n", r.Suspended, r.Frozen, r.Killed)
 				for _, n := range r.Notes {
 					fmt.Fprintln(cmd.OutOrStdout(), "  "+n)
 				}
@@ -886,8 +886,8 @@ func pauseCmd() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&now, "now", false, "also suspend running GPU workers (their GPU memory moves to host RAM); "+
-		"workers that cannot be suspended are killed")
+	cmd.Flags().BoolVar(&now, "now", false, "also suspend running GPU workers (their GPU memory moves to host RAM) "+
+		"and freeze CPU workers; workers that cannot be suspended are killed")
 	return cmd
 }
 

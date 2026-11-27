@@ -267,6 +267,11 @@ func (s *Server) status(withStats bool) StatusView {
 	}
 	if ck := s.cfg().Checkpoints; ck.Enabled {
 		v.Checkpoints = "every " + time.Duration(ck.Interval).String()
+		if ck.RAMOn() {
+			n, b := s.ramStatus()
+			v.Checkpoints = fmt.Sprintf("in RAM every %s, on disk every %s (%d in RAM, %s)", ck.GuestInterval(),
+				time.Duration(ck.Interval), n, config.Bytes(b))
+		}
 	}
 	if s.layout.System {
 		v.Level = 1
@@ -414,10 +419,12 @@ func (s *Server) control(ctx context.Context, req ControlRequest) (any, error) {
 }
 
 // Pause queues new executes. With now, GPU workers are also suspended:
-// their GPU memory moves to host RAM and comes back on Resume (ADR-030). A
-// worker that cannot be suspended (not enough free host RAM, a kernel that
-// does not finish within suspend.LockTimeout, a driver without the API, or a
-// CPU worker) is killed, as before; its last checkpoint stays recoverable.
+// their GPU memory moves to host RAM and comes back on Resume (ADR-030).
+// CPU workers are frozen (cgroup.freeze, or SIGSTOP without a cgroup) and
+// thawed on Resume (ADR-061). A worker that cannot be suspended or frozen
+// (not enough free host RAM, a kernel that does not finish within
+// suspend.LockTimeout, a driver without the API) is killed, as before; its
+// last checkpoint stays recoverable.
 func (s *Server) Pause(now bool, by string) PauseResult {
 	s.paused.Store(true)
 	s.events.publish(pb.Event_KIND_PAUSED, "the Owner paused GPU sharing; queued work resumes later")
@@ -431,6 +438,7 @@ func (s *Server) Pause(now bool, by string) PauseResult {
 // PauseResult is what `reflopd pause --now` reports.
 type PauseResult struct {
 	Suspended int      `json:"suspended"`
+	Frozen    int      `json:"frozen,omitempty"`
 	Killed    int      `json:"killed"`
 	Notes     []string `json:"notes,omitempty"`
 }
@@ -472,7 +480,26 @@ func (s *Server) suspendAll(kill bool, why string) PauseResult {
 			continue
 		}
 		if sess.Device.GPU == nil {
-			end(sess, "a CPU session cannot be suspended")
+			if !kill {
+				continue // auto-yield frees the GPU: a CPU session keeps running, paused
+			}
+			// It holds no GPU memory: stop it where it is instead of
+			// ending it.
+			sess.mu.Lock()
+			sess.suspended, sess.frozen = true, true
+			sess.mu.Unlock()
+			if err := sess.worker.Freeze(true); err != nil {
+				sess.mu.Lock()
+				sess.suspended, sess.frozen = false, false
+				sess.mu.Unlock()
+				_ = sess.worker.Freeze(false)
+				end(sess, "could not freeze it: "+firstLine(err.Error()))
+				continue
+			}
+			res.Frozen++
+			s.audit.Write(audit.Record{Identity: sess.Identity.Name, ID: sess.Identity.ID, Session: sess.hex(),
+				Event: "frozen", Fields: map[string]any{"by": why}})
+			s.logf("session %s of %q frozen until resume (CPU)", sess.hex()[:8], sess.Identity.Name)
 			continue
 		}
 		pid := sess.worker.PID()
@@ -534,6 +561,10 @@ func (s *Server) suspendAll(kill bool, why string) PauseResult {
 		s.events.publish(pb.Event_KIND_SUSPENDED, "the Owner needs the GPU now: your session's GPU memory was moved to "+
 			"host RAM and comes back when sharing resumes")
 	}
+	if res.Frozen > 0 {
+		s.events.publish(pb.Event_KIND_SUSPENDED, "the Owner paused sharing now: CPU sessions are frozen and continue "+
+			"where they stopped when sharing resumes")
+	}
 	return res
 }
 
@@ -558,9 +589,17 @@ func (s *Server) resumeSuspended() {
 		wg.Add(1)
 		go func(sess *Session) {
 			defer wg.Done()
-			err := s.suspendHelper(sess).Resume(sess.worker.PID())
 			sess.mu.Lock()
-			sess.suspended = false
+			frozen := sess.frozen
+			sess.mu.Unlock()
+			var err error
+			if frozen {
+				err = sess.worker.Freeze(false)
+			} else {
+				err = s.suspendHelper(sess).Resume(sess.worker.PID())
+			}
+			sess.mu.Lock()
+			sess.suspended, sess.frozen = false, false
 			now := time.Now()
 			for _, r := range sess.routes {
 				r.start = now // the watchdog does not count the suspension

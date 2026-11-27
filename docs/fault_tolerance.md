@@ -16,7 +16,9 @@ those decisions.
 | Recovery from the last checkpoint in the same process (`reflop.recover()`), final versus recoverable ends | done, ADR-029 |
 | `pause --now` suspends GPU workers through the CUDA driver; `yield --auto --suspend` | done, ADR-030 |
 | C/E. Client redo log and transparent replay | deferred: needs strict deterministic numerics and a client that reconnects with requests in flight |
-| F. reflopd spilling detached sessions and draining on shutdown | not started |
+| F. reflopd spilling detached sessions and draining on shutdown | done for sessions with checkpoints on (2026-11-27, ADR-061): the newest RAM checkpoint is written to disk when any worker ends (eviction and TTL included) and when reflopd stops |
+| RAM checkpoints every minute, disk copy by reflopd, a pause instead of a skip when the state fills the GPU, `pause --now` freezes CPU sessions | done 2026-11-27, ADR-061 (measurements below) |
+| Rewinding Guest-side state; recovery in a new Guest process | not started |
 
 Answers to the open questions below: checkpoints are off by default on the
 Owner side and opt-in on the Guest side; the redo log is not in the first
@@ -441,3 +443,28 @@ process under the worker's seccomp filter and on a real sandboxed worker
 driven from inside reflopd's own sandbox (0.31 s for 1.3 GiB). The suspended
 memory moves into the worker's own host memory (its RSS grew by the same
 amount).
+
+## Measurements (2026-11-27, ADR-061)
+
+Same machine, driver 595, a throwaway reflopd in a delegated cgroup, the
+Python client against it over TLS, CUDA unless noted.
+
+| What | Before (main) | After |
+|---|---|---|
+| Work lost when the worker is SIGKILLed 7 min in (322 MiB state, disk interval 5 min) | 121 s | 0.4 s (just after a RAM checkpoint); 30 s at 7.5 min |
+| Newest checkpoint after a reflopd restart | the last disk one | the RAM one, written out in 0.2 s on SIGTERM; recovered bit for bit |
+| 8 GiB state on the 12 GiB GPU | every checkpoint skipped | first one after a 1.2 s pause (2.4 s straight to disk when RAM was too full), recovered bit for bit |
+| `pause --now` with a CPU session | killed | frozen (0 CPU while frozen), resumed with exact values |
+| Training speed, RAM checkpoints every 30 s (1.9 GiB state, 120 s runs) | 19.6 steps/s (off) | 19.7 steps/s |
+| Training speed, RAM checkpoints every 30 s (322 MiB state, 3 alternating 60 s runs each) | 67.6, 68.0, 67.9 steps/s (off) | 68.0, 67.8, 68.2 steps/s |
+| RAM pressure (host ~100 MiB above the RAM floor) | n/a | the RAM checkpoint (already on disk) dropped, no worker touched |
+
+Worker level, 64 tensors rebound every step, 85-110 ms steps: a background
+checkpoint into a memfd took 0.16 s per GiB, the same as into a disk file
+(the page cache absorbs it; fsync then takes about as long again), with
+about 1% slower steps meanwhile. A synchronous copy took 0.15 to 0.3 s per
+GiB and needed no extra GPU memory. reflopd's `sendfile` copy of a memfd to
+disk with fsync: 1 GiB 0.32 s, 4 GiB 1.14 s, 8 GiB 1.80 s. memfd pages were
+charged to the writing process's cgroup and moved to the parent cgroup when
+that cgroup was removed. `cgroup.freeze` took 0.1 ms each way.
+

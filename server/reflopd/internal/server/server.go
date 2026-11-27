@@ -107,6 +107,15 @@ type Server struct {
 	diskReserved uint64
 	idReserved   map[string]uint64
 
+	// RAM checkpoints (ramckpt.go): bytes held by complete ones and
+	// reserved by writes in progress; sessions whose RAM checkpoint is
+	// being written to disk.
+	ramMu       sync.Mutex
+	ramHeld     uint64
+	ramReserved uint64
+	persisting  map[string]chan struct{}
+	persistWG   sync.WaitGroup
+
 	listeners []net.Listener
 	started   time.Time
 }
@@ -146,7 +155,8 @@ func New(opts Options) (*Server, error) {
 	}
 	s := &Server{layout: l, opts: opts, config: cfg, key: key, ids: ids, audit: al, usage: ul, logger: logger,
 		sessions: map[string]*Session{}, conns: map[*clientConn]bool{}, preauth: map[string]int{}, events: newBroadcaster(),
-		throttles: map[string]*bucket{}, started: time.Now(), idReserved: map[string]uint64{}}
+		throttles: map[string]*bucket{}, started: time.Now(), idReserved: map[string]uint64{},
+		persisting: map[string]chan struct{}{}}
 	s.store = store.New(l.Store(), int64(cfg.Limits.UploadChunkBytes), cfg.Limits.MaxTensorNumel,
 		func() config.Rails { return s.cfg().Rails },
 		func(name string) uint64 { return uint64(s.quotaByID(name).StorageBytes) })
@@ -597,7 +607,8 @@ func (s *Server) capabilitiesFor(id *auth.Identity) *pb.ServerCapabilities {
 	}
 	c.Capabilities = append(c.Capabilities, "usage", "snapshots", "checkpoints")
 	if ck := s.cfg().Checkpoints; ck.Enabled {
-		c.CheckpointIntervalS = uint64(time.Duration(ck.Interval) / time.Second)
+		c.CheckpointIntervalS = uint64(ck.GuestInterval() / time.Second)
+		c.CheckpointDiskIntervalS = uint64(time.Duration(ck.Interval) / time.Second)
 	}
 	if c.RuntimeInfo == nil {
 		c.RuntimeInfo = &pb.RuntimeInfo{}
@@ -810,6 +821,10 @@ func (s *Server) Serve(ctx context.Context) error {
 	os.Remove(s.bridgePath())
 	for _, sess := range s.allSessions() {
 		sess.close("reflopd stopped")
+	}
+	// Ending the workers wrote their RAM checkpoints out (ADR-061).
+	if !s.waitAllPersists(persistWait) {
+		s.logf("stopping before every RAM checkpoint reached the disk (waited %s)", persistWait)
 	}
 	s.mu.Lock()
 	for c := range s.conns {

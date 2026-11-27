@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -62,4 +63,25 @@ func TestNewWorkerWritesItsOwnMemoryLimit(t *testing.T) {
 		t.Fatalf("no limit: memory.max = %q, want max", got)
 	}
 	unixClose(w2)
+}
+
+// Freeze writes cgroup.freeze and waits until cgroup.events reports the
+// state; a cgroup that never gets there is an error, not a hang.
+func TestFreezeWaitsForTheKernel(t *testing.T) {
+	dir := t.TempDir()
+	w := &Worker{Dir: dir}
+	os.WriteFile(filepath.Join(dir, "cgroup.events"), []byte("populated 1\nfrozen 1\n"), 0o644)
+	if err := w.Freeze(true, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(t, filepath.Join(dir, "cgroup.freeze")); got != "1" {
+		t.Fatalf("cgroup.freeze = %q", got)
+	}
+	if err := w.Freeze(false, 50*time.Millisecond); err == nil || !strings.Contains(err.Error(), "frozen 0") {
+		t.Fatalf("thaw that the kernel never reports: %v", err)
+	}
+	os.WriteFile(filepath.Join(dir, "cgroup.events"), []byte("populated 1\nfrozen 0\n"), 0o644)
+	if err := w.Freeze(false, time.Second); err != nil {
+		t.Fatal(err)
+	}
 }

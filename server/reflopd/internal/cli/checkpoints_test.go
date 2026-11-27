@@ -23,14 +23,14 @@ func TestCheckpointWarningFigures(t *testing.T) {
 		{config.MinCheckpointInterval, []string{"up to 144 GiB written per hour", "3.4 TiB per day", "writes 12 GiB per hour"}},
 		{time.Hour, []string{"up to 12 GiB written per hour", "288 GiB per day", "writes 1 GiB per hour"}},
 	} {
-		w := checkpointWarning(c.iv, g)
+		w := checkpointWarning(config.Checkpoints{Interval: config.Duration(c.iv)}, g)
 		for _, s := range append(c.want, "wear out SSDs", "doubles") {
 			if !strings.Contains(w, s) {
 				t.Errorf("interval %s: warning lacks %q:\n%s", c.iv, s, w)
 			}
 		}
 	}
-	if w := checkpointWarning(config.DefaultCheckpointInterval, nil); !strings.Contains(w, "writes 6 GiB per hour") {
+	if w := checkpointWarning(config.Checkpoints{Interval: config.Duration(config.DefaultCheckpointInterval)}, nil); !strings.Contains(w, "writes 6 GiB per hour") {
 		t.Errorf("without a GPU: %s", w)
 	}
 }
@@ -77,5 +77,42 @@ func TestCheckpointsIntervalFloor(t *testing.T) {
 	}
 	if !cfg.Checkpoints.Enabled || time.Duration(cfg.Checkpoints.Interval) != config.DefaultCheckpointInterval {
 		t.Fatalf("saved %+v", cfg.Checkpoints)
+	}
+}
+
+// RAM checkpoints: on by default, the RAM interval has its own floor, and
+// --ram=false turns them off (ADR-061).
+func TestCheckpointsRAMFlags(t *testing.T) {
+	t.Setenv("REFLOP_HOME", t.TempDir())
+	run := func(args ...string) (string, error) {
+		cmd := checkpointsCmd()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetArgs(args)
+		err := cmd.Execute()
+		return out.String(), err
+	}
+	out, err := run("on")
+	if err != nil || !strings.Contains(out, "one every 1m0s kept in RAM, written to disk every 10m0s") ||
+		!strings.Contains(out, "kept in RAM: up to the") {
+		t.Fatalf("on: %v\n%s", err, out)
+	}
+	if _, err := run("on", "--ram-interval", "29s"); err == nil || !strings.Contains(err.Error(), "at least 30s") {
+		t.Fatalf("a 29s RAM interval was accepted: %v", err)
+	}
+	if _, err := run("on", "--ram-interval", "11m"); err == nil || !strings.Contains(err.Error(), "must not be longer") {
+		t.Fatalf("a RAM interval above the disk interval was accepted: %v", err)
+	}
+	out, err = run("on", "--ram=false")
+	if err != nil || !strings.Contains(out, "RAM checkpoints off") || strings.Contains(out, "kept in RAM: up to the") {
+		t.Fatalf("--ram=false: %v\n%s", err, out)
+	}
+	l, _ := layout()
+	cfg, err := config.Load(l.ConfigFile(), settingsPath(l))
+	if err != nil || cfg.Checkpoints.RAMOn() || !cfg.Checkpoints.Enabled {
+		t.Fatalf("saved %+v (%v)", cfg.Checkpoints, err)
+	}
+	if out, _ = run(); !strings.Contains(out, "checkpoints on: one every 10m0s, written to disk") {
+		t.Fatalf("state: %s", out)
 	}
 }

@@ -40,8 +40,12 @@ func snapFixture(t *testing.T) (*Server, *Session, *clientConn, *bytes.Buffer) {
 	cfg := config.Defaults()
 	cfg.Rails.DiskFreeFloorBytes, cfg.Rails.DiskFreeFloorPercent = config.MinDiskFreeFloorBytes, 1
 	srv := &Server{config: cfg, layout: l, audit: al, logger: log.New(io.Discard, "", 0), sessions: map[string]*Session{},
-		conns: map[*clientConn]bool{}, preauth: map[string]int{}, idReserved: map[string]uint64{}}
+		conns: map[*clientConn]bool{}, preauth: map[string]int{}, idReserved: map[string]uint64{},
+		persisting: map[string]chan struct{}{}}
 	srv.store = store.New(l.Store(), 4<<20, 1<<40, func() config.Rails { return srv.cfg().Rails }, func(string) uint64 { return 0 })
+	if srv.ids, err = auth.Open(filepath.Join(dir, "ids")); err != nil {
+		t.Fatal(err)
+	}
 	out := &bytes.Buffer{}
 	c := &clientConn{srv: srv, w: wire.NewWriter(out, 64<<20), gen: 1}
 	sess := &Session{ID: [16]byte{0xa1}, Identity: auth.Identity{Name: "alice", ID: "aa"}, srv: srv,
@@ -83,20 +87,33 @@ func TestCheckpointNeedsTheOwner(t *testing.T) {
 	}
 }
 
-// The server, not the client, enforces the Owner's interval.
+// The server, not the client, enforces the Owner's interval: the disk
+// interval with RAM checkpoints off, the RAM interval with them on.
 func TestCheckpointIntervalEnforced(t *testing.T) {
 	srv, sess, c, out := snapFixture(t)
-	srv.config.Checkpoints = config.Checkpoints{Enabled: true, Interval: config.Duration(config.MinCheckpointInterval)}
-	sess.lastCheckpoint = time.Now().Add(-4 * time.Minute)
-	env := ckEnv()
-	if err := sess.checkpoint(c, env, env.GetCheckpoint()); err != nil {
-		t.Fatal(err)
+	off := false
+	for _, ck := range []struct {
+		cfg  config.Checkpoints
+		ago  time.Duration
+		want string
+	}{
+		{config.Checkpoints{Enabled: true, Interval: config.Duration(config.MinCheckpointInterval), RAM: &off},
+			4 * time.Minute, "one checkpoint every 5m0s"},
+		{config.Checkpoints{Enabled: true, Interval: config.Duration(config.MinCheckpointInterval)},
+			45 * time.Second, "one checkpoint every 1m0s"},
+	} {
+		srv.config.Checkpoints = ck.cfg
+		sess.lastCheckpoint = time.Now().Add(-ck.ago)
+		env := ckEnv()
+		if err := sess.checkpoint(c, env, env.GetCheckpoint()); err != nil {
+			t.Fatal(err)
+		}
+		if e := lastError(t, out); e.Code != pb.ErrorCode_ERROR_RESOURCE_LIMIT || !strings.Contains(e.Message, ck.want) {
+			t.Fatalf("got %v, want RESOURCE_LIMIT %q", e, ck.want)
+		}
+		out.Reset()
 	}
-	if e := lastError(t, out); e.Code != pb.ErrorCode_ERROR_RESOURCE_LIMIT || !strings.Contains(e.Message, "one checkpoint every") {
-		t.Fatalf("got %v, want RESOURCE_LIMIT", e)
-	}
-	out.Reset()
-	env = &pb.Envelope{RequestId: 6, Body: &pb.Envelope_Checkpoint{Checkpoint: &pb.Checkpoint{Tag: make([]byte, maxTagBytes+1)}}}
+	env := &pb.Envelope{RequestId: 6, Body: &pb.Envelope_Checkpoint{Checkpoint: &pb.Checkpoint{Tag: make([]byte, maxTagBytes+1)}}}
 	if err := sess.checkpoint(c, env, env.GetCheckpoint()); err != nil {
 		t.Fatal(err)
 	}

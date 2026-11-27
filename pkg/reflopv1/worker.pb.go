@@ -537,7 +537,8 @@ func (x *DatasetClose) GetDatasetId() []byte {
 	return nil
 }
 
-// SnapshotWrite/SnapshotRead: one fd follows on the fd channel.
+// SnapshotWrite/SnapshotRead: one fd follows on the fd channel (a checkpoint
+// write may have two: see SnapshotWrite.targets).
 //
 // A write is asynchronous (ADR-029): the worker takes references to the
 // tensors between two requests (the cut), reports the file size in
@@ -550,9 +551,15 @@ type SnapshotWrite struct {
 	Keys      []string               `protobuf:"bytes,3,rep,name=keys,proto3" json:"keys,omitempty"`
 	// checkpoint: save every live handle (key = handle hex) plus RNG state and
 	// `tag`/`generation` under reserved "__reflop__/" keys; handles/keys empty.
-	Checkpoint    bool   `protobuf:"varint,4,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
-	Tag           []byte `protobuf:"bytes,5,opt,name=tag,proto3" json:"tag,omitempty"`
-	Generation    uint64 `protobuf:"varint,6,opt,name=generation,proto3" json:"generation,omitempty"`
+	Checkpoint bool   `protobuf:"varint,4,opt,name=checkpoint,proto3" json:"checkpoint,omitempty"`
+	Tag        []byte `protobuf:"bytes,5,opt,name=tag,proto3" json:"tag,omitempty"`
+	Generation uint64 `protobuf:"varint,6,opt,name=generation,proto3" json:"generation,omitempty"`
+	// Number of fds that follow: 0 or 1 = one; 2 = a RAM checkpoint (a memfd)
+	// and a disk file. SnapshotGo.target says which one to write (ADR-061).
+	Targets uint32 `protobuf:"varint,7,opt,name=targets,proto3" json:"targets,omitempty"`
+	// When the GPU has no room for a second copy of the state, copy it now,
+	// holding later requests until it is copied, instead of skipping.
+	AllowStall    bool `protobuf:"varint,8,opt,name=allow_stall,json=allowStall,proto3" json:"allow_stall,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -629,6 +636,20 @@ func (x *SnapshotWrite) GetGeneration() uint64 {
 	return 0
 }
 
+func (x *SnapshotWrite) GetTargets() uint32 {
+	if x != nil {
+		return x.Targets
+	}
+	return 0
+}
+
+func (x *SnapshotWrite) GetAllowStall() bool {
+	if x != nil {
+		return x.AllowStall
+	}
+	return false
+}
+
 type SnapshotRead struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RequestId     uint64                 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
@@ -700,9 +721,12 @@ func (x *SnapshotRead) GetRestoreRng() bool {
 // SnapshotCut (worker → reflopd): the cut is taken; the file will have
 // exactly `bytes` bytes. reflopd answers SnapshotGo.
 type SnapshotCut struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	RequestId     uint64                 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
-	Bytes         uint64                 `protobuf:"varint,2,opt,name=bytes,proto3" json:"bytes,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	RequestId uint64                 `protobuf:"varint,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
+	Bytes     uint64                 `protobuf:"varint,2,opt,name=bytes,proto3" json:"bytes,omitempty"`
+	// The worker copies the state before it serves any other request (the GPU
+	// has no room for a background copy; SnapshotWrite.allow_stall).
+	Stall         bool `protobuf:"varint,3,opt,name=stall,proto3" json:"stall,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -751,6 +775,13 @@ func (x *SnapshotCut) GetBytes() uint64 {
 	return 0
 }
 
+func (x *SnapshotCut) GetStall() bool {
+	if x != nil {
+		return x.Stall
+	}
+	return false
+}
+
 // SnapshotGo (reflopd → worker): write the file, or drop the references.
 type SnapshotGo struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -758,6 +789,7 @@ type SnapshotGo struct {
 	Proceed       bool                   `protobuf:"varint,2,opt,name=proceed,proto3" json:"proceed,omitempty"`
 	Code          ErrorCode              `protobuf:"varint,3,opt,name=code,proto3,enum=reflop.v1.ErrorCode" json:"code,omitempty"` // when !proceed
 	Reason        string                 `protobuf:"bytes,4,opt,name=reason,proto3" json:"reason,omitempty"`
+	Target        uint32                 `protobuf:"varint,5,opt,name=target,proto3" json:"target,omitempty"` // index of the fd to write (SnapshotWrite.targets); the others are closed
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -818,6 +850,13 @@ func (x *SnapshotGo) GetReason() string {
 		return x.Reason
 	}
 	return ""
+}
+
+func (x *SnapshotGo) GetTarget() uint32 {
+	if x != nil {
+		return x.Target
+	}
+	return 0
 }
 
 type StatsRequest struct {
@@ -1233,7 +1272,7 @@ const file_reflop_v1_worker_proto_rawDesc = "" +
 	"\x06shards\x18\x03 \x03(\v2\x17.reflop.v1.DatasetShardR\x06shards\"-\n" +
 	"\fDatasetClose\x12\x1d\n" +
 	"\n" +
-	"dataset_id\x18\x01 \x01(\fR\tdatasetId\"\xae\x01\n" +
+	"dataset_id\x18\x01 \x01(\fR\tdatasetId\"\xe9\x01\n" +
 	"\rSnapshotWrite\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x18\n" +
@@ -1245,25 +1284,30 @@ const file_reflop_v1_worker_proto_rawDesc = "" +
 	"\x03tag\x18\x05 \x01(\fR\x03tag\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x06 \x01(\x04R\n" +
-	"generation\"|\n" +
+	"generation\x12\x18\n" +
+	"\atargets\x18\a \x01(\rR\atargets\x12\x1f\n" +
+	"\vallow_stall\x18\b \x01(\bR\n" +
+	"allowStall\"|\n" +
 	"\fSnapshotRead\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x12\n" +
 	"\x04keys\x18\x02 \x03(\tR\x04keys\x12\x18\n" +
 	"\ahandles\x18\x03 \x03(\fR\ahandles\x12\x1f\n" +
 	"\vrestore_rng\x18\x04 \x01(\bR\n" +
-	"restoreRng\"B\n" +
+	"restoreRng\"X\n" +
 	"\vSnapshotCut\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x14\n" +
-	"\x05bytes\x18\x02 \x01(\x04R\x05bytes\"\x87\x01\n" +
+	"\x05bytes\x18\x02 \x01(\x04R\x05bytes\x12\x14\n" +
+	"\x05stall\x18\x03 \x01(\bR\x05stall\"\x9f\x01\n" +
 	"\n" +
 	"SnapshotGo\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\x04R\trequestId\x12\x18\n" +
 	"\aproceed\x18\x02 \x01(\bR\aproceed\x12(\n" +
 	"\x04code\x18\x03 \x01(\x0e2\x14.reflop.v1.ErrorCodeR\x04code\x12\x16\n" +
-	"\x06reason\x18\x04 \x01(\tR\x06reason\"\x0e\n" +
+	"\x06reason\x18\x04 \x01(\tR\x06reason\x12\x16\n" +
+	"\x06target\x18\x05 \x01(\rR\x06target\"\x0e\n" +
 	"\fStatsRequest\"\xef\x01\n" +
 	"\vWorkerStats\x126\n" +
 	"\x17device_memory_allocated\x18\x01 \x01(\x04R\x15deviceMemoryAllocated\x124\n" +

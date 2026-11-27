@@ -508,7 +508,7 @@ class Runner:
         cuts: list = []
         n_done = len(self.done)
         try:
-            s.snapshot_write(msg, fd, lambda r, n: cuts.append((r, n)), self._done)
+            s.snapshot_write(msg, fd, lambda r, n, _stall=False: cuts.append((r, n)), self._done)
         except ReflopError as e:
             self.events.add(f"snapshot_write:error:{cpb.ErrorCode.Name(e.code)}")
             self.closed(fd, ident, "snapshot_write")

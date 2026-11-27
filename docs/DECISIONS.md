@@ -2134,3 +2134,101 @@ copy, as it does in native PyTorch. A step that reads a value inside
 run eagerly; return the tensor and read it after the call. Steps up to
 `max_nodes` operations are kept in client memory while capture records.
 
+
+## ADR-061: RAM checkpoints, a pause instead of a skip, and frozen CPU sessions
+
+**Context.** Issue #2, the Owner side. Checkpoints (ADR-029) went only to
+disk, at least 5 and by default 10 minutes apart, because each one writes
+the Guest's whole state to the Owner's SSD. A worker crash, the watchdog, a
+rail, eviction or a restart therefore lost up to 10 minutes of work. A Guest
+whose state filled the GPU never got a checkpoint: the cut was skipped when
+the GPU lacked room for a second copy of the state, every time. `pause --now`
+killed CPU sessions, because the driver's suspend API (ADR-030) is for GPU
+memory. Measured on the Owner's RTX 5070 (driver 595, NVMe, 60 GiB RAM): a
+checkpoint into a memfd costs the worker what one into a disk file does
+(0.6 s for 4 GiB; the disk write lands in the page cache), so the disk's
+real cost is wear and fsync, not training time; reflopd copies an 8 GiB
+memfd into a file and fsyncs it in 1.8 s with `sendfile`; a synchronous copy
+of 8 GiB of state takes 1.0 to 1.3 s and needs no extra GPU memory; a memfd's
+pages are charged to the writing worker's cgroup and move to the shared
+`workers` cgroup when that worker's cgroup is removed; `cgroup.freeze` stops
+a busy CPU worker in 0.1 ms and it uses no CPU until thawed.
+
+**Decision.** (The Owner chose the defaults on 2026-11-27.)
+
+- **RAM checkpoints.** With checkpoints on, RAM checkpoints are on unless
+  the Owner passes `--ram=false` (`[checkpoints] ram`). reflopd creates a
+  memfd per checkpoint and passes it to the worker, with the disk file as a
+  second target when the disk interval has passed. At the cut, reflopd
+  reserves the bytes in RAM if all RAM checkpoints together stay within half
+  of what workers may use (the RAM rail's budget) and 256 MiB stays free
+  above the RAM floor; otherwise it uses the disk file, or refuses with
+  "allows one checkpoint every <disk interval> for this session", which the
+  client takes as "wait". reflopd seals the finished memfd (no write, grow,
+  shrink or new seals, also through the worker's descriptor), checks its
+  size, keeps it as the session's RAM checkpoint and closes the previous
+  one. The Guest's interval is the RAM interval, 1 minute by default, never
+  under 30 seconds and never longer than the disk interval
+  (`--ram-interval`). The disk interval (`--interval`) keeps its 5-minute
+  floor.
+- **reflopd writes the disk copy.** Every disk interval, when a session's
+  worker ends for any reason but an end on purpose, and when reflopd stops,
+  reflopd copies the newest RAM checkpoint into a temporary file with
+  `sendfile` (the bytes never enter reflopd's memory, and the worker and GPU
+  are not involved) and publishes it as before (sync, size check, rename,
+  directory sync). A publish never replaces a newer generation. Recovery
+  reads only the disk file; `RecoverSession` and shutdown wait up to 60 s
+  for a copy in progress. An end on purpose drops the RAM checkpoint
+  unwritten, and a late write is refused as before (ADR-029).
+- **RAM pressure.** Before the RAM rail limits or kills any worker, it drops
+  RAM checkpoints while they exceed their share or the host has less than
+  256 MiB above the RAM floor: first those already on disk, then the oldest.
+  Without a cgroup, reflopd adds their bytes to what workers use.
+- **A pause instead of a skip.** When the GPU lacks room for a background
+  copy and reflopd allows it (`SnapshotWrite.allow_stall`, set only for a
+  checkpoint that goes to disk), the worker reports `SnapshotCut.stall`,
+  reads the control channel until its `SnapshotGo` (keeping every other
+  message, in order, for after), and copies the state before it serves any
+  other request. Nothing is rebound meanwhile, so no second copy is needed.
+  The Guest is told once how long its work waited (`CheckpointSaved.paused_ms`).
+  The watchdog does not count the pause. Other checkpoints are still skipped,
+  with a reason that says when the next pause comes.
+- **Frozen CPU sessions.** `pause --now` freezes CPU workers (`cgroup.freeze`,
+  or SIGSTOP without a cgroup) and `resume` thaws them. A worker that cannot
+  be frozen is killed, as before. Auto-yield leaves CPU sessions running, as
+  before.
+
+**Alternatives.** RAM checkpoints off by default: most Guests would keep
+losing up to 10 minutes, and the RAM they use is bounded and the first thing
+the rail takes back. The worker writing the disk copy as a second
+checkpoint: it doubles the state's GPU memory again and copies it from the
+GPU twice. Keeping RAM checkpoints after their session ends, for a faster
+recovery: they would hold the Owner's RAM for a session that may never come
+back, and the disk copy is in the page cache anyway. A pause at every RAM
+checkpoint for a state that fills the GPU: 8 GiB every minute is about 2%
+slower training, every 10 minutes 0.2% (the Owner chose the disk interval).
+Overwriting one memfd in place instead of writing a new one: a crash during
+the write would leave no complete RAM copy.
+SIGSTOP for CPU workers everywhere: a cgroup freezes every thread at once
+and reports when it is done, so it is used when there is one.
+
+**Consequences.** A crash, the watchdog, a rail, eviction or the session TTL
+loses at most one RAM interval of server-side work, and a reflopd restart
+too. Measured on the Owner's machine with a 322 MiB state: a worker killed
+7.5 minutes in lost 30 s of work (with a 5-minute disk interval and RAM
+checkpoints off it lost 121 s at 7 minutes); the newest RAM checkpoint came
+back after a SIGKILL of the worker and after a reflopd restart, bit for bit.
+Training with RAM checkpoints every 30 s ran as fast as without (1.9 GiB
+state: 19.7 against 19.6 steps per second; 322 MiB, three alternating runs
+each: 68.0 against 67.8 on average). An 8 GiB state on the 12 GiB GPU
+got its first checkpoint, after a 1.2 s pause, where it had none. SSD writes
+are unchanged at the same disk interval, plus one write when a worker ends
+with a newer RAM checkpoint. Each Guest with checkpoints on holds up to its
+state's size in the Owner's RAM, twice that while the next one is written.
+reflopd now holds Guest data as sealed memfds it does not map, and copies
+it to disk in the kernel. Still open in issue #2: replay of the work since
+the last checkpoint, rewinding what the Guest keeps on its own machine, and
+recovery in a new Guest process. Tests: `ramckpt_test.go`,
+`TestCheckpointIntervalEnforced`, `TestRAMCheckpointSettings`,
+`TestCheckpointsRAMFlags`, `TestFreezeWaitsForTheKernel`,
+`tests/security/corpus/test_checkpoint_targets.py`, `tests/client/test_checkpoints.py`.

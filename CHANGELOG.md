@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Checkpoints are kept in RAM between disk writes (issue #2, ADR-061). With
+  `reflopd checkpoints on`, a session's newest checkpoint is now taken every
+  minute (`--ram-interval`, at least 30 s) and kept in the Owner's RAM; reflopd
+  writes it to disk every `--interval` as before, when the session's worker
+  ends, and when reflopd stops. A worker crash, the watchdog, a rail, eviction
+  or a reflopd restart now loses at most a minute of work, not up to the disk
+  interval, with no more disk writes. RAM checkpoints together use at most
+  half of the RAM workers may use and are dropped first when the RAM rail
+  needs the memory. `--ram=false` turns them off. Update both: the client
+  then uses the shorter interval and says where checkpoints go.
+- A session whose state fills the GPU gets checkpoints. They were skipped
+  every time, for lack of room for a second copy; now the checkpoint that
+  goes to disk copies the state while the session's requests wait (8 GiB:
+  about 1.2 s, once per disk interval), and the Guest is told once.
+- `reflopd pause --now` freezes CPU sessions instead of killing them, and
+  `reflopd resume` thaws them.
 - `b.copy_(a)` between two reFLOP tensors copies `a`. Once `a` had been
   sent to the server, `b` was made to point at `a`'s server tensor instead:
   changing `a` afterwards (`a.add_(1)`) changed `b` too, and when `a` was

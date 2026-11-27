@@ -179,9 +179,37 @@ type Config struct {
 // while it is copied.
 type Checkpoints struct {
 	Enabled bool `toml:"enabled" json:"enabled"`
-	// Interval is the shortest time between two checkpoints of a session,
+	// Interval is how often a session's checkpoint is written to disk, and,
+	// with RAM checkpoints off, the shortest time between two checkpoints
 	// and the default a Guest gets. Never below MinCheckpointInterval.
 	Interval Duration `toml:"interval" json:"interval"`
+	// RAM keeps each session's newest checkpoint in this machine's RAM
+	// between disk writes (ADR-061). Unset means on. reflopd writes the RAM
+	// copy to disk every Interval, when the session's worker ends, and when
+	// reflopd stops, and drops it first when the RAM rail needs the memory.
+	RAM *bool `toml:"ram,omitempty" json:"ram,omitempty"`
+	// RAMInterval is the shortest time between two checkpoints of a session
+	// with RAM checkpoints on, and the default a Guest gets.
+	RAMInterval Duration `toml:"ram_interval,omitempty" json:"ram_interval,omitempty"`
+}
+
+// RAMOn reports whether checkpoints are kept in RAM between disk writes.
+func (c Checkpoints) RAMOn() bool { return c.RAM == nil || *c.RAM }
+
+// RAMEvery is the RAM interval, the default when unset.
+func (c Checkpoints) RAMEvery() time.Duration {
+	if c.RAMInterval == 0 {
+		return DefaultRAMCheckpointInterval
+	}
+	return time.Duration(c.RAMInterval)
+}
+
+// GuestInterval is the shortest time between two checkpoints of a session.
+func (c Checkpoints) GuestInterval() time.Duration {
+	if c.RAMOn() {
+		return min(c.RAMEvery(), time.Duration(c.Interval))
+	}
+	return time.Duration(c.Interval)
 }
 
 // Checkpoint interval bounds. The floor is a hard limit: no setting, flag or
@@ -191,6 +219,10 @@ const (
 	MinCheckpointInterval     = 5 * time.Minute
 	DefaultCheckpointInterval = 10 * time.Minute
 	MaxCheckpointInterval     = 24 * time.Hour
+	// RAM checkpoints (ADR-061) write no disk; each still doubles the
+	// state's GPU memory for a moment while it is copied.
+	MinRAMCheckpointInterval     = 30 * time.Second
+	DefaultRAMCheckpointInterval = time.Minute
 )
 
 // Rail minimums: no configuration can go below these, so the rails are
@@ -465,6 +497,16 @@ func (c Checkpoints) Validate() error {
 	}
 	if iv > MaxCheckpointInterval {
 		return fmt.Errorf("checkpoints.interval must be at most %s", MaxCheckpointInterval)
+	}
+	if c.RAMInterval != 0 {
+		r := time.Duration(c.RAMInterval)
+		if r < MinRAMCheckpointInterval {
+			return fmt.Errorf("checkpoints.ram_interval must be at least %s (got %s): each checkpoint doubles the "+
+				"Guest state's GPU memory while it is copied", MinRAMCheckpointInterval, r)
+		}
+		if r > iv {
+			return fmt.Errorf("checkpoints.ram_interval (%s) must not be longer than checkpoints.interval (%s)", r, iv)
+		}
 	}
 	return nil
 }

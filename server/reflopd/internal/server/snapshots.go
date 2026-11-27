@@ -51,12 +51,20 @@ const (
 // pendingWrite is the one snapshot or checkpoint a session is writing.
 type pendingWrite struct {
 	rid        uint64 // session-internal request id
-	tmp, final string
+	tmp, final string // tmp is "" when the write has no disk target
 	checkpoint bool
 	generation uint64
 	replaced   uint64 // size of the file it replaces
-	reserved   uint64
+	reserved   uint64 // disk bytes
 	expect     uint64
+
+	// RAM checkpoints (ADR-061).
+	ram     bool     // RAM checkpoints are on for this write
+	diskDue bool     // the disk interval has passed: this one goes to disk too
+	memfd   *os.File // the RAM target (SnapshotWrite fd 0), until adopted
+	ramRes  uint64   // RAM bytes reserved for it
+	inRAM   bool     // SnapshotGo chose the memfd
+	stall   bool     // the worker holds requests while it copies (SnapshotCut.stall)
 }
 
 func (s *Session) snapshotDir() string { return s.srv.layout.IdentitySnapshots(s.Identity.ID) }
@@ -120,27 +128,38 @@ func (s *Session) checkpoint(c *clientConn, env *pb.Envelope, req *pb.Checkpoint
 		c.sendErr(env.RequestId, pb.ErrorCode_ERROR_RESOURCE_LIMIT, fmt.Sprintf("checkpoint tags are at most %d bytes", maxTagBytes))
 		return nil
 	}
-	iv := time.Duration(cfg.Interval)
+	iv, disk := cfg.GuestInterval(), time.Duration(cfg.Interval)
 	s.mu.Lock()
-	last, gen := s.lastCheckpoint, s.checkpointGen+1
+	last, gen, lastDisk, refused := s.lastCheckpoint, s.checkpointGen+1, s.lastDisk, s.ramRefused
 	s.mu.Unlock()
 	if !last.IsZero() && time.Since(last) < iv {
 		c.sendErr(env.RequestId, pb.ErrorCode_ERROR_RESOURCE_LIMIT, fmt.Sprintf(
 			"the Owner allows one checkpoint every %s; the last one was %s ago", iv, time.Since(last).Truncate(time.Second)))
 		return nil
 	}
+	diskDue := lastDisk.IsZero() || time.Since(lastDisk) >= disk
+	ram := cfg.RAMOn()
+	if ram && refused > 0 && !diskDue {
+		// The last one did not fit in RAM: this session gets disk
+		// checkpoints only, until its state fits again.
+		if why := s.srv.ramFits(refused); why != "" {
+			code, msg := ramRefusal(disk, why)
+			c.sendErr(env.RequestId, code, msg)
+			return nil
+		}
+	}
 	dir := s.checkpointDir()
-	pw := &pendingWrite{final: checkpointPath(dir, s.ID[:]), checkpoint: true, generation: gen}
-	return s.startWrite(c, env, dir, pw, &pb.SnapshotWrite{Checkpoint: true, Tag: req.Tag, Generation: gen}, "")
+	pw := &pendingWrite{final: checkpointPath(dir, s.ID[:]), checkpoint: true, generation: gen, ram: ram, diskDue: diskDue}
+	// A state that fills the GPU is copied while the session's requests
+	// wait, but only for a checkpoint that goes to disk (ADR-061).
+	return s.startWrite(c, env, dir, pw, &pb.SnapshotWrite{Checkpoint: true, Tag: req.Tag, Generation: gen,
+		AllowStall: diskDue}, "")
 }
 
 func (s *Session) startWrite(c *clientConn, env *pb.Envelope, dir string, pw *pendingWrite, msg *pb.SnapshotWrite, name string) error {
-	if rails.DiskBudget(s.srv.cfg().Rails, s.srv.layout.State) == 0 {
+	diskOK := rails.DiskBudget(s.srv.cfg().Rails, s.srv.layout.State) > 0
+	if !pw.ram && !diskOK {
 		c.sendErr(env.RequestId, pb.ErrorCode_ERROR_SAFETY_RAIL, "the disk safety rail leaves no room for snapshots")
-		return nil
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		c.sendErr(env.RequestId, pb.ErrorCode_ERROR_INTERNAL, "could not create the snapshot directory")
 		return nil
 	}
 	s.mu.Lock()
@@ -156,26 +175,60 @@ func (s *Session) startWrite(c *clientConn, env *pb.Envelope, dir string, pw *pe
 	}
 	s.writing = pw
 	s.mu.Unlock()
-	pw.tmp = filepath.Join(dir, "."+filepath.Base(pw.final)+".tmp-"+s.hex()[:8])
-	pw.replaced = fileSize(pw.final)
-	f, err := os.OpenFile(pw.tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|unix.O_CLOEXEC, 0o600)
-	if err != nil {
+	var fds []int
+	if pw.ram {
+		mf, err := newMemfd("reflop-checkpoint")
+		if err != nil {
+			s.srv.logf("session %s: no RAM checkpoint: memfd: %v", s.hex()[:8], err)
+			pw.ram = false
+		} else {
+			pw.memfd = mf
+			fds = append(fds, int(mf.Fd()))
+		}
+	}
+	// The disk file is a target when every checkpoint goes to disk or the
+	// disk interval has passed, as long as the disk rail leaves room.
+	wantDisk := (!pw.ram || pw.diskDue) && diskOK
+	if !pw.ram && !wantDisk {
 		s.clearWrite(pw)
-		c.sendErr(env.RequestId, pb.ErrorCode_ERROR_INTERNAL, "could not create the snapshot file")
+		c.sendErr(env.RequestId, pb.ErrorCode_ERROR_SAFETY_RAIL, "the disk safety rail leaves no room for checkpoints")
 		return nil
+	}
+	if wantDisk {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			s.clearWrite(pw)
+			c.sendErr(env.RequestId, pb.ErrorCode_ERROR_INTERNAL, "could not create the snapshot directory")
+			return nil
+		}
+	}
+	var f *os.File
+	if wantDisk {
+		pw.tmp = filepath.Join(dir, "."+filepath.Base(pw.final)+".tmp-"+s.hex()[:8])
+		pw.replaced = fileSize(pw.final)
+		var err error
+		f, err = os.OpenFile(pw.tmp, os.O_CREATE|os.O_EXCL|os.O_WRONLY|unix.O_CLOEXEC, 0o600)
+		if err != nil {
+			pw.tmp = ""
+			s.clearWrite(pw)
+			c.sendErr(env.RequestId, pb.ErrorCode_ERROR_INTERNAL, "could not create the snapshot file")
+			return nil
+		}
+		fds = append(fds, int(f.Fd()))
 	}
 	pw.rid = s.newRoute(c, env.RequestId, map[bool]string{true: "checkpoint", false: "snapshot"}[pw.checkpoint],
 		func(resp *pb.Envelope) { s.finishWrite(c, env.RequestId, pw, name, resp) })
 	msg.RequestId = pw.rid
-	err = s.worker.SendFDs([]byte("snapshot"), []int{int(f.Fd())})
-	f.Close()
+	msg.Targets = uint32(len(fds))
+	err := s.worker.SendFDs([]byte("snapshot"), fds)
+	if f != nil {
+		f.Close() // the worker has its own descriptor; publish opens the path again
+	}
 	if err == nil {
 		err = s.worker.Send(&pb.WorkerEnvelope{Body: &pb.WorkerEnvelope_SnapshotWrite{SnapshotWrite: msg}})
 	}
 	if err != nil {
 		s.dropRoute(pw.rid)
 		s.clearWrite(pw)
-		os.Remove(pw.tmp)
 		c.sendErr(env.RequestId, pb.ErrorCode_ERROR_SESSION_LOST, "worker is gone")
 	}
 	return nil
@@ -189,15 +242,55 @@ func (s *Session) onCut(cut *pb.SnapshotCut) {
 	if pw == nil || pw.rid != cut.RequestId {
 		return
 	}
+	_ = s.worker.Send(&pb.WorkerEnvelope{Body: &pb.WorkerEnvelope_SnapshotGo{SnapshotGo: s.cutVerdict(pw, cut)}})
+}
+
+// cutVerdict reserves the cut's bytes where the write goes, the memfd when
+// it fits in RAM, else the disk file, and says which (SnapshotGo.target).
+func (s *Session) cutVerdict(pw *pendingWrite, cut *pb.SnapshotCut) *pb.SnapshotGo {
 	g := &pb.SnapshotGo{RequestId: cut.RequestId, Proceed: true}
-	if code, err := s.srv.reserveWrite(s.Identity.ID, cut.Bytes, pw.replaced); err != nil {
-		g.Proceed, g.Code, g.Reason = false, code, err.Error()
-	} else {
+	var ramWhy string
+	chosen := false
+	if pw.memfd != nil {
+		// RAM first: it writes no disk (ADR-061).
+		if err := s.srv.reserveRAM(cut.Bytes); err == nil {
+			s.mu.Lock()
+			pw.ramRes, pw.expect, pw.inRAM = cut.Bytes, cut.Bytes, true
+			s.ramRefused = 0
+			s.mu.Unlock()
+			g.Target, chosen = 0, true
+		} else {
+			ramWhy = err.Error()
+			s.mu.Lock()
+			s.ramRefused = cut.Bytes
+			s.mu.Unlock()
+		}
+	}
+	switch {
+	case chosen:
+	case pw.tmp != "":
+		if code, err := s.srv.reserveWrite(s.Identity.ID, cut.Bytes, pw.replaced); err != nil {
+			g.Proceed, g.Code, g.Reason = false, code, err.Error()
+		} else {
+			s.mu.Lock()
+			pw.reserved, pw.expect = cut.Bytes, cut.Bytes
+			s.mu.Unlock()
+			if pw.memfd != nil {
+				g.Target = 1
+			}
+		}
+	default:
+		g.Proceed = false
+		g.Code, g.Reason = ramRefusal(time.Duration(s.srv.cfg().Checkpoints.Interval), ramWhy)
+	}
+	if g.Proceed && cut.Stall {
+		// The worker serves no request until the copy is done: the
+		// watchdog must not count that wait (finishWrite resets it).
 		s.mu.Lock()
-		pw.reserved, pw.expect = cut.Bytes, cut.Bytes
+		pw.stall, s.stalled = true, true
 		s.mu.Unlock()
 	}
-	_ = s.worker.Send(&pb.WorkerEnvelope{Body: &pb.WorkerEnvelope_SnapshotGo{SnapshotGo: g}})
+	return g
 }
 
 func (s *Session) clearWrite(pw *pendingWrite) {
@@ -205,10 +298,25 @@ func (s *Session) clearWrite(pw *pendingWrite) {
 	if s.writing == pw {
 		s.writing = nil
 	}
-	n := pw.reserved
-	pw.reserved = 0
+	n, r, mf := pw.reserved, pw.ramRes, pw.memfd
+	pw.reserved, pw.ramRes, pw.memfd = 0, 0, nil
+	if pw.stall {
+		pw.stall, s.stalled = false, false
+		now := time.Now()
+		for _, rt := range s.routes {
+			rt.start = now // the watchdog does not count the copy
+		}
+	}
+	tmp := pw.tmp
 	s.mu.Unlock()
 	s.srv.releaseWrite(s.Identity.ID, n)
+	s.srv.releaseRAMReservation(r)
+	if mf != nil {
+		mf.Close() // not adopted
+	}
+	if tmp != "" {
+		os.Remove(tmp) // after a publish the name is gone and this fails
+	}
 }
 
 func (s *Session) finishWrite(c *clientConn, rid uint64, pw *pendingWrite, name string, resp *pb.Envelope) {
@@ -223,7 +331,6 @@ func (s *Session) finishWrite(c *clientConn, rid uint64, pw *pendingWrite, name 
 		ok = true
 	}
 	if !ok {
-		os.Remove(pw.tmp)
 		if cs := resp.GetCheckpointSaved(); cs != nil && cs.Skipped {
 			s.srv.audit.Write(audit.Record{Identity: s.Identity.Name, ID: s.Identity.ID, Session: s.hex(), Event: "checkpoint_skipped",
 				Fields: map[string]any{"reason": trunc(cs.Reason, 200)}})
@@ -231,8 +338,11 @@ func (s *Session) finishWrite(c *clientConn, rid uint64, pw *pendingWrite, name 
 		s.reply(c, rid, resp)
 		return
 	}
+	if pw.inRAM {
+		s.finishRAM(c, rid, pw, resp)
+		return
+	}
 	if err := s.publish(pw); err != nil {
-		os.Remove(pw.tmp)
 		s.srv.logf("session %s: %s not saved: %v", s.hex()[:8], what, err)
 		code := pb.ErrorCode_ERROR_INTERNAL
 		if errors.Is(err, errSessionFinal) {
@@ -246,6 +356,7 @@ func (s *Session) finishWrite(c *clientConn, rid uint64, pw *pendingWrite, name 
 		s.mu.Lock()
 		s.lastCheckpoint, s.checkpointGen = time.Now(), pw.generation
 		s.mu.Unlock()
+		s.dropRAM() // older than the disk checkpoint now
 		resp.GetCheckpointSaved().Bytes = pw.expect
 	} else {
 		resp.GetSnapshotSaved().Bytes = pw.expect
@@ -255,7 +366,60 @@ func (s *Session) finishWrite(c *clientConn, rid uint64, pw *pendingWrite, name 
 	s.reply(c, rid, resp)
 }
 
-var errSessionFinal = errors.New("the session was ended on purpose")
+var (
+	errSessionFinal    = errors.New("the session was ended on purpose")
+	errStaleCheckpoint = errors.New("a newer checkpoint is already on disk")
+)
+
+// finishRAM completes a checkpoint the worker wrote into a memfd: seal it,
+// check its size, keep it as the session's RAM checkpoint, and write it to
+// disk in the background when the disk interval has passed.
+func (s *Session) finishRAM(c *clientConn, rid uint64, pw *pendingWrite, resp *pb.Envelope) {
+	n, err := sealMemfd(pw.memfd)
+	if err == nil && (n != pw.expect || n == 0) {
+		err = fmt.Errorf("the RAM checkpoint has %d bytes, the worker announced %d", n, pw.expect)
+	}
+	s.mu.Lock()
+	if err == nil && s.final {
+		err = errSessionFinal
+	}
+	s.mu.Unlock()
+	if err != nil {
+		s.srv.logf("session %s: checkpoint not saved: %v", s.hex()[:8], err)
+		code := pb.ErrorCode_ERROR_INTERNAL
+		if errors.Is(err, errSessionFinal) {
+			code = pb.ErrorCode_ERROR_SESSION_LOST
+		}
+		s.reply(c, rid, &pb.Envelope{End: true, Body: &pb.Envelope_Error{Error: &pb.Error{Code: code,
+			Message: fmt.Sprintf("the checkpoint was not saved: %v", err)}}})
+		return
+	}
+	rc := &ramCheckpoint{f: pw.memfd, gen: pw.generation, bytes: n, created: time.Now()}
+	s.mu.Lock()
+	reserved := pw.ramRes
+	pw.memfd, pw.ramRes = nil, 0
+	s.lastCheckpoint, s.checkpointGen = time.Now(), pw.generation
+	s.mu.Unlock()
+	if !s.adoptRAM(rc, reserved) {
+		// The worker ended meanwhile (lost already ran): write it out now,
+		// unless the session was ended on purpose.
+		s.mu.Lock()
+		final := s.final
+		s.mu.Unlock()
+		if final {
+			s.srv.releaseRAM(rc)
+		} else {
+			s.persistInBackground(rc, "worker ended", true)
+		}
+	} else if pw.diskDue {
+		s.persistInBackground(rc, "disk interval", false)
+	}
+	cs := resp.GetCheckpointSaved()
+	cs.Bytes, cs.InRam = n, true
+	s.srv.audit.Write(audit.Record{Identity: s.Identity.Name, ID: s.Identity.ID, Session: s.hex(), Event: "checkpoint_saved",
+		Fields: map[string]any{"bytes": n, "generation": pw.generation, "ram": true, "paused_ms": cs.PausedMs}})
+	s.reply(c, rid, resp)
+}
 
 func auditWriteFields(pw *pendingWrite, name string) map[string]any {
 	f := map[string]any{"bytes": pw.expect}
@@ -293,7 +457,16 @@ func (s *Session) publish(pw *pendingWrite) error {
 		s.mu.Unlock()
 		return errSessionFinal
 	}
+	// The worker (a disk target) and reflopd (writing a RAM checkpoint
+	// out) both publish checkpoints: never replace a newer one.
+	if pw.checkpoint && pw.generation != 0 && pw.generation <= s.diskGen {
+		s.mu.Unlock()
+		return errStaleCheckpoint
+	}
 	err = os.Rename(pw.tmp, pw.final)
+	if err == nil && pw.checkpoint {
+		s.diskGen, s.lastDisk = pw.generation, time.Now()
+	}
 	s.mu.Unlock()
 	if err != nil {
 		return fmt.Errorf("rename: %w", err)
@@ -415,6 +588,8 @@ func (s *Session) recoverSession(c *clientConn, env *pb.Envelope, req *pb.Recove
 		c.sendErr(rid, pb.ErrorCode_ERROR_PROTOCOL, "bad session id")
 		return nil
 	}
+	// Its newest checkpoint may still be on its way from RAM to disk.
+	s.srv.waitPersist(hex.EncodeToString(from), persistWait)
 	s.srv.mu.Lock()
 	old := s.srv.sessions[hex.EncodeToString(from)]
 	s.srv.mu.Unlock()
@@ -500,7 +675,7 @@ func (s *Session) recoverSession(c *clientConn, env *pb.Envelope, req *pb.Recove
 		s.mu.Lock()
 		if !s.final {
 			if err := os.Rename(path, checkpointPath(s.checkpointDir(), s.ID[:])); err == nil {
-				s.checkpointGen = meta.Generation
+				s.checkpointGen, s.diskGen = meta.Generation, meta.Generation
 			}
 		}
 		s.mu.Unlock()

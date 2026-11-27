@@ -482,8 +482,12 @@ type ServerCapabilities struct {
 	// Checkpoints ("checkpoints" capability): the Owner's interval in seconds,
 	// the shortest a Guest may use. 0 = the Owner has not enabled them.
 	CheckpointIntervalS uint64 `protobuf:"varint,9,opt,name=checkpoint_interval_s,json=checkpointIntervalS,proto3" json:"checkpoint_interval_s,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// How often a checkpoint reaches the Owner's disk. Larger than
+	// checkpoint_interval_s when checkpoints are kept in RAM in between
+	// (ADR-061); 0 from older servers.
+	CheckpointDiskIntervalS uint64 `protobuf:"varint,10,opt,name=checkpoint_disk_interval_s,json=checkpointDiskIntervalS,proto3" json:"checkpoint_disk_interval_s,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *ServerCapabilities) Reset() {
@@ -579,6 +583,13 @@ func (x *ServerCapabilities) GetCheckpointIntervalS() uint64 {
 	return 0
 }
 
+func (x *ServerCapabilities) GetCheckpointDiskIntervalS() uint64 {
+	if x != nil {
+		return x.CheckpointDiskIntervalS
+	}
+	return 0
+}
+
 var File_reflop_v1_capabilities_proto protoreflect.FileDescriptor
 
 const file_reflop_v1_capabilities_proto_rawDesc = "" +
@@ -628,7 +639,7 @@ const file_reflop_v1_capabilities_proto_rawDesc = "" +
 	"\fcuda_version\x18\x02 \x01(\tR\vcudaVersion\x12%\n" +
 	"\x0edriver_version\x18\x03 \x01(\tR\rdriverVersion\x12'\n" +
 	"\x0freflopd_version\x18\x04 \x01(\tR\x0ereflopdVersion\x12'\n" +
-	"\x0fruntime_variant\x18\x05 \x01(\tR\x0eruntimeVariant\"\xae\x03\n" +
+	"\x0fruntime_variant\x18\x05 \x01(\tR\x0eruntimeVariant\"\xeb\x03\n" +
 	"\x12ServerCapabilities\x12+\n" +
 	"\x11protocol_versions\x18\x01 \x03(\rR\x10protocolVersions\x12%\n" +
 	"\x0eopset_versions\x18\x02 \x03(\rR\ropsetVersions\x12$\n" +
@@ -638,7 +649,9 @@ const file_reflop_v1_capabilities_proto_rawDesc = "" +
 	"\bnumerics\x18\x06 \x01(\v2\x13.reflop.v1.NumericsR\bnumerics\x12)\n" +
 	"\x06limits\x18\a \x01(\v2\x11.reflop.v1.LimitsR\x06limits\x129\n" +
 	"\fruntime_info\x18\b \x01(\v2\x16.reflop.v1.RuntimeInfoR\vruntimeInfo\x122\n" +
-	"\x15checkpoint_interval_s\x18\t \x01(\x04R\x13checkpointIntervalSB)Z'github.com/reflopai/reflop/pkg/reflopv1b\x06proto3"
+	"\x15checkpoint_interval_s\x18\t \x01(\x04R\x13checkpointIntervalS\x12;\n" +
+	"\x1acheckpoint_disk_interval_s\x18\n" +
+	" \x01(\x04R\x17checkpointDiskIntervalSB)Z'github.com/reflopai/reflop/pkg/reflopv1b\x06proto3"
 
 var (
 	file_reflop_v1_capabilities_proto_rawDescOnce sync.Once

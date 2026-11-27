@@ -534,9 +534,15 @@ dev = reflop.device(checkpoint=True)                    # the Owner's interval
 dev = reflop.device(checkpoint=True, checkpoint_interval=1800)   # or longer, in seconds
 ```
 
-The interval defaults to the Owner's, which is at least 5 minutes. You can
-make it longer, never shorter: a shorter one raises `ReflopError` and names
-the Owner's interval. Checkpoints are taken at `reflop.step_boundary()` and
+The interval defaults to the Owner's. reflopd newer than 0.3.2 keeps
+checkpoints in its RAM between disk writes: the interval is then 1 minute
+unless the Owner set another, never under 30 seconds, and the newest one
+reaches the Owner's disk every 10 minutes by default, when your worker ends,
+and when reflopd stops. Older servers write each one to disk, at most every
+5 minutes.
+Turning checkpoints on prints which applies. You can make the interval
+longer, never shorter: a shorter one raises `ReflopError` and names the
+Owner's interval. Checkpoints are taken at `reflop.step_boundary()` and
 after each call of a `reflop.capture` step. They run in the background on the
 server and did not slow training measurably in our tests.
 
@@ -546,8 +552,9 @@ server and did not slow training measurably in our tests.
 > change keeps its old version until the checkpoint has copied it, so for a
 > moment parameters, optimizer state and buffers can need twice their
 > memory. Leave that much GPU memory free when you pick a batch size. If it
-> is not free, the checkpoint is skipped: reflop prints why and tries again
-> later, and training goes on.
+> is not free, the checkpoint that goes to the Owner's disk is copied while
+> your work waits (about 1.2 s for 8 GiB; reflop tells you once), and the
+> ones in between are skipped. Older servers skip them all.
 
 When the worker is lost, the next request raises `reflop.SessionLostError`.
 `reflop.recover()` then opens a new session from the last checkpoint, in the
@@ -585,8 +592,8 @@ be recovered: that deletes its checkpoint. Closing the session yourself does
 too. When your process ends, use `reflop.save` for what you want to keep.
 
 If the Owner runs `reflopd pause --now`, your session is usually suspended
-rather than ended: your program waits until the Owner resumes, and nothing is
-lost.
+(a GPU session) or frozen (a CPU session) rather than ended: your program
+waits until the Owner resumes, and nothing is lost.
 
 While execution is paused, the server holds your requests until it resumes.
 It holds up to 4096 of them per session (and a limit in bytes); a request
