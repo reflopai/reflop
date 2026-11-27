@@ -1,3 +1,0 @@
-# Optional offline report rendering; not needed to run GPU benchmarks.
-matplotlib==3.11.2
-numpy>=1.24
