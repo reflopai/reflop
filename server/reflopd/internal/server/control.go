@@ -20,6 +20,7 @@ import (
 
 	pb "github.com/reflopai/reflop/pkg/reflopv1"
 	"github.com/reflopai/reflop/server/reflopd/internal/audit"
+	"github.com/reflopai/reflop/server/reflopd/internal/auth"
 	"github.com/reflopai/reflop/server/reflopd/internal/buildinfo"
 	"github.com/reflopai/reflop/server/reflopd/internal/config"
 	"github.com/reflopai/reflop/server/reflopd/internal/gpu"
@@ -629,9 +630,14 @@ func (s *Server) Resume(by string) {
 
 // Kill terminates sessions matching an identity name or session id prefix.
 func (s *Server) Kill(target, why string) int {
-	return s.kill(why, func(sess *Session) bool {
-		return target != "" && (sess.Identity.Name == target || strings.HasPrefix(sess.hex(), target))
-	})
+	return s.kill(why, func(sess *Session) bool { return killTargets(sess, target) })
+}
+
+// killTargets says whether `reflopd kill target` ends sess: target is a
+// session id prefix or a Guest's name, which reaches the Guest's identity
+// on every GPU (ADR-062).
+func killTargets(sess *Session, target string) bool {
+	return target != "" && (auth.OfGuest(sess.Identity.Name, target) || strings.HasPrefix(sess.hex(), target))
 }
 
 func (s *Server) kill(why string, match func(*Session) bool) int {

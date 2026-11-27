@@ -113,6 +113,11 @@ the identity, its datasets and snapshots on disk, and its quotas, and frees the
 name. The audit log keeps its history. It refuses an identity that is still
 active; revoke it first.
 
+A Guest you invited to several GPUs has one identity per GPU, all listed
+under one name. `reflopd revoke`, `users delete` and `unpair` act on all of
+them; add `--gpu <index>` for one GPU only. `reflopd kill` and `reflopd usage`
+also cover every GPU.
+
 ### Unpairing a Guest
 
 `reflopd unpair alice` does both steps: it revokes `alice` and deletes her.

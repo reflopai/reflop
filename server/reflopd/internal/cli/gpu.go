@@ -199,6 +199,53 @@ func quotaIdentity(out io.Writer, ids *auth.Store, name, selector string) (strin
 	return "", exitWith(ExitUsage, fmt.Errorf("no Guest named %q (see `reflopd users`)", name))
 }
 
+// guestIdentities is what revoke, unpair and users delete act on (ADR-062).
+// With --gpu, the named GPU's identity, which must exist. Without it, every
+// identity of that Guest: the one named exactly name (paired before 0.2.10,
+// or a full name such as alice@gpu-… copied from a hint) and each
+// name@<gpu-uuid>. `reflopd users` shows all of them as name, and cutting a
+// Guest off must not leave one of their identities working.
+func guestIdentities(ids *auth.Store, name, selector string) ([]auth.Identity, error) {
+	if selector != "" {
+		scoped, err := scopedIdentityName(name, selector)
+		if err != nil {
+			return nil, err
+		}
+		id, ok := ids.Get(scoped)
+		if !ok {
+			return nil, exitWith(ExitUsage, fmt.Errorf("%q is not paired with GPU %s (see `reflopd users`)", name, selector))
+		}
+		return []auth.Identity{id}, nil
+	}
+	var out []auth.Identity
+	for _, id := range ids.List() {
+		if auth.OfGuest(id.Name, name) {
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		return nil, exitWith(ExitUsage, fmt.Errorf("no Guest named %q (see `reflopd users`)", name))
+	}
+	return out, nil
+}
+
+// identityNames quotes each identity's full name for messages.
+func identityNames(list []auth.Identity) string {
+	q := make([]string, len(list))
+	for i, id := range list {
+		q[i] = strconv.Quote(id.Name)
+	}
+	return strings.Join(q, ", ")
+}
+
+// withGPU repeats a command's --gpu flag in a hint.
+func withGPU(name, selector string) string {
+	if selector == "" {
+		return name
+	}
+	return name + " --gpu " + selector
+}
+
 // orphanQuota says whether a quota is stored under a name no identity has:
 // it limits nobody. Quotas set without --gpu for a GPU-scoped Guest before
 // ADR-055 are like that.

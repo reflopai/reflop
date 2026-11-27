@@ -2232,3 +2232,42 @@ recovery in a new Guest process. Tests: `ramckpt_test.go`,
 `TestCheckpointIntervalEnforced`, `TestRAMCheckpointSettings`,
 `TestCheckpointsRAMFlags`, `TestFreezeWaitsForTheKernel`,
 `tests/security/corpus/test_checkpoint_targets.py`, `tests/client/test_checkpoints.py`.
+
+## ADR-062: Owner commands reach every identity of a Guest by name
+
+**Context.** Since 0.2.10 (ADR-047) a Guest paired with a GPU gets an identity
+per GPU, named `alice@<gpu-uuid>`, and `reflopd users` lists each of them
+under the name `alice`. `reflopd revoke`, `unpair` and `users delete` scoped
+the name only when `--gpu` was given, so `reflopd unpair alice` answered `no
+identity named "alice"`; `reflopd kill alice` and `reflopd usage alice` found
+nothing either. A Guest paired before 0.2.10 and again with a GPU since has
+both `alice` and `alice@gpu-…`: `reflopd revoke alice` revoked only the first,
+said `revoked "alice"`, and left the GPU identity working. The 2026-11-28
+benchmark's cleanup hit the first case and left a test Guest paired.
+ADR-055 fixed the same naming for quotas.
+
+**Decision.** (The Owner chose this on 2026-11-28.) Without `--gpu`, a Guest's
+name means every identity of that Guest: the one named exactly so and each
+`name@gpu-…` (`auth.OfGuest`). `revoke` revokes each one still active and
+says which were already revoked. `unpair` names every identity it will
+delete in its question and in the `--yes` refusal, then revokes and deletes
+each. `users delete` is all or nothing: it deletes nothing while any of them
+is active. `kill` ends the Guest's sessions on every GPU, and `usage NAME`
+shows each of the Guest's identities. A full name (`alice@gpu-…`, as hints
+print it) still selects that identity alone, and `--gpu` narrows a command
+to one GPU's identity, which must exist.
+
+**Alternatives.** Quotas' rule (ADR-055): the exact name, else the only GPU
+identity, else refuse. For quotas a refusal costs nothing. For revoke it
+leaves the GPU identity of a Guest who also has an old one working, and an
+Owner cutting a Guest off in a hurry would have to run the command once per
+GPU. Revoke every identity, but refuse `unpair` and `users delete` when there
+are several: those delete data, but the question already lists them, and
+`--yes` is the Owner's explicit choice.
+
+**Consequences.** An Owner who means one GPU must pass `--gpu`; the
+command's output and `unpair`'s question show every identity it reaches.
+Names cannot contain `@` (`auth.NameRe`), so `alice` never matches
+`alicex@gpu-…`. Tests: `TestRevokeReachesEveryIdentityOfAGuest`,
+`TestUnpairAndDeleteReachEveryIdentityOfAGuest`,
+`TestKillTargetsAGuestOnEveryGPU`, `TestOfGuest`.

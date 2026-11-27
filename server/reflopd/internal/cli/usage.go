@@ -16,6 +16,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/reflopai/reflop/server/reflopd/internal/auth"
 	"github.com/reflopai/reflop/server/reflopd/internal/usage"
 )
 
@@ -45,13 +46,14 @@ only covers its retention window.`,
 			name := ""
 			if len(args) == 1 {
 				name = args[0]
-				if _, ok := rep.Identities[name]; !ok {
-					return fmt.Errorf("no usage recorded for %q", name)
-				}
+				// The Guest's identity on every GPU (ADR-062).
 				for k := range rep.Identities {
-					if k != name {
+					if !auth.OfGuest(k, name) {
 						delete(rep.Identities, k)
 					}
+				}
+				if len(rep.Identities) == 0 {
+					return fmt.Errorf("no usage recorded for %q", name)
 				}
 			}
 			if asJSON {
