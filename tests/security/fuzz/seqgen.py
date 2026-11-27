@@ -389,7 +389,10 @@ class Gen:
         call = self._template(x, y)
         inputs, nodes = encode(self.gsess, call)
         outs, err = infer_outputs(self.gsess, call)
-        if err is not None:
+        if err is not None or any(dt not in TORCH_TO_PB for dt, _ in outs):
+            # Type promotion can infer a dtype the wire cannot carry: a 0-dim
+            # complex64 plus a float16 tensor is complex32. No graph can
+            # declare it, so declare x's meta; the worker must refuse it (V4).
             outs = [x]
         twice = r.random() < (0.5 if len(self.live) >= LIMITS["max_handles_per_session"] - 2 else 0.08)
         g = graph_of(self.gsess, inputs, nodes, outs * (2 if twice else 1))

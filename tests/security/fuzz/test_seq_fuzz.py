@@ -21,6 +21,7 @@ import os
 
 import pytest
 from fuzzrun import CORPUS, fuzz_device, load, retarget
+from helpers import NAME
 from isolated import run_isolated
 from reflop_worker._pb import graph_pb2 as gpb
 from seqgen import frames, sequence
@@ -49,6 +50,26 @@ def test_seq_corpus(path, tmp_path):
     if DEVICE != "cpu":
         frs = retarget(frs, gpb.Device(kind=gpb.DEVICE_CUDA))
     assert run_fresh(DEVICE, frs, tmp_path)[0] == []
+
+
+def test_an_output_dtype_the_wire_cannot_carry(tmp_path):
+    # Seed 101, case 260: add(<0-dim complex64>, <float16 [3, 0]>) infers
+    # complex32, which has no wire dtype, and building the graph raised
+    # KeyError before any request reached the worker. The generator now
+    # declares the input's meta and the worker refuses the graph in V4.
+    # corpus/seq/complex32-promoted-output.bin replays the same sequence
+    # whatever the generator does later.
+    case = sequence(101, 260, DEVICE)
+    C64, F16 = gpb.DTYPE_COMPLEX64, gpb.DTYPE_FLOAT16
+    promoted = [g for g in (s.env.client.register_graph.graph for s in case.steps
+                            if s.env.client.WhichOneof("body") == "register_graph")
+                if [i.meta.dtype for i in g.inputs] == [C64, F16]
+                and [n.op_id for n in g.nodes] == [NAME["aten.add.Tensor"]]]
+    assert promoted, "the generator no longer makes this graph here; find a seed that does"
+    assert [m.dtype for m in promoted[0].output_meta] == [C64]
+    failures, seen = run_fresh(DEVICE, frames(case), tmp_path)
+    assert failures == []
+    assert "register_graph:error:ERROR_SHAPE_MISMATCH" in seen
 
 
 # Paths the generator must reach, so a change to it cannot quietly stop
