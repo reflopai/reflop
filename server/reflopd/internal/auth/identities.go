@@ -40,6 +40,17 @@ func ScopedName(name, uuid string) string {
 	return name + "@" + uuid
 }
 
+// OfGuest says whether the identity named full belongs to the Guest name:
+// full is name itself (paired before 0.2.10) or name@<gpu-uuid>, which
+// `reflopd users` lists as name. NameRe keeps "@" out of names.
+func OfGuest(full, name string) bool {
+	if full == name {
+		return true
+	}
+	base, uuid, scoped := strings.Cut(full, "@")
+	return scoped && base == name && strings.HasPrefix(uuid, "gpu-")
+}
+
 // Key is one registered public key.
 type Key struct {
 	Public  []byte    `json:"public"` // 32-byte Ed25519

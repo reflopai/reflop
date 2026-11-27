@@ -307,13 +307,12 @@ name for a new invite. The audit log keeps its history.
 Only revoked identities can be deleted; revoke an active one first:
 
   reflopd revoke alice
-  reflopd users delete alice`,
+  reflopd users delete alice
+
+Without --gpu this deletes every identity of the Guest (one per GPU it
+paired with); with --gpu, only that GPU's.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name, err := scopedIdentityName(args[0], selector)
-			if err != nil {
-				return err
-			}
 			l, err := layout()
 			if err != nil {
 				return err
@@ -322,15 +321,28 @@ Only revoked identities can be deleted; revoke an active one first:
 			if err != nil {
 				return err
 			}
-			id, ok := ids.Get(name)
-			if !ok {
-				return exitWith(ExitUsage, fmt.Errorf("no identity named %q", name))
+			targets, err := guestIdentities(ids, args[0], selector)
+			if err != nil {
+				return err
 			}
-			if !id.Revoked {
-				return exitWith(ExitUsage, fmt.Errorf("%q is an active identity; revoke it first with `reflopd revoke %s`, "+
-					"or do both with `reflopd unpair %s`", name, name, name))
+			var active []auth.Identity
+			for _, id := range targets {
+				if !id.Revoked {
+					active = append(active, id)
+				}
 			}
-			return deleteIdentity(cmd.OutOrStdout(), l, ids, id)
+			if len(active) > 0 {
+				// All or nothing: a half-deleted Guest is harder to reason about.
+				arg := withGPU(args[0], selector)
+				return exitWith(ExitUsage, fmt.Errorf("still active: %s; revoke it first with `reflopd revoke %s`, "+
+					"or do both with `reflopd unpair %s`", identityNames(active), arg, arg))
+			}
+			for _, id := range targets {
+				if err := deleteIdentity(cmd.OutOrStdout(), l, ids, id); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&selector, "gpu", "", "physical GPU index or UUID")
@@ -384,13 +396,13 @@ func revokeCmd() *cobra.Command {
 	var selector string
 	cmd := &cobra.Command{
 		Use:   "revoke <name>",
-		Short: "Revoke an identity: its keys stop working and its sessions end now",
-		Args:  cobra.ExactArgs(1),
+		Short: "Revoke a Guest: its keys stop working and its sessions end now",
+		Long: `Revoke a Guest. Its keys stop working and its sessions end now.
+
+Without --gpu this revokes every identity of the Guest (one per GPU it
+paired with); with --gpu, only that GPU's.`,
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name, err := scopedIdentityName(args[0], selector)
-			if err != nil {
-				return err
-			}
 			l, err := layout()
 			if err != nil {
 				return err
@@ -399,16 +411,28 @@ func revokeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			out := cmd.OutOrStdout()
-			id, err := revokeIdentity(out, ids, name)
+			targets, err := guestIdentities(ids, args[0], selector)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(out, "revoked %q\n", name)
-			if id.GuestUnpaired == nil {
+			out := cmd.OutOrStdout()
+			tellGuest := false
+			for _, t := range targets {
+				if t.Revoked {
+					fmt.Fprintf(out, "%q was already revoked\n", t.Name)
+					continue
+				}
+				id, err := revokeIdentity(out, ids, t.Name)
+				if err != nil {
+					return err
+				}
+				fmt.Fprintf(out, "revoked %q\n", t.Name)
+				tellGuest = tellGuest || id.GuestUnpaired == nil
+			}
+			if tellGuest {
 				fmt.Fprintln(out, "On the Guest machine, run `reflop status` and `reflop unpair <name>` to forget this pairing.")
 			}
-			fmt.Fprintf(out, "To delete it and its data and free the name: reflopd users delete %s\n", name)
+			fmt.Fprintf(out, "To delete it and its data and free the name: reflopd users delete %s\n", withGPU(args[0], selector))
 			return nil
 		},
 	}
@@ -472,14 +496,13 @@ Its keys stop working, its sessions end, its datasets and snapshots are
 deleted, and its name can be invited again. The audit log keeps its history.
 
 The Guest forgets this pairing with ` + "`reflop unpair <name>`" + `. Either side may go
-first; after both, a new invite pairs them as if for the first time.`,
+first; after both, a new invite pairs them as if for the first time.
+
+Without --gpu this unpairs every identity of the Guest (one per GPU it
+paired with); with --gpu, only that GPU's. The question lists them.`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out := cmd.OutOrStdout()
-			name, err := scopedIdentityName(args[0], selector)
-			if err != nil {
-				return err
-			}
 			l, err := layout()
 			if err != nil {
 				return err
@@ -488,37 +511,42 @@ first; after both, a new invite pairs them as if for the first time.`,
 			if err != nil {
 				return err
 			}
-			id, ok := ids.Get(name)
-			if !ok {
-				return exitWith(ExitUsage, fmt.Errorf("no identity named %q", name))
+			targets, err := guestIdentities(ids, args[0], selector)
+			if err != nil {
+				return err
 			}
+			names := identityNames(targets)
 			if !yes {
 				if !isTerminal(os.Stdin) {
-					return exitWith(ExitUsage, fmt.Errorf("unpairing %q deletes its datasets and snapshots; pass --yes to confirm", name))
+					return exitWith(ExitUsage, fmt.Errorf("unpairing %s deletes its datasets and snapshots; pass --yes to confirm", names))
 				}
-				fmt.Fprintf(out, "Unpair %q? Its keys stop working and its datasets and snapshots are deleted. [y/N] ", name)
+				fmt.Fprintf(out, "Unpair %s? Its keys stop working and its datasets and snapshots are deleted. [y/N] ", names)
 				ans, _ := bufio.NewReader(os.Stdin).ReadString('\n')
 				if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(ans)), "y") {
 					fmt.Fprintln(out, "not changed")
 					return nil
 				}
 			}
-			if !id.Revoked {
-				if _, err := revokeIdentity(out, ids, name); err != nil {
+			for _, id := range targets {
+				name := id.Name
+				if !id.Revoked {
+					if _, err := revokeIdentity(out, ids, name); err != nil {
+						return err
+					}
+					fmt.Fprintf(out, "revoked %q\n", name)
+					var ok bool
+					if id, ok = ids.Get(name); !ok {
+						return fmt.Errorf("identity %q disappeared while unpairing", name)
+					}
+				}
+				if err := deleteIdentity(out, l, ids, id); err != nil {
 					return err
 				}
-				fmt.Fprintf(out, "revoked %q\n", name)
-				if id, ok = ids.Get(name); !ok {
-					return fmt.Errorf("identity %q disappeared while unpairing", name)
+				if id.GuestUnpaired != nil {
+					fmt.Fprintf(out, "unpaired %q; the Guest had already run `reflop unpair`, so a new invite pairs them again\n", name)
+				} else {
+					fmt.Fprintf(out, "unpaired %q. On the Guest machine, run `reflop status` and `reflop unpair <name>`; then pair with a new invite\n", name)
 				}
-			}
-			if err := deleteIdentity(out, l, ids, id); err != nil {
-				return err
-			}
-			if id.GuestUnpaired != nil {
-				fmt.Fprintf(out, "unpaired %q; the Guest had already run `reflop unpair`, so a new invite pairs them again\n", name)
-			} else {
-				fmt.Fprintf(out, "unpaired %q. On the Guest machine, run `reflop status` and `reflop unpair <name>`; then pair with a new invite\n", name)
 			}
 			return nil
 		},
@@ -903,7 +931,7 @@ func resumeCmd() *cobra.Command {
 }
 
 func killCmd() *cobra.Command {
-	return &cobra.Command{Use: "kill <identity|session-id>", Short: "Kill an identity's sessions or one session",
+	return &cobra.Command{Use: "kill <name|session-id>", Short: "Kill a Guest's sessions (on every GPU) or one session",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var r map[string]int

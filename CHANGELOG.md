@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- `reflopd revoke`, `unpair`, `users delete`, `kill` and `usage` take a
+  Guest's name as `reflopd users` shows it (ADR-062). Since 0.2.10 a Guest
+  paired with a GPU has an identity per GPU, named `alice@gpu-…`, and these
+  commands answered `no identity named "alice"` unless you passed `--gpu`.
+  Without `--gpu` they now act on every identity of the Guest: `reflopd revoke
+  alice` revokes alice on every GPU, including an identity from before
+  0.2.10, which was the only one revoked before. `unpair` lists what it will
+  delete before asking. `users delete` deletes nothing while any of them is
+  still active. `--gpu` still narrows a command to one GPU.
+
 ## 0.4.1 (2026-11-27)
 
 Faster executes on the server. Update the daemon. The client has no
