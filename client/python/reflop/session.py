@@ -165,6 +165,7 @@ class Session:
         self.pending_free: list[bytes] = []
         self._sending_frees = False
         self.upload_log: list | None = None  # set by reflop.capture while it records a step
+        self.capture_split = ""  # "long" when a recorded step outgrew one graph (maybe_flush)
         self.async_error: BaseException | None = None
         self.async_what = ""  # the request kind async_error came from (see _ASYNC_WHAT)
         self.inflight: list = []
@@ -376,7 +377,17 @@ class Session:
 
     def maybe_flush(self) -> None:
         """Flush a long trace between ops. The caller holds the lock."""
-        if self.depth == 0 and len(self.trace) >= FLUSH_NODES:
+        if self.depth != 0:
+            return
+        if self.upload_log is None:
+            if len(self.trace) >= FLUSH_NODES:
+                self.flush()
+            return
+        # reflop.capture is recording a step: it can replay only a step that
+        # is one graph, so hold the trace up to the server's graph limit.
+        limit = max(FLUSH_NODES, int(self.limits.max_nodes or 0))
+        if len(self.trace) >= limit:
+            self.capture_split = "long"
             self.flush()
 
     def flush(self, returns: list[Value] | None = None, plan: dict | None = None) -> list[torch.Tensor]:
@@ -397,9 +408,27 @@ class Session:
                 v = st.value
                 if v is None or v.kind == HANDLE:
                     continue
-                if v.kind == CPU:
+                if v.kind == CPU and plan is not None:
+                    # reflop.capture builds its plan from this flush. An upload
+                    # here is not part of the graph, so replays would leave b
+                    # as the recorded call wrote it: copy b's CPU value in the
+                    # graph instead, which a replay binds from the new argument.
+                    pv = v
+                    if v.payload.shape != st.meta.shape or v.payload.dtype != st.meta.dtype:
+                        pv = self.cpu_value(v.payload.expand(st.meta.shape).to(st.meta.dtype))
+                    st.set(self.record_simple("aten.clone.default", torch.ops.aten.clone.default, [pv, None],
+                                              pv.meta)[0])
+                    v = st.value
+                elif v.kind == CPU:
+                    # b.copy_(cpu_tensor): the upload gets a new handle. Free
+                    # b's old one (after this flush's execute, which may still
+                    # read it); dropping it leaked one server tensor per copy.
+                    old = st.handle
                     st.set(self.upload_value(v.payload.expand(st.meta.shape).to(st.meta.dtype).contiguous()))
                     st.handle = st.value.handle
+                    if old is not None:
+                        self.storages.pop(old, None)  # else reflop.recover finds it and marks b lost
+                        self.pending_free.append(old)
                     continue
                 if v.kind != NODE:
                     continue

@@ -18,6 +18,11 @@ Execute that binds the new arguments. Requirements (checked, not assumed):
 - values that change every step must live in tensors, not Python numbers:
   use `capturable=True` (or `fused=True`) optimizers and tensor learning
   rates; a step whose Python scalars drift is refused with an explanation;
+- the step reads no tensor value on the host (`.item()`, `.cpu()`,
+  `if t:`): its Python would depend on what it reads, and a step that does
+  so on two calls in a row is refused (CaptureError);
+- the step fits in one graph (the server's max_nodes, 1,000,000 by
+  default); a longer step stays eager;
 - the returned tensors are the same objects every call (their contents
   change), as with CUDA graphs;
 - CPU work inside the step is not replayed: a CPU argument modified in place
@@ -90,7 +95,15 @@ _WHY = {
              "as an argument",
     "changed": "the step uploads a CPU tensor and then modifies it",
     "handle": "the step's inputs on the server differ between calls",
+    "long": "the step records more operations than the server accepts in one graph (its max_nodes limit), so it "
+            "runs as several graphs; split it into smaller steps, each with its own reflop.capture",
 }
+
+_SYNC = ("reflop.capture: the step reads a tensor's value on the host partway through (.item(), .tolist(), "
+         ".cpu(), float(t), print(t), `if t:`, or an op that runs on the client) and its Python depends on what it "
+         "reads, so its work is split into several graphs. Replaying would skip that Python and the work before "
+         "the read. Return the tensor and read it after the step, use capturable=True optimizers (non-capturable "
+         "ASGD, and LBFGS, read values every step), or call the step without reflop.capture.")
 
 
 def _sig(args):
@@ -151,13 +164,26 @@ class Captured:
         cpu_args = [i for i, (k, _) in enumerate(arg_h) if k == "cpu"]
         before = {i: _state(ts[i]) for i in cpu_args}
         logs = {}
+        epochs = {}
         for c in cands:
             c.upload_log = []
+            c.capture_split = ""
+            epochs[id(c)] = c.epoch
         try:
             out = self.fn(*args)
         finally:
             for c in cands:
                 logs[id(c)], c.upload_log = c.upload_log, None
+        split = [c for c in cands if c.epoch != epochs[id(c)]]
+        if split:
+            # A session flushed inside the step: a host read, or a trace past
+            # the server's graph limit. The final flush below would hold only
+            # the work after it, and replaying that alone skips the rest.
+            why = "long" if all(c.capture_split for c in split) else "sync"
+            for c in cands:
+                c.capture_split = ""
+                c.flush()
+            return out, {"split": why}
         used = [c for c in cands if len(c.trace) or c.dirty or logs[id(c)]]
         if len(used) != 1:
             # Nothing recorded, or work in several sessions: stays eager.
@@ -229,6 +255,9 @@ class Captured:
     def _differs(a, b) -> str | None:
         """None if two recorded calls can be replayed as one plan, else a
         key of _WHY saying why not."""
+        for p in (b, a):
+            if p is not None and "split" in p:
+                return p["split"]
         if a is None or b is None or a["sess"] is not b["sess"]:
             return "nothing"
         if a["hash"] != b["hash"] or len(a["sources"]) != len(b["sources"]):
@@ -263,9 +292,16 @@ class Captured:
             # graph expects their shapes). Capture again from scratch.
             self.plan = self.out = None
         out, plan = self._record(args)
+        if (sig == self.sig and plan is not None and plan.get("split") == "sync"
+                and self.prev is not None and self.prev.get("split") == "sync"):
+            # Two calls in a row read on the host (not a warm-up's one-off),
+            # like the scalar drift below: refused, not run eagerly unnoticed.
+            self.prev = None
+            raise CaptureError(_SYNC)
         if sig == self.sig and self._same(self.prev, plan):
             self.plan, self.out = plan, out
-        elif self.prev is not None and sig == self.sig and plan is not None and self.prev["hash"] == plan["hash"]:
+        elif (self.prev is not None and sig == self.sig and plan is not None and "hash" in self.prev
+              and "hash" in plan and self.prev["hash"] == plan["hash"]):
             drift = [i for i, (x, y) in enumerate(zip(self.prev["sources"], plan["sources"]))
                      if x[0] == "scalar" and x[1] != y[1]]
             if drift:

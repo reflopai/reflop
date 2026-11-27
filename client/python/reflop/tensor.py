@@ -641,6 +641,13 @@ def write(t: RemoteTensor, new_val: Value, new_meta: torch.Tensor | None = None)
             new_val = sess.record_simple("aten.expand.default", aten.expand.default,
                                          [new_val, list(tm.shape), False], tm)[0]
     if not t._rf_chain:
+        if new_val.kind == HANDLE and new_val.handle != st.handle:
+            # Another tensor's server handle (b.copy_(a) after a flush). Taking
+            # it as this tensor's value would alias the two: the handle is
+            # freed with `a` while `b` still reads it (GH#61), and rebinding
+            # it after a.add_(1) changes `b` too. Copy it on the server.
+            new_val = sess.record_simple("aten.clone.default", aten.clone.default, [new_val, None],
+                                         new_val.meta if new_val.meta is not None else tm)[0]
         st.set(new_val)
         return
     # Values and metas of every intermediate base along the chain.

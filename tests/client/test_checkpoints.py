@@ -288,3 +288,20 @@ def test_reopening_local_cuda_preserves_saved_values(owner_interval, devname, ch
         reflop.close()
         del sess, tensor, restored
         gc.collect()
+
+
+def test_recover_keeps_a_tensor_overwritten_from_the_cpu(owner_interval):
+    """Regression (GH#61): b.copy_(cpu) moved b to a new handle and kept the
+    old one in sess.storages, unfreed. recover() then found the old handle,
+    saw it was not b's, and marked b lost."""
+    owner_interval(1)
+    dev = reflop.device(local="cpu", checkpoint=True)
+    sess = S.current()
+    b = torch.zeros(4).to(dev)
+    reflop.synchronize()
+    b.copy_(torch.full((4,), 7.0))
+    reflop.synchronize()
+    take_checkpoint(sess)
+    sess.conn.kill_worker()
+    reflop.recover()
+    assert b.cpu().tolist() == [7.0] * 4

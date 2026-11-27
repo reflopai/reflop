@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- `b.copy_(a)` between two reFLOP tensors copies `a`. Once `a` had been
+  sent to the server, `b` was made to point at `a`'s server tensor instead:
+  changing `a` afterwards (`a.add_(1)`) changed `b` too, and when `a` was
+  freed, the next read of `b` failed with `UNKNOWN_HANDLE`. `torch.optim.LBFGS`
+  failed that way on its second step (GH#61); it now matches native PyTorch.
+- `b.copy_(cpu_tensor)` into a reFLOP tensor frees the server tensor it
+  replaces. Each such copy kept one server tensor until the session closed
+  (non-capturable ASGD did this every step), and `reflop.recover()` could
+  then mark `b` as lost.
+- `reflop.capture` no longer skips part of a step. When a step read a value
+  on your machine partway through (`.item()`, `.cpu()`, `if t:`), or recorded
+  more than 20,000 operations, replays ran only the work after that point and
+  silently dropped the rest. A step that reads a value on two calls in a row
+  now raises `reflop.CaptureError` with the reason, as drifting Python scalars
+  do; non-capturable `ASGD` and `LBFGS` steps are refused this way (GH#62).
+  While capture records a step, it keeps the step in one graph up to the
+  server's `max_nodes` (1,000,000 by default), so long steps replay whole. A
+  step longer than that runs eagerly, with a warning.
+- Under `reflop.capture`, `buf.copy_(x)` from a CPU argument `x` updates
+  `buf` on every replay. Replays used to leave `buf` as the second call wrote
+  it, though values computed from it inside the step were right.
+
 ## 0.3.2 (2026-11-26)
 
 Fixes for the worker and the Python client, and session numerics the

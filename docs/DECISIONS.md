@@ -2071,3 +2071,66 @@ server-CPU reference on another architecture still differs. A reFLOP CUDA
 run of a model with BatchNorm differs from native PyTorch's default by the
 BatchNorm kernel; for well-conditioned training that is within rounding,
 and the Guest guide says so.
+
+## ADR-060: Copies own their server tensor; a captured step is one graph
+
+**Context.** The client models an in-place write by giving the written
+tensor's `Storage` a new value. `b.copy_(a)`, with `a` already on the server,
+gave `b` the value `Value(HANDLE, a's handle)`. `b` then had no server
+tensor of its own: rebinding `a`'s handle after `a.add_(1)` changed what `b`
+read, and when `a` was freed its handle went with it, so reading `b` failed
+with `UNKNOWN_HANDLE` (GH#61; LBFGS does `prev_flat_grad.copy_(flat_grad)`
+and then drops `flat_grad`). `b.copy_(cpu_tensor)` gave `b` a CPU value that
+the next flush uploads into a new handle. The flush replaced `b`'s handle
+without freeing the old one and left it in `sess.storages`, so every copy
+kept one server tensor, and `reflop.recover()` found the old handle, saw it
+was not `b`'s, and marked `b` lost.
+
+`reflop.capture` builds its plan from the session's final flush of a
+recorded step. A flush inside the step (any host read, or the automatic
+flush at `REFLOP_FLUSH_NODES`, 20,000 nodes) sent the work before it as a
+separate execute, so the plan held only the rest. Replays ran that rest and
+silently skipped the step's earlier work and its Python. Non-capturable
+ASGD reads `eta`, `mu` and `step` on the host, so its last segment was
+empty: it never replayed, and the warning said the step did no work
+(GH#62).
+
+**Decision.**
+
+- `write()` records `aten.clone` when the new value is another tensor's
+  handle, so the destination gets a server tensor of its own at the next
+  flush. A flush that uploads a CPU value into a tensor that already has a
+  handle frees the old handle after that flush's execute, which may still
+  read it, and drops it from `sess.storages`.
+- `Captured._record` notes every candidate session's flush counter
+  (`epoch`) before the step and compares after. If a session flushed, the
+  call yields no plan. When two calls in a row with the same signature
+  read on the host, `reflop.capture` raises `CaptureError`, as it does for
+  drifting Python scalars. A single read, as in a warm-up call, is not
+  refused.
+- When the flush builds a capture plan, a CPU value written into a tensor
+  becomes an `aten.clone` node of the graph instead of a separate upload, so
+  a replay rebinds the tensor from the new argument. Before, the upload ran
+  only in the recorded calls and replays left the tensor as they wrote it.
+- While capture records a step (`upload_log` set), `maybe_flush` holds the
+  trace until it reaches the server's `max_nodes` instead of
+  `REFLOP_FLUSH_NODES`. A step that still splits there runs eagerly and
+  warns once, with the reason.
+
+**Alternatives.** Keeping the source `Storage` alive from the destination:
+fixes the free, but not the shared contents after a later write to either
+tensor. Uploading a CPU copy into the tensor's existing handle: the worker
+refuses an upload to a live handle, and a graph in the same flush may still
+read the old contents. Replaying a split step as several executes: Python
+between the segments depends on the values it read, and a replay does not
+run it. Warning and running eagerly on a host read: results stay correct,
+but a capture that never replays is easy to miss, and it would differ from
+the scalar drift case, which already raises.
+
+**Consequences.** `copy_` between two flushed tensors costs one server
+copy, as it does in native PyTorch. A step that reads a value inside
+`reflop.capture` on every call, including one that reads only at the end
+(`return loss.item()`), now raises after its second call, where it used to
+run eagerly; return the tensor and read it after the call. Steps up to
+`max_nodes` operations are kept in client memory while capture records.
+

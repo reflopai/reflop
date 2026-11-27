@@ -325,6 +325,14 @@ your Python function is not run. Rules (checked, not assumed):
   `capturable=True` (or `fused=True`). A Python learning-rate schedule has the
   same problem: use a tensor learning rate. When this rule is broken,
   `reflop.CaptureError` explains it instead of silently freezing the value.
+- The step must not read a tensor's value on your machine: no `.item()`,
+  `.cpu()`, `print(t)` or `if t:` inside it. Your Python would depend on the
+  value, and a replay does not run your Python. Return the tensor and read it
+  after the call (as `loss.item()` above). A step that reads on two calls in a
+  row raises `reflop.CaptureError`. Optimizers that read values every step,
+  such as `LBFGS` and `ASGD` without `capturable=True`, cannot be captured.
+- A step can have up to the server's `max_nodes` operations (1,000,000 by
+  default). A longer one runs eagerly and warns.
 - The returned tensors are the same objects every call, with new contents (like
   CUDA graphs). Clone them if you need to keep a value.
 - CPU tensor arguments may be moved inside the step (`x.to(dev)`, as above) or
