@@ -534,7 +534,7 @@ dev = reflop.device(checkpoint=True)                    # the Owner's interval
 dev = reflop.device(checkpoint=True, checkpoint_interval=1800)   # or longer, in seconds
 ```
 
-The interval defaults to the Owner's. reflopd newer than 0.3.2 keeps
+The interval defaults to the Owner's. reflopd 0.4.0 or newer keeps
 checkpoints in its RAM between disk writes: the interval is then 1 minute
 unless the Owner set another, never under 30 seconds, and the newest one
 reaches the Owner's disk every 10 minutes by default, when your worker ends,

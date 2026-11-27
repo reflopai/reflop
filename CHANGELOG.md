@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-11-27)
+
+Checkpoints kept in RAM between disk writes, checkpoints for sessions whose
+state fills the GPU, CPU sessions that survive `pause --now`, and fixes for
+`copy_` and `reflop.capture` that gave wrong results without an error.
+Update both: the daemon for the checkpoint and pause changes, the client for
+the `copy_` and capture fixes. Each works with the other's 0.3.x. One
+behavior change: a `reflop.capture` step that reads a tensor's value inside
+the step on two calls in a row now raises `reflop.CaptureError` instead of
+replaying only part of the step.
 
 - Checkpoints are kept in RAM between disk writes (issue #2, ADR-061). With
   `reflopd checkpoints on`, a session's newest checkpoint is now taken every
