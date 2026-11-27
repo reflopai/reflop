@@ -224,6 +224,20 @@ def test_the_executor_refuses_a_resized_copy_too():
     assert env["r"] is orig
 
 
+def test_adopt_repoints_every_slot_that_held_the_original():
+    # The executor keeps values in a list of slots; a tensor can sit in
+    # several (an input and a view of it, say). All of them must read the copy.
+    class Node:
+        index, op = 0, OPS[51]
+
+    orig, other, c = torch.zeros(2), torch.ones(2), torch.zeros(2)
+    env = [orig, None, other, orig]
+    moved: dict = {}
+    writes.adopt(Node, [(orig, c)], env, moved, cpb.STAGE_E3_EXECUTE)
+    assert env[0] is c and env[3] is c and env[2] is other and env[1] is None
+    assert moved == {id(c): [orig, c]}
+
+
 def test_the_copies_count_toward_peak_memory(sess, monkeypatch):
     # [4096] statistics: their two copies are 2 x 16 KiB.
     from reflop_worker import cost
