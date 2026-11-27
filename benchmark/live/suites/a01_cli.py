@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a01 CLI and install: version, status, usage, verify, doctor (OpenMP), key, servers, init, update --check,
 REFLOP_DEBUG connection log, error messages for a wrong server name."""
 
@@ -11,7 +12,7 @@ import time
 from pathlib import Path
 
 from live import owner
-from live.harness import SCRATCH, Skip, Suite, check, cli, env_for, env_info, server_name, strip_ansi, tail
+from live.harness import SCRATCH, Suite, check, cli, env_for, env_info, server_name, strip_ansi, tail
 
 
 def version():
@@ -60,9 +61,8 @@ def usage_cli_and_api():
 
 
 def usage_grows_with_work():
-    import torch
-
     import reflop
+    import torch
 
     before = reflop.usage()
     dev = reflop.device()
@@ -78,7 +78,7 @@ def usage_grows_with_work():
     check(d_ex >= 1, f"executes did not grow ({d_ex})")
     check(d_fl >= 10 * 2 * 2048 ** 3 * 0.9, f"FLOPs grew by {d_fl:.3g}, expected >= {10 * 2 * 2048 ** 3:.3g}")
     if owner.available():
-        o = owner.usage_json("guest")["identities"]["guest"]
+        o = owner.guest_usage()
         check(abs(o["executes"] - after["executes"]) <= 50, f"Owner sees {o['executes']} executes, Guest {after['executes']}")
     return f"+{d_ex} executes, +{d_fl / 1e12:.3f} TFLOP, device +{after['device_seconds'] - before['device_seconds']:.3f} s"
 

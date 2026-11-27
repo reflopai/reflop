@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a10 C and C++ API (libreflop): key file, build, `make test` (per-thread last_error, no server), `make check`
 (examples), the clib/README nested C++ builder pattern (old N1), matmul C on GPU and server CPU, edge cases (fetch
 size query / ERANGE / NULL nbytes / nbytes mismatch / open node / unknown op), macOS install name + relocation,
@@ -26,7 +27,8 @@ def sh(cmd, cwd=None, timeout=900, env=None):
 def key_file():
     r = cli("key", "--write-file")
     check(r.returncode == 0, r.stderr)
-    p = Path.home() / ".config" / "reflop" / "id_ed25519"
+    home = os.environ.get("REFLOP_CLIENT_HOME")
+    p = (Path(home).expanduser() if home else Path.home() / ".config" / "reflop") / "id_ed25519"
     check(p.exists(), f"{p} missing after --write-file")
     mode = oct(p.stat().st_mode & 0o777)
     check(mode == "0o600", f"key file mode {mode}")

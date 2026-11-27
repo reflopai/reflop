@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a07 datasets: build from a dict / pairs / dicts / tensors / many dtypes, push, ls, ds.batch values, loader
 (shuffle seed determinism, epochs, drop_last, coverage), 8 B/sample per step, eager and captured training, server-side
 augmentation, server-CPU session, interrupted push resumes, re-push, corrupted shard refused, rm; push throughput."""
@@ -16,8 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from live import workloads as wl
-from live.harness import (PREFIX, PY, REFLOP_EXE, ROOT, SCRATCH, Suite, check, cli, env_for, q, stats, stats_delta,
-                         tail)
+from live.harness import PREFIX, REFLOP_EXE, ROOT, SCRATCH, Suite, check, cli, env_for, q, stats, stats_delta, tail
 from live.helpers import packs
 
 PACKS = SCRATCH / "packs"
@@ -87,7 +87,7 @@ def build_iterables():
     import reflop
 
     res = []
-    for fn, check_fn in (
+    for fn, _check_fn in (
         ("pairs_iter", lambda ds, src: None),
         ("dicts_iter", lambda ds, src: None),
         ("tensors_iter", lambda ds, src: None),
@@ -176,12 +176,12 @@ def train_eager_and_captured(s):
         mean = torch.tensor([125.0, 123.0, 114.0], device=d).view(1, 3, 1, 1)
 
         def step(batch):
-            x = (batch["images"].float() - mean) / 64
+            x = (batch["images"].float() - mean) / 64  # noqa: B023 - step is used in this iteration only
             x = torch.where(torch.rand(x.shape[0], 1, 1, 1, device=d) < 0.5, x, x.flip(3))   # augmentation on the server
-            opt.zero_grad(set_to_none=True)
-            loss = F.cross_entropy(m(x), batch["labels"])
+            opt.zero_grad(set_to_none=True)  # noqa: B023
+            loss = F.cross_entropy(m(x), batch["labels"])  # noqa: B023
             loss.backward()
-            opt.step()
+            opt.step()  # noqa: B023
             return loss
 
         f = reflop.capture(step) if mode == "capture" else step

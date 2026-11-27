@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a11 Owner controls (over SSH, guarded): say (+ control-sequence stripping), status/top/usage/audit agree with the
 Guest, pause/resume (work waits, nothing lost), pause --now suspends a GPU worker (2 GiB state survives, bit-identical
 losses, latency), pause --now freezes a server-CPU session and resume thaws it (0.4.0; identical losses), bounded pause queue (0.2.2:
@@ -10,7 +11,7 @@ import re
 import time
 
 from live import owner
-from live.harness import SCRATCH, LineReader, Suite, check, env_for, popen_helper, q, strip_ansi
+from live.harness import SCRATCH, LineReader, Suite, check, popen_helper
 
 REF: dict = {}
 
@@ -72,17 +73,18 @@ def status_top_usage_audit():
     st = owner.sessions()
     top = owner.out("top")
     mine = [x for x in st if sid.startswith(x.get("session", "-"))]
-    check(mine and mine[0]["identity"] == "guest", f"session {sid[:8]} not in reflopd status: {st}")
+    check(mine and owner.guest_of(mine[0]["identity"]) == owner.OURS[0], f"session {sid[:8]} not in reflopd status: {st}")
+    ident = mine[0]["identity"]
     check(sid[:8] in top, f"session not in reflopd top:\n{top[-600:]}")
     lr.finish(300)
     import reflop
 
     time.sleep(2)
     g = reflop.usage()
-    o = owner.usage_json("guest")["identities"]["guest"]
+    o = owner.guest_usage(ident)
     check(abs(o["executes"] - g["executes"]) <= 5, f"executes: owner {o['executes']} guest {g['executes']}")
     check(abs(o["flops"] - g["flops"]) <= 0.001 * max(g["flops"], 1), "flops differ")
-    aud = owner.audit("guest", since="10m")
+    aud = owner.audit(ident, since="10m")
     check(sid[:8] in aud and "session_end" in aud, f"audit lacks the session:\n{aud[-800:]}")
     (SCRATCH / "audit_sample.txt").write_text(aud)
     return {"summary": f"session {sid[:8]} in status/top/audit; usage agrees ({g['executes']} executes)",
@@ -98,11 +100,11 @@ def pause_resume():
     sid_of(lr)
     lr.wait_json(lambda j: j.get("step") == 15, 120)
     try:
-        t_p = time.time()
+        _t_p = time.time()
         po = owner.pause()
         time.sleep(10)
     finally:
-        ro = owner.resume()
+        _ro = owner.resume()
     rc = lr.finish(300)
     check(rc == 0, f"child rc {rc}: {lr.stdout_text()[-400:]}")
     gap, at = max_gap(lr)
@@ -118,7 +120,7 @@ def pause_now_suspends_gpu(s):
     owner.wait_quiet()
     ref = reference(state=2048)
     lr = child("--mode", "train", "--steps", 60, "--sleep", 0.05, "--state-mib", 2048)
-    sid = sid_of(lr)
+    _sid = sid_of(lr)
     lr.wait_json(lambda j: j.get("step") == 15, 300)
     try:
         t0 = time.time()
@@ -128,7 +130,7 @@ def pause_now_suspends_gpu(s):
         time.sleep(8)
     finally:
         t0 = time.time()
-        ro = owner.resume()
+        _ro = owner.resume()
         t_resume = time.time() - t0
     rc = lr.finish(600)
     gap, at = max_gap(lr)
@@ -156,7 +158,7 @@ def pause_now_freezes_cpu_session(s):
         t0 = time.time()
         po = owner.pause(now=True)
         t_pause = time.time() - t0
-        st = owner.status_text()
+        _st = owner.status_text()
         time.sleep(6)
     finally:
         t0 = time.time()
@@ -191,7 +193,7 @@ def bounded_pause_queue():
         go.touch()
         sent = lr.wait_json(lambda j: "sent" in j, 300)
         time.sleep(3)
-        st = owner.status_text()
+        _st = owner.status_text()
     finally:
         owner.resume()
     rc = lr.finish(300)
@@ -234,7 +236,7 @@ def kill_session():
     sid = sid_of(lr)
     lr.wait_json(lambda j: j.get("step") == 10, 120)
     t0 = time.time()
-    ko = owner.kill(sid[:8])
+    _ko = owner.kill(sid[:8])
     rc = lr.finish(60)
     dt = time.time() - t0
     lost = [j for j in lr.json() if "lost" in j]

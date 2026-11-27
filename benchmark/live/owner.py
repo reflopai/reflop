@@ -1,4 +1,5 @@
-"""The Owner machine, driven over SSH (reflopd commands, worker kills, native CUDA runs).
+# SPDX-License-Identifier: Apache-2.0
+"""The Owner machine: reflopd commands, worker kills and native CUDA runs.
 
 Guards (agreed with the human):
   * anything that pauses or restarts Guest work first waits until no *other* identity (not `guest`,
@@ -7,7 +8,12 @@ Guards (agreed with the human):
   * every change is undone in a `finally` (resume, yield --off, checkpoints back to the initial
     setting, quota clear, unpair e2e-*); `python -m live.owner cleanup` does all of it idempotently.
 
-Configuration: E2E_OWNER_SSH (default "<owner-host>"), E2E_NO_OWNER=1 to disable.
+Configuration (nothing touches an Owner unless one of these is set):
+  E2E_OWNER_SSH=<host>   drive the Owner over `ssh <host>` (an ~/.ssh/config alias works)
+  E2E_LOCAL=1            the Owner is a throwaway reflopd on this machine, whose home is E2E_OWNER_HOME;
+                         refused for the default home (~/.local/share/reflop), so a live daemon is never touched
+  E2E_GUEST_IDENTITY     the default Guest's identity name on the Owner (default "guest")
+  E2E_NO_OWNER=1         never touch the Owner (Owner suites skip)
 """
 
 from __future__ import annotations
@@ -23,14 +29,49 @@ import time
 
 from live.harness import LOGS, PREFIX, Skip
 
-HOST = os.environ.get("E2E_OWNER_SSH", "<owner-host>")
-OURS = ("guest",)                       # the default Guest's identity on the Owner
+HOST = os.environ.get("E2E_OWNER_SSH", "")
+LOCAL = os.environ.get("E2E_LOCAL") == "1"
+OURS = (os.environ.get("E2E_GUEST_IDENTITY", "guest"),)   # the default Guest's identity on the Owner
 PRE = ('export PATH="$HOME/.local/bin:$PATH" XDG_RUNTIME_DIR="/run/user/$(id -u)"; '
-       'CG="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/reflopd.service"; ')
+       'CG="${E2E_OWNER_CGROUP:-/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/app.slice/'
+       'reflopd.service}"; RH="${REFLOP_HOME:-$HOME/.local/share/reflop}"; ')
 STATE_FILE = LOGS / "owner_initial_state.json"
 LOG = LOGS / "owner_commands.log"
 
 _avail: bool | None = None
+
+
+def guest_of(identity: str) -> str:
+    """The Guest an identity belongs to: alice for alice@gpu-<uuid> (one identity per GPU since reflopd 0.2.10)."""
+    return identity.split("@", 1)[0]
+
+
+def is_ours(identity: str) -> bool:
+    """The default Guest's or a throwaway e2e-* identity, on any GPU."""
+    g = guest_of(identity)
+    return g in OURS or g.startswith(PREFIX + "-")
+
+
+def local_home() -> str:
+    """E2E_LOCAL's Owner home. Refuses the default reflopd home: local mode is for a throwaway daemon only."""
+    home = os.environ.get("E2E_OWNER_HOME", "")
+    default = os.path.realpath(os.path.expanduser("~/.local/share/reflop"))
+    if not home or os.path.realpath(os.path.expanduser(home)) == default:
+        raise RuntimeError("E2E_LOCAL=1 needs E2E_OWNER_HOME set to a throwaway reflopd home (not "
+                           "~/.local/share/reflop); see benchmark/README.md")
+    return os.path.realpath(os.path.expanduser(home))
+
+
+def _argv(cmd: str) -> list[str]:
+    if LOCAL:
+        return ["bash", "-c", f"export REFLOP_HOME={shlex.quote(local_home())}; " + PRE + cmd]
+    if not HOST:
+        raise Skip("no Owner configured (set E2E_OWNER_SSH, or E2E_LOCAL=1 with E2E_OWNER_HOME)")
+    return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", HOST, PRE + cmd]
+
+
+def where() -> str:
+    return f"local reflopd ({os.environ.get('E2E_OWNER_HOME')})" if LOCAL else f"ssh {HOST or '(none)'}"
 
 
 def _log(cmd: str, r: subprocess.CompletedProcess | None, dt: float):
@@ -45,9 +86,7 @@ def run(cmd: str, timeout: float = 120, check: bool = False) -> subprocess.Compl
         raise Skip("E2E_NO_OWNER=1")
     t = time.time()
     try:
-        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15",
-                            HOST, PRE + cmd], capture_output=True, text=True, timeout=timeout,
-                           stdin=subprocess.DEVNULL)
+        r = subprocess.run(_argv(cmd), capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         _log(cmd, None, time.time() - t)
         raise
@@ -59,7 +98,7 @@ def run(cmd: str, timeout: float = 120, check: bool = False) -> subprocess.Compl
 
 def available() -> bool:
     global _avail
-    if os.environ.get("E2E_NO_OWNER") == "1":
+    if os.environ.get("E2E_NO_OWNER") == "1" or not (LOCAL or HOST):
         return False
     if _avail is None:
         try:
@@ -71,7 +110,7 @@ def available() -> bool:
 
 def need():
     if not available():
-        raise Skip(f"no Owner access (ssh {HOST})")
+        raise Skip(f"no Owner access ({where()})")
 
 
 def reflopd(*args, timeout=120, check=False) -> subprocess.CompletedProcess:
@@ -111,7 +150,7 @@ def sessions() -> list[dict]:
 
 
 def foreign_sessions() -> list[dict]:
-    return [s for s in sessions() if s.get("identity") not in OURS and not s.get("identity", "").startswith(PREFIX)]
+    return [s for s in sessions() if not is_ours(s.get("identity", ""))]
 
 
 def wait_quiet(max_wait: float = 600, poll: float = 15) -> None:
@@ -129,8 +168,8 @@ def wait_quiet(max_wait: float = 600, poll: float = 15) -> None:
         time.sleep(poll)
 
 
-def our_sessions(identity: str = "guest") -> list[dict]:
-    return [s for s in sessions() if s.get("identity") == identity]
+def our_sessions(identity: str | None = None) -> list[dict]:
+    return [s for s in sessions() if guest_of(s.get("identity", "")) == (identity or OURS[0])]
 
 
 # ----------------------------------------------------------------------------- controls
@@ -163,10 +202,10 @@ def kill(target: str) -> str:
 
 def check_target(target: str):
     """Only our own identities, or a session id prefix that belongs to one of them."""
-    if target in OURS or target.startswith(PREFIX + "-"):
+    if is_ours(target):
         return
     ss = [s for s in sessions() if s.get("session", "").startswith(target[:8])]
-    if not ss or any(s.get("identity") not in OURS and not s.get("identity", "").startswith(PREFIX) for s in ss):
+    if not ss or any(not is_ours(s.get("identity", "")) for s in ss):
         raise RuntimeError(f"refusing to act on {target!r}: not one of our sessions")
 
 
@@ -251,6 +290,15 @@ def usage_json(name: str | None = None) -> dict:
     return json.loads(t)
 
 
+def guest_usage(identity: str | None = None) -> dict:
+    """Usage of one identity: `identity` exactly, else the default Guest's (whichever GPU it is paired with)."""
+    ids = usage_json()["identities"]
+    hits = [v for k, v in ids.items() if (k == identity if identity else guest_of(k) == OURS[0])]
+    if len(hits) != 1:
+        raise RuntimeError(f"{len(hits)} usage entries for {identity or OURS[0]}: {sorted(ids)}")
+    return hits[0]
+
+
 def audit(name: str | None = None, since: str = "1h", limit: int = 500) -> str:
     args = ["audit", "--since", since, "--limit", str(limit)]
     if name:
@@ -261,7 +309,7 @@ def audit(name: str | None = None, since: str = "1h", limit: int = 500) -> str:
 # ----------------------------------------------------------------------------- native runs on the Owner
 
 def runtime_python() -> str:
-    r = run('ls -d "$HOME"/.local/share/reflop/runtime/cu*/python/bin/python3 2>/dev/null | head -1')
+    r = run('ls -d "$RH"/runtime/cu*/python/bin/python3 2>/dev/null | head -1')
     p = r.stdout.strip()
     if not p:
         raise Skip("no CUDA runtime python on the Owner")
@@ -270,8 +318,11 @@ def runtime_python() -> str:
 
 def push(local: str, remote_dir: str = "/tmp/reflop-e2e") -> str:
     run(f"mkdir -p {remote_dir}")
-    r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", local, f"{HOST}:{remote_dir}/"], capture_output=True,
-                       text=True, timeout=120)
+    if LOCAL:
+        r = subprocess.run(["cp", local, remote_dir + "/"], capture_output=True, text=True, timeout=120)
+    else:
+        r = subprocess.run(["scp", "-q", "-o", "BatchMode=yes", local, f"{HOST}:{remote_dir}/"], capture_output=True,
+                           text=True, timeout=120)
     if r.returncode:
         raise RuntimeError(f"scp failed: {r.stderr}")
     return f"{remote_dir}/{os.path.basename(local)}"
@@ -279,7 +330,7 @@ def push(local: str, remote_dir: str = "/tmp/reflop-e2e") -> str:
 
 def popen(cmd: str) -> subprocess.Popen:
     """Start a long Owner command; its stdout/stderr come back through ssh."""
-    return subprocess.Popen(["ssh", "-o", "BatchMode=yes", HOST, PRE + cmd], stdout=subprocess.PIPE,
+    return subprocess.Popen(_argv(cmd), stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, stdin=subprocess.DEVNULL)
 
 

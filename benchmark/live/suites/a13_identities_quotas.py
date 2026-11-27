@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a13 identities and quotas (Owner-guarded; only throwaway e2e-* identities): pair e2e-alice/bob/carol in separate
 client homes (distinct keys, Keychain items); invite single-use, expired invite message, pairing while paired says
 unpair first without using the invite; isolation of datasets and snapshots across identities; concurrent training;
@@ -16,8 +17,20 @@ import textwrap
 import time
 
 from live import owner
-from live.harness import (GUESTS, PREFIX, SCRATCH, LineReader, Skip, Suite, check, cli, env_for, guest_home,
-                         popen_helper, py, tail)
+from live.harness import (
+    GUESTS,
+    PREFIX,
+    SCRATCH,
+    LineReader,
+    Skip,
+    Suite,
+    check,
+    cli,
+    guest_home,
+    popen_helper,
+    py,
+    tail,
+)
 
 A, B, C = f"{PREFIX}-alice", f"{PREFIX}-bob", f"{PREFIX}-carol"
 
@@ -187,7 +200,7 @@ def concurrent_identities():
 # ----------------------------------------------------------------------------- quotas
 
 def q_device_memory():
-    o = owner.quota_set(A, device_memory="1GiB")
+    _o = owner.quota_set(A, device_memory="1GiB")
     r = gpy(A, """
         import torch, reflop
         d = reflop.device()
@@ -330,7 +343,7 @@ def unpair_guest_first():
     u = owner.users()
     line = next((l for l in u.splitlines() if l.startswith(A)), "")
     check("unpaired" in line.lower(), f"owner does not show {A} as unpaired by guest: {line!r}")
-    st = owner.status_text()
+    _st = owner.status_text()
     st2 = cli("--server", "e2e", "status", guest=A)   # plain `status` lists (zero) pairings and exits 0 in 0.4.x
     check(st2.returncode != 0, f"status still works after unpair: {tail(st2.stdout + st2.stderr, 300)}")
     owner.unpair(A)

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Native baseline: runs on the Owner with reflopd's runtime Python (outside any sandbox).
 
     python3 -I native_bench.py --workloads mlp,cnn --batches 8,32,128 --device cuda
@@ -12,7 +13,6 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch  # noqa: E402
-
 import workloads as wl  # noqa: E402
 
 

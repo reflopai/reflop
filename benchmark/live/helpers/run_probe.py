@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Child program for `reflop run` tests. Usage: run_probe.py <mode> [args]"""
 
 import json

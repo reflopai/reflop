@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /* libreflop edge cases (0.1.6 changes) and a latency benchmark. Prints one JSON line per check.
  *   api_edges <device> <bench_iters>
  * Checks: fetch size query (buf=NULL, cap=0), ERANGE on a short buffer (nothing copied), nbytes=NULL rejected,

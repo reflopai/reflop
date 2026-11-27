@@ -1,15 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
 """a02 tensor operators: ~150 forward ops and autograd checks vs the local CPU, on the GPU and the server CPU,
 under strict "remote" placement (no silent fallback); data-dependent shapes, RNG, dtypes, views/in-place."""
 
 from __future__ import annotations
 
-import math
 import warnings
 
 import torch
 import torch.nn.functional as F
 
-from live.harness import Expected, Skip, Suite, check, close_to, q
+from live.harness import Expected, Suite, check, close_to, q
 
 G = torch.Generator().manual_seed(1234)
 
@@ -304,7 +304,7 @@ def generator_object(dev):
         torch.randn(10, generator=g).to(dev)                  # CPU generator on the client is fine
         torch.randn(10, device=dev, generator=g).sum().item()
     except Exception as e:  # noqa: BLE001
-        raise Expected(f"explicit torch.Generator on a reflop tensor is documented as unsupported: {type(e).__name__}: {str(e)[:120]}")
+        raise Expected(f"explicit torch.Generator on a reflop tensor is documented as unsupported: {type(e).__name__}: {str(e)[:120]}") from None
     return "explicit generator accepted"
 
 
@@ -318,7 +318,7 @@ def main():
     for tname, mk in targets:
         dev = mk()
         with reflop.placement("remote"):
-            for name, ins, fn, *tol in [(o[0], o[1], o[2]) for o in ops]:
+            for name, ins, fn, *_tol in [(o[0], o[1], o[2]) for o in ops]:
                 rt, at = op_tol(name)
                 s.case(f"{tname}/op/{name}", run_op, dev, fn, ins, rt, at, name)
             for name, fn, ins in GRAD:

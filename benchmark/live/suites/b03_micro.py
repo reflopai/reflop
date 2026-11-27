@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """b03 micro-benchmarks: round-trip latency (.item() of a tiny op, GPU and server CPU), transfer sweep (upload /
 fetch / round trip 4 B .. 64 MiB, content verified), matmul TFLOP/s sweep fp32/bf16/fp16 (wall and server device
 time from reflop.usage()), client recording cost per op vs graph length, graph cache (same graph vs shape churn),
@@ -73,7 +74,7 @@ def matmul_sweep(s):
             u0 = reflop.usage()
             t = time.perf_counter()
             acc = None
-            for i in range(k):
+            for _ in range(k):
                 y = x @ x
                 acc = y[0, 0] if acc is None else acc + y[0, 0]
             acc.item()
@@ -94,7 +95,7 @@ def recording_cost(s):
     d = reflop.device(0)
     x = torch.ones(64).to(d)
     for n_ops in q((10, 100, 1000, 5000), (10, 100)):
-        for rep in range(2):
+        for _rep in range(2):
             t = time.perf_counter()
             y = x
             for _ in range(n_ops):

@@ -1,10 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
 """a08 saving state: server snapshots (reflop.save/load/snapshots/delete_snapshot, 0.2.0) and local fetch to
 safetensors. Round trips, nested dicts, views, tied weights, replace-by-name, new-process load, server-CPU load,
 bit-exact training resume, argument validation, hostile names, save/load throughput."""
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import os
 import textwrap

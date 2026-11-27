@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a06 sessions, placement and errors: GPU + server-CPU sessions, t.device, moves (also differentiable), mixing
 errors, module.to, close/reopen, threads, seeds; placement auto/remote/local/remote-cpu; when work is sent (flush at
 20k ops, step_boundary, nonzero round trips), stats; async and exit-time errors, OOM (oversized and real fill) as
@@ -12,10 +13,19 @@ import time
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from live.harness import (SCRATCH, Suite, check, close_to, py, q, rss_mib, session_of, stats, stats_delta,
-                         tensor_session_index)
+from live.harness import (
+    SCRATCH,
+    Suite,
+    check,
+    close_to,
+    py,
+    q,
+    rss_mib,
+    stats,
+    stats_delta,
+    tensor_session_index,
+)
 
 
 def gpu():
@@ -373,7 +383,7 @@ def oom_oversized():
         healthy(d)
         return f"OutOfMemoryError (also torch.OutOfMemoryError): {str(e)[:150]}"
     except Exception as e:  # noqa: BLE001
-        raise AssertionError(f"oversized allocation raised {type(e).__name__} instead of OutOfMemoryError: {e}")
+        raise AssertionError(f"oversized allocation raised {type(e).__name__} instead of OutOfMemoryError: {e}") from e
     raise AssertionError("1 TiB allocation succeeded?")
 
 

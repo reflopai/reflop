@@ -1,12 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
 """b01 training throughput matrix on the reflop GPU (and a server-CPU subset): 10 workloads x batch {8,32,128} x
 eager/capture x resident/upload inputs; ms/step, samples/s, bytes up/down and graph registrations per step.
 The native-CUDA counterpart (b02) runs the same workloads.py on the Owner."""
 
 from __future__ import annotations
-
-import time
-
-import torch
 
 from live import workloads as wl
 from live.harness import Suite, q, stats, stats_delta

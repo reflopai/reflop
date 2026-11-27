@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 // Two-layer MLP forward (with GELU) on the reflop server through reflop.hpp; compare with a local reference.
 #include <algorithm>
 #include <cmath>

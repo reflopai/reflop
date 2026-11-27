@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """An ordinary CUDA training script with no reflop in it. Run as `reflop run python cuda_train.py`."""
 
 import json
@@ -20,7 +21,7 @@ g = torch.Generator().manual_seed(1)
 X = torch.randn(512, 3, 16, 16, generator=g)
 Y = (X.mean((1, 2, 3)) > 0).long()
 losses = []
-for epoch in range(3):
+for _epoch in range(3):
     tot = 0.0
     for i in range(0, 512, 64):
         x, y = X[i:i + 64].to(dev), Y[i:i + 64].to(device=dev)

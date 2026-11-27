@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """b02 native baseline on the Owner: the same workloads.py, batches, optimizer and timing as b01, with local CUDA
 (reflopd's own runtime Python, outside the sandbox), plus a matmul TFLOP/s sweep. Retained throughput
 (reflop / native) is computed in the summary. Guarded: waits until no other identity has a session."""

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a12 automatic checkpoints and recovery (0.2.0, Owner-guarded): refused while off; interval rules; tag rules; with
 `reflopd checkpoints on --interval 5m`, three Guests checkpoint in parallel, then lose their worker three ways:
 GPU worker SIGKILL (crash) -> recover(); server-CPU worker SIGKILL -> recover() (pause --now freezes CPU sessions since 0.4.0, see a11); `reflopd kill` (on
@@ -5,8 +6,6 @@ purpose) -> recover refused. After recover: params bit-equal to the checkpoint, 
 raise SessionLostError, 1 GiB ballast intact, training continues. Checkpoint overhead on step time."""
 
 from __future__ import annotations
-
-import time
 
 from live import owner
 from live.harness import LineReader, Skip, Suite, check, popen_helper, q

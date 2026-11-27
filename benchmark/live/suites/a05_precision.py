@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a05 mixed precision: bf16/fp16 autocast policy (matmul/conv low precision, reductions/losses fp32), GradScaler
 (incl. inf-skip), fp16/bf16/fp64 storage training, AMP under capture, vs CPU references."""
 

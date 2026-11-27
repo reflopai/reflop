@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Deterministic data sources for `reflop data build --from live.helpers.packs:<fn>` (no downloads)."""
 
 import torch

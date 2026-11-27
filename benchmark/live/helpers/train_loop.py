@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Child training program for the Owner-control, checkpoint, quota and concurrency suites.
 
 Prints JSON lines (flushed): {"sid"}, {"step","t","loss"}, {"event"}, {"lost"}, {"error"}, ...
@@ -22,11 +23,10 @@ import traceback
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
+import reflop  # noqa: E402
 import torch  # noqa: E402
 import torch.nn as nn  # noqa: E402
 import torch.nn.functional as F  # noqa: E402
-
-import reflop  # noqa: E402
 from reflop._pb import compute_pb2 as cpb  # noqa: E402
 
 

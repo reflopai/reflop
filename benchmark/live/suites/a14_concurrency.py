@@ -1,9 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
 """a14 concurrency: 1/2/4/8 Guest processes training a captured CNN at once (aggregate throughput, per-process
 latency, Jain fairness), and one process filling the GPU while another hits OutOfMemoryError (both sessions survive)."""
 
 from __future__ import annotations
-
-import time
 
 from live.harness import SCRATCH, LineReader, Suite, check, popen_helper, q
 

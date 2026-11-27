@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a04 optimizers and reflop.capture: 12 optimizers eager vs CPU; capture with every optimizer (replay + correct, or
 an explicit CaptureError); capture rules: same output objects, shape/dtype re-capture, nested args, CPU args moved
 inside, mutated args stay eager with a warning, Python scalars refused, tensor LR schedules, branches, RNG,
@@ -5,7 +6,6 @@ accumulation, server CPU, one request per replay."""
 
 from __future__ import annotations
 
-import copy
 import warnings
 
 import torch
@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from live import workloads as wl
-from live.harness import Expected, Suite, check, close_to, q, stats, stats_delta
+from live.harness import Expected, Suite, check, q, stats, stats_delta
 
 OPTS = ["sgd", "momentum", "nesterov", "adam", "adamw", "adam_cap", "adamw_cap", "adamw_fused", "rmsprop", "adagrad",
         "adadelta", "adamax"]
@@ -240,7 +240,7 @@ def tensor_lr_schedule(dev):
     step = reflop.capture(mk(m, lr))
     fref = mk(mref, lr_ref)
     worst = 0
-    for i, (x, y) in enumerate(data(10)):
+    for x, y in data(10):
         a = step(x.to(dev), y.to(dev)).item()
         r = fref(x, y).item()
         worst = max(worst, abs(a - r))

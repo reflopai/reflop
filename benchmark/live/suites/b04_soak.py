@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """b04 soak: captured char-GPT (dropout on) trained from a server dataset for 20 minutes; every 30 s: steps/s, step
 time, loss, client RSS, thread count, replays, bytes per step. Pass if it never stalls > 30 s, loss falls, RSS and
 step time stay flat (last third vs first third within 25% / 100 MiB)."""
@@ -42,7 +43,7 @@ def soak(s):
         return loss
 
     f = reflop.capture(step)
-    samples, last = [], time.time()
+    samples = []
     t0 = time.time()
     n = 0
     s0 = stats(0)

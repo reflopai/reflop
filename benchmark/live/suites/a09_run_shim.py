@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a09 `reflop run`: unmodified CUDA script (fp32 and AMP) trains on reflop; torch.cuda API compatibility map; exit
 status passthrough, signals named and 128+n, args not echoed, PYTHONFAULTHANDLER and OMP_NUM_THREADS defaults (user
 values kept), SIGTERM forwarded, Ctrl-C reaches the program first, REFLOP_DEBUG pid + SIGUSR1 stack dump, bad
@@ -5,14 +6,13 @@ commands."""
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import signal
 import subprocess
 import time
 
-from live.harness import E2E, IS_MAC, PY, REFLOP_EXE, ROOT, Skip, Suite, check, env_for, last_json, tail
+from live.harness import E2E, IS_MAC, PY, REFLOP_EXE, ROOT, Suite, check, env_for, last_json, tail
 
 PROBE = str(E2E / "helpers" / "run_probe.py")
 

@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """a03 model zoo correctness: 10 workloads trained from one init on the local CPU (reference), the server GPU and
 the server CPU; drift judged against a 1e-6 weight-perturbation baseline. Plus training-feature compatibility:
 activation checkpointing, clipping, hooks, accumulation, custom autograd, eval mode, DataLoader workers,
@@ -135,7 +136,7 @@ def eval_mode_dropout_bn(dev):
     mr = copy.deepcopy(m).to(dev)
     x = torch.randn(32, 8)
     m.train(), mr.train()
-    keep = (m(x), mr(x.to(dev)))                # updates running stats (outputs kept alive)
+    _keep = (m(x), mr(x.to(dev)))                # updates running stats (outputs kept alive)
     m.eval(), mr.eval()
     with torch.no_grad():
         a, b = m(x), mr(x.to(dev))
@@ -202,7 +203,7 @@ def torch_compile_boundary(dev):
         cm = torch.compile(m)
         cm(torch.randn(2, 4).to(dev)).sum().item()
     except Exception as e:  # noqa: BLE001
-        raise Expected(f"torch.compile is documented as not working: {type(e).__name__}: {str(e)[:150]}")
+        raise Expected(f"torch.compile is documented as not working: {type(e).__name__}: {str(e)[:150]}") from None
     return "torch.compile worked (documented as unsupported)"
 
 
@@ -223,7 +224,7 @@ def torchscript_boundary(dev):
         sm = torch.jit.script(m).to(dev)
         sm(torch.randn(2, 4).to(dev)).sum().item()
     except Exception as e:  # noqa: BLE001
-        raise Expected(f"TorchScript on reflop: {type(e).__name__}: {str(e)[:150]}")
+        raise Expected(f"TorchScript on reflop: {type(e).__name__}: {str(e)[:150]}") from None
     return "TorchScript module ran on reflop"
 
 

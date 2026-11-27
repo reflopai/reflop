@@ -1,11 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
 """Shared harness for the reFLOP end-to-end suite and benchmarks.
 
 Every suite is a module `live.suites.<name>` with a `main()` that builds a `Suite`, runs cases and
-benchmarks, and calls `finish()`. Results go to results/<RUN_ID>/<suite>.json; logs to
-results/<RUN_ID>/logs/. RUN_ID comes from $E2E_RUN_ID (set by run_full.sh) or defaults to "adhoc".
+benchmarks, and calls `finish()`. Results go to benchmark/results/<RUN_ID>/<suite>.json; logs to
+benchmark/results/<RUN_ID>/logs/. RUN_ID comes from $E2E_RUN_ID (set by run_full.sh) or defaults to "adhoc".
 
 Environment knobs:
   E2E_RUN_ID     results directory name
+  E2E_RESULTS    results root (default benchmark/results)
+  E2E_SRC        reFLOP source tree for the C API suite (default: this checkout; run_full.sh sets it to the
+                 release's source when the installed client is a release)
   E2E_SCRATCH    directory for temporary files (run_full.sh uses a temp dir it deletes afterwards)
   E2E_QUICK=1    tiny matrices and short waits (smoke-testing the harness itself)
   E2E_NO_OWNER=1 never touch the Owner (owner-dependent cases are skipped)
@@ -28,16 +32,17 @@ import time
 import traceback
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent          # project root (testreflop/)
-E2E = ROOT / "e2e"
+ROOT = Path(__file__).resolve().parent.parent          # benchmark/
+REPO = ROOT.parent                                      # the reFLOP checkout
+E2E = ROOT / "live"
 RUN_ID = os.environ.get("E2E_RUN_ID", "adhoc")
-RESULTS = ROOT / "results" / RUN_ID
+RESULTS = Path(os.environ.get("E2E_RESULTS") or ROOT / "results") / RUN_ID
 LOGS = RESULTS / "logs"
 LOGS.mkdir(parents=True, exist_ok=True)
 SCRATCH = Path(os.environ["E2E_SCRATCH"]) if os.environ.get("E2E_SCRATCH") else RESULTS / "scratch"
 SCRATCH.mkdir(parents=True, exist_ok=True)
 GUESTS = ROOT / "guests"
-SRC = ROOT / "vendor" / "reflop"
+SRC = Path(os.environ.get("E2E_SRC") or REPO)
 PY = sys.executable
 REFLOP_EXE = str(Path(PY).parent / "reflop")
 QUICK = os.environ.get("E2E_QUICK") == "1"
@@ -318,7 +323,9 @@ def guest_home(name: str | None) -> Path | None:
 
 
 def env_for(guest: str | None = None, **extra) -> dict:
-    env = {k: v for k, v in os.environ.items() if k not in ("REFLOP_CLIENT_HOME",)}
+    """Environment for a Guest subprocess. The default Guest keeps this process's REFLOP_CLIENT_HOME (a
+    throwaway client home with E2E_LOCAL=1); a named Guest gets its own home under guests/."""
+    env = dict(os.environ)
     h = guest_home(guest)
     if h:
         env["REFLOP_CLIENT_HOME"] = str(h)
@@ -438,9 +445,8 @@ def strip_ansi(s: str) -> str:
 
 
 def env_info() -> dict:
-    import torch
-
     import reflop
+    import torch
 
     info = {"python": sys.version.split()[0], "platform": platform.platform(), "torch": torch.__version__,
             "reflop": reflop.__version__}

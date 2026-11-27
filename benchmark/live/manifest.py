@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """results/<run>/run.json: what was tested (versions, server, settings), which suites ran, exit codes, timings and
 case counts. Machine-readable only; run_full.sh calls it.
 
@@ -35,6 +36,13 @@ def _save(d: dict):
     tmp = FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(d, indent=1))
     tmp.replace(FILE)
+
+
+def owner_label() -> str | None:
+    """How the Owner is reached (an ssh host or a local throwaway home); the report's sanitizer drops it."""
+    from live import owner
+
+    return owner.where() if (owner.LOCAL or owner.HOST) else None
 
 
 def _owner_status() -> str | None:
@@ -88,7 +96,7 @@ def owner_gpu() -> dict | None:
         if pid.strip().isdigit():
             out["processes"].append({"pid": int(pid), "used_memory_mib": float(mem) if mem.strip() else None,
                                      "user": user.strip(), "cmd": args.strip(),
-                                     "reflop_worker": "/.local/share/reflop/runtime/" in args})
+                                     "reflop_worker": bool(re.search(r"/runtime/cu[^/]*/python/", args))})
     out["foreign_gpu_memory_mib"] = sum(p["used_memory_mib"] or 0 for p in out["processes"] if not p["reflop_worker"])
     return out
 
@@ -131,9 +139,8 @@ def network(server: str) -> dict:
 
 
 def init(selected: list[str]):
-    import torch
-
     import reflop
+    import torch
 
     server = server_name()
     st = cli("--server", server, "status", timeout=60)
@@ -149,10 +156,10 @@ def init(selected: list[str]):
         "finished": None,
         "seconds": None,
         "versions": {"reflop_client": reflop.__version__, "reflopd": m.group(1) if m else None,
-                     "vendor_reflop": src or None, "torch": torch.__version__, "python": sys.version.split()[0],
+                     "reflop_src": src or None, "torch": torch.__version__, "python": sys.version.split()[0],
                      "platform": platform.platform()},
         "settings": {"server": server, "quick": QUICK, "no_owner": os.environ.get("E2E_NO_OWNER") == "1",
-                     "owner_ssh": os.environ.get("E2E_OWNER_SSH", "<owner-host>"),
+                     "owner": owner_label(),
                      "soak_minutes": os.environ.get("E2E_SOAK_MINUTES"), "suites_selected": selected},
         "network_start": network(server),
         "network_end": None,

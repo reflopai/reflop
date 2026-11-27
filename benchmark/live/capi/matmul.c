@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 */
 /* Multiply two matrices on the reflop server with libreflop; compare with a C reference.
  * Prints one JSON line. Exit 0 if max abs error <= 1e-4 * max(1, max|ref|). */
 #include <math.h>

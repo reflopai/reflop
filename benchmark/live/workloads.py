@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Workloads shared by the Guest suites and the native baseline on the Owner.
 
 Pure torch (no torchvision, no numpy): this file is copied to the Owner and run with reflopd's own
@@ -12,7 +13,6 @@ import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 # ----------------------------------------------------------------------------- models
 
