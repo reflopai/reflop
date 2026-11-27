@@ -12,6 +12,7 @@ Nothing runs on this machine's GPU, and no code from this machine runs on the se
 from __future__ import annotations
 
 import itertools
+import os
 import statistics
 import sys
 import threading
@@ -181,96 +182,126 @@ def measure(dev, name: str, batch: int, progress: Progress, budget_s: float = 1.
 
 # ----------------------------------------------------------------------------- output
 
+class _Style:
+    """ANSI colors on a terminal, nothing otherwise (NO_COLOR, pipes, tests)."""
+
+    def __init__(self, color: bool):
+        self.color = color
+
+    def _w(self, code: str, text: str) -> str:
+        return f"\033[{code}m{text}\033[0m" if self.color else text
+
+    def bold(self, text: str) -> str:
+        return self._w("1", text)
+
+    def dim(self, text: str) -> str:
+        return self._w("2", text)
+
+    def red(self, text: str) -> str:
+        return self._w("31", text)
+
+    def rated(self, score: float, text: str) -> str:
+        return self._w("32" if score >= GREAT else "33" if score >= OKAY else "31", text)
+
+
+GREAT, OKAY = 70, 30   # score bands: great, okay, slow
+
+
+def _word(score: float) -> str:
+    return "great" if score >= GREAT else "okay" if score >= OKAY else "slow"
+
+
 def _ms(r: dict | None) -> str:
     return "" if not r else f"{r['ms_per_step']:.2f}" if r["ms_per_step"] < 100 else f"{r['ms_per_step']:.0f}"
-
-
-def _sps(r: dict | None, batch: int) -> str:
-    return "" if not r else f"{batch / r['ms_per_step'] * 1000:,.0f}"
 
 
 def _pct(v: float | None) -> str:
     return "—" if v is None else f"{v:.0f}%" if v >= 10 else f"{v:.1f}%"
 
 
-def _table(rows: list[list[str]], right: set[int]) -> list[str]:
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
-    out = []
-    for r in rows:
-        cells = [c.rjust(widths[i]) if i in right else c.ljust(widths[i]) for i, c in enumerate(r)]
-        out.append("  " + "   ".join(cells).rstrip())
-    return out
-
-
 def _when(unix: int) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(unix)) if unix else "earlier"
 
 
-def render_one(res: Result, net: Network, where: str) -> str:
+def _header(title: str, net: Network, where: str, st: _Style) -> list[str]:
+    bw = f"{net.upload_mib_s:.1f} MiB/s" if net.upload_mib_s else "unknown"
+    return [f"{st.bold('reflop test')}: {title}", f"  server   {where}",
+            f"  network  round trip {net.rtt_ms:.1f} ms, upload {bw}", ""]
+
+
+def _mark(score: float | None, st: _Style) -> str:
+    """A colored dot on a terminal; the number itself without color, where a dot would say nothing."""
+    if score is None:
+        return "—"
+    return st.rated(score, "●") if st.color else _pct(score)
+
+
+def render_one(res: Result, net: Network, where: str, color: bool = False) -> str:
+    st = _Style(color)
     w = testzoo.WORKLOADS[res.workload]
-    lines = [f"reflop test: {res.workload} ({w.label}), batch {res.batch}", f"  server   {where}",
-             _network_line(net), ""]
+    lines = _header(f"{res.workload} ({w.label}), batch {res.batch}", net, where, st)
     if res.error:
-        return "\n".join(lines + [f"  failed: {res.error}"]) + "\n"
-    rows = [["", "ms/step", "samples/s", "score"]]
-    if res.native:
-        src = "cached " + _when(res.native["measured_unix"]) if res.native["cached"] else "measured now"
-        rows.append([f"native on the server's device ({src})", _ms(res.native), _sps(res.native, res.batch), "100%"])
-    for mode, label in (("captured", "reflop.capture, data on the server"),
-                        ("upload", "reflop.capture, batch uploaded every step"),
-                        ("eager", "eager, data on the server")):
-        r = getattr(res, mode)
-        rows.append([label, _ms(r), _sps(r, res.batch), _pct(res.score(mode))])
-    lines += _table(rows, {1, 2, 3}) + [""]
-    lines += _summary(res, net)
+        return "\n".join(lines + [f"  {st.red('failed')}: {res.error}"]) + "\n"
+    s = res.score("captured")
+    cap = res.captured["ms_per_step"]
+    if s is None:
+        lines += [f"  No score: {res.native_note or 'no native baseline'}.", ""]
+        for mode, label in (("captured", "reflop.capture"), ("upload", "uploading each batch"),
+                            ("eager", "eager, without capture")):
+            lines.append(f"  {_ms(getattr(res, mode)):>8} ms/step  {label}")
+        return "\n".join(lines) + "\n"
+
+    lines += [f"  {st.rated(s, st.bold('● ' + _word(s)))}  {st.bold(_pct(s))} of native speed with reflop.capture", ""]
+    upload, eager = res.upload["ms_per_step"], res.eager["ms_per_step"]
+    for mode, label, tip in (
+            ("upload", "uploading each batch", "keep data on the server" if upload - cap > 0.5 * cap else ""),
+            ("eager", "eager, without capture", "wrap the step in reflop.capture" if eager > 1.5 * cap else "")):
+        m = res.score(mode)
+        row = f"  {st.rated(m, '●')} {_pct(m):>4}  {label:<24}"
+        lines.append((row + st.dim("→ " + tip)) if tip else row.rstrip())
+    src = "measured now" if not res.native["cached"] else f"from {_when(res.native['measured_unix'])}"
+    lines += ["", st.dim(f"  {_ms(res.captured)} ms/step here, {_ms(res.native)} ms/step native ({src})")]
+    if s < 20 and net.rtt_ms < 0.1 * cap:
+        lines.append("  Not the network: this model runs as many small operations, each with a fixed cost on the server.")
+    if net.rtt_ms > 20:
+        lines.append(f"  Slow round trip: every value read back (.item(), print) waits {net.rtt_ms:.0f} ms.")
     return "\n".join(lines) + "\n"
 
 
-def _network_line(net: Network) -> str:
-    bw = f"{net.upload_mib_s:.1f} MiB/s" if net.upload_mib_s else "unknown"
-    return f"  network  round trip {net.rtt_ms:.1f} ms, upload {bw}"
+def render_all(results: list[Result], net: Network, where: str, batch: int, seconds: float,
+               color: bool = False) -> str:
+    st = _Style(color)
+    lines = _header(f"all workloads, batch {batch}", net, where, st)
+    nw = max(len(r.workload) for r in results) + 2
+    lines.append(st.dim(f"  {'':<{nw}}{'capture':<15}{'upload':>6} {'eager':>6}"))
 
+    def key(r: Result):
+        s = r.score("captured")
+        return (bool(r.error), s is None, -(s or 0))
 
-def _summary(res: Result, net: Network) -> list[str]:
-    s = res.score("captured")
-    if s is None:
-        return [f"  No score: {res.native_note or 'no native baseline'}."]
-    out = [f"  Score {_pct(s)}: with reflop.capture and the data kept on the server (a dataset), this model trains",
-           f"  at {_pct(s)} of the speed it has on the server's device itself, over this connection."]
-    if res.upload and res.captured:
-        extra = res.upload["ms_per_step"] - res.captured["ms_per_step"]
-        if extra > 0.5 * res.captured["ms_per_step"]:
-            out.append(f"  Uploading each batch ({res.batch_bytes / 2**10:,.0f} KiB) adds {extra:.1f} ms per step here: keep "
-                       "the data on the server.")
-    if res.eager and res.captured and res.eager["ms_per_step"] > 1.5 * res.captured["ms_per_step"]:
-        out.append(f"  Without reflop.capture a step takes {res.eager['ms_per_step'] / res.captured['ms_per_step']:.1f}x "
-                   "as long.")
-    cap = res.captured["ms_per_step"] if res.captured else 0
-    if s < 20 and cap and net.rtt_ms < 0.1 * cap:
-        out.append(f"  The network is not what makes it slow (round trip {net.rtt_ms:.1f} ms, {cap:.1f} ms per step):")
-        out.append("  reFLOP runs this model as many small operations, each with a fixed cost on the server.")
-        out.append("  RNNs are the slowest kind of model on reFLOP.")
-    if net.rtt_ms > 20:
-        out.append(f"  The {net.rtt_ms:.0f} ms round trip is slow: every value read back (.item(), print) waits for it.")
-    return out
-
-
-def render_all(results: list[Result], net: Network, where: str, batch: int, seconds: float) -> str:
-    lines = [f"reflop test: all workloads, batch {batch}", f"  server   {where}", _network_line(net), ""]
-    rows = [["workload", "native ms", "captured", "+ upload", "eager"]]
-    for r in results:
+    for r in sorted(results, key=key):
+        name = f"  {r.workload:<{nw}}"
         if r.error:
-            rows.append([r.workload, "", f"failed: {r.error[:60]}", "", ""])
+            lines.append(name + st.red(f"failed: {r.error[:60]}"))
             continue
-        rows.append([r.workload, _ms(r.native), _pct(r.score("captured")), _pct(r.score("upload")),
-                     _pct(r.score("eager"))])
-    lines += _table(rows, {1, 2, 3, 4}) + [""]
-    lines += ["  Score = share of native speed on the server's device (100% = as fast as running there).",
-              "  captured: reflop.capture, data on the server. + upload: also uploading each batch.",
-              "  eager: no capture."]
-    notes = sorted({r.native_note for r in results if r.native_note})
-    lines += [f"  No score for some workloads: {n}." for n in notes]
-    lines.append(f"  Done in {seconds:.0f} s.")
+        s = r.score("captured")
+        if s is None:
+            lines.append(name + st.dim(f"— no score, {_ms(r.captured)} ms/step"))
+            continue
+        if color:   # the dots under the middle of "upload" and "eager"; pad the visible text, not the codes
+            rest = f"  {_mark(r.score('upload'), st)}      {_mark(r.score('eager'), st)}"
+        else:
+            rest = f"{_mark(r.score('upload'), st):>6} {_mark(r.score('eager'), st):>6}"
+        lines.append(name + st.rated(s, f"● {_pct(s):>4} {_word(s):<5}") + "   " + rest)
+    lines.append("")
+    foot = ("  " + "  ".join(st.rated(v, "●") + st.dim(t) for v, t in ((GREAT, " ≥70%"), (OKAY, " 30–70%"), (0, " <30%")))
+            + st.dim(" of native speed")) if color else "  % of native speed on the server's device"
+    if any(r.workload in ("lstm", "gru") and (r.score("captured") or 100) < OKAY for r in results):
+        foot += st.dim(" · RNNs are slow on reFLOP")
+    lines.append(foot + st.dim(f" · {seconds:.0f} s"))
+    if net.rtt_ms > 20:
+        lines.append(f"  Slow round trip: every value read back (.item(), print) waits {net.rtt_ms:.0f} ms.")
+    lines += [f"  No score for some workloads: {n}." for n in sorted({r.native_note for r in results if r.native_note})]
     return "\n".join(lines) + "\n"
 
 
@@ -308,9 +339,10 @@ def run(names: list[str], batch: int = testzoo.DEFAULT_BATCH, server: str | None
         except Exception:  # noqa: BLE001 - the name is only shown
             server = None
     where = where_of(dev, server)
+    color = hasattr(out, "isatty") and out.isatty() and not os.environ.get("NO_COLOR")
     if len(names) == 1:
-        out.write(render_one(results[0], net, where))
+        out.write(render_one(results[0], net, where, color))
     else:
-        out.write(render_all(results, net, where, batch, time.monotonic() - t0))
+        out.write(render_all(results, net, where, batch, time.monotonic() - t0, color))
     out.flush()
     return 1 if any(r.error for r in results) else 0

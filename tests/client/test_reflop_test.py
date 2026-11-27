@@ -70,9 +70,10 @@ def test_one_workload_end_to_end(local):
     out, err = io.StringIO(), io.StringIO()
     assert speedtest.run(["mlp"], dev=local, server="local", out=out, err=err) == 0
     text = out.getvalue()
-    for want in ("reflop test: mlp", "round trip", "native on the server's device (measured now)",
-                 "reflop.capture, data on the server", "batch uploaded every step", "eager", "Score "):
+    for want in ("reflop test: mlp", "round trip", "of native speed with reflop.capture", "uploading each batch",
+                 "eager, without capture", "ms/step native (measured now)"):
         assert want in text, (want, text)
+    assert "\033" not in text   # not a terminal: no colors
     # Not a terminal: plain progress lines, no spinner control codes.
     assert "mlp: native baseline" in err.getvalue() and "\r" not in err.getvalue()
 
@@ -133,8 +134,12 @@ def test_all_table():
 
     text = speedtest.render_all([res("mlp", 1.0, 4.0), res("lstm", 1.0, 40.0), res("gpt", 0, 0, "RuntimeError: x")],
                                 speedtest.Network(4.1, 10.2), "srv cuda:0 GPU", 32, 95.0)
-    assert "round trip 4.1 ms, upload 10.2 MiB/s" in text and "Done in 95 s" in text
-    assert "25%" in text and "2.5%" in text and "failed: RuntimeError" in text
+    assert "round trip 4.1 ms, upload 10.2 MiB/s" in text and "· 95 s" in text
+    assert "25% slow" in text and "2.5% slow" in text and "failed: RuntimeError" in text
+    assert text.index("mlp") < text.index("lstm") < text.index("gpt")   # best first, failures last
+    assert "RNNs are slow" in text and "\033" not in text
+    colored = speedtest.render_all([res("mlp", 3.0, 4.0)], speedtest.Network(4.1, 10.2), "srv", 32, 95.0, color=True)
+    assert "\033[32m● " in colored and "75% great" in colored
 
 
 def test_spinner_on_a_terminal():
