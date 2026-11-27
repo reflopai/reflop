@@ -382,8 +382,10 @@ machine. It shows three ways of training:
 - the same, uploading each batch from your machine;
 - eager, without `reflop.capture`.
 
-It also shows the round trip and upload speed it measured, and says what costs
-the most on your connection. With the Guest on the Owner's own machine (a
+Each score is rated great (70% or more), okay (30 to 70%) or slow (under 30%),
+in green, yellow or red on a terminal. It also shows the round trip and upload
+speed it measured, and a short tip where one way of training costs much more
+than another. With the Guest on the Owner's own machine (a
 0.3 ms round trip), a transformer at batch 32 kept 53% with capture and data on
 the server; an LSTM kept 1.6%, slowed down by reFLOP's cost per operation, not
 by the network.
