@@ -8,7 +8,7 @@ raise SessionLostError, 1 GiB ballast intact, training continues. Checkpoint ove
 from __future__ import annotations
 
 from live import owner
-from live.harness import LineReader, Skip, Suite, check, popen_helper, q
+from live.harness import LineReader, Skip, Suite, check, kill_tree, popen_helper, q
 
 INTERVAL_MIN = 5
 
@@ -104,11 +104,20 @@ def three_way_recovery(s):
              (("gpu_crash", a), ("cpu_crash", b), ("owner_kill", c))}
     for k, v in saved.items():
         s.metric("checkpoint_first", case=k, after_s=v["after_s"], at_step=v["at_step"])
-    ko = owner.kill_worker(sids["gpu_crash"])
-    kp = owner.kill_worker(sids["cpu_crash"])
+    # A crash is a kill of the worker's processes, found through the worker's cgroup. A daemon outside a reflopd
+    # scope or unit (a throwaway one in E2E_LOCAL) has none: those paths are skipped, not failed.
+    skipped = {k: "the worker has no cgroup (reflopd is not in a reflopd scope or unit)"
+               for k in ("gpu_crash", "cpu_crash") if not owner.worker_pids(sids[k])}
+    ko = "" if "gpu_crash" in skipped else owner.kill_worker(sids["gpu_crash"])
+    kp = "" if "cpu_crash" in skipped else owner.kill_worker(sids["cpu_crash"])
     kc = owner.kill(sids["owner_kill"][:8])
     res = {}
     for k, lr in (("gpu_crash", a), ("cpu_crash", b), ("owner_kill", c)):
+        if k in skipped:
+            kill_tree(lr.p)
+            lr.finish(60)
+            res[k] = {"skip": skipped[k]}
+            continue
         rc = lr.finish(600)
         js = {}
         for j in lr.json():
@@ -127,6 +136,8 @@ def three_way_recovery(s):
 
 def check_recovered(r, k):
     v = r[k]
+    if "skip" in v:
+        raise Skip(v["skip"])
     check("lost" in v, f"{k}: worker loss not seen as SessionLostError: {v}")
     check("recovered" in v, f"{k}: recover() failed: {v}")
     check(v["params_match"]["params_match"], f"{k}: parameters differ from the checkpoint: {v['params_match']}")

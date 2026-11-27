@@ -71,7 +71,7 @@ E2E_LOCAL=1 E2E_OWNER_HOME=$E/home REFLOP_CLIENT_HOME=$E/client REFLOP_NO_KEYCHA
 ```
 
 Local mode runs this checkout's `bin/reflopd` for Owner commands (`E2E_OWNER_BIN` overrides). A daemon started
-this way is not in a systemd scope, so the cases that kill a worker through its cgroup skip.
+this way is not in a systemd scope, so the a12 cases that crash a worker through its cgroup skip.
 
 ## Suites
 

@@ -49,8 +49,11 @@ case "$client" in
     ;;
 esac
 
+# Line-buffered sed for the plain log: -u in GNU sed (-l there is the line length), -l in BSD/macOS sed.
+if sed --version >/dev/null 2>&1; then SED_UNBUFFERED=-u; else SED_UNBUFFERED=-l; fi
+
 ALL=()
-for f in e2e/suites/[a-z][0-9]*_*.py; do ALL+=("$(basename "$f" .py)"); done
+for f in live/suites/[a-z][0-9]*_*.py; do ALL+=("$(basename "$f" .py)"); done
 sel=()
 if [ $# -eq 0 ]; then sel=("${ALL[@]}"); else
   for want in "$@"; do for s in "${ALL[@]}"; do [[ $s == $want* ]] && sel+=("$s"); done; done
@@ -88,7 +91,7 @@ for s in "${sel[@]}"; do
   echo
   echo "######## $s  ($(date +%H:%M:%S))"
   t=$(date +%s)
-  "$PY" -u -m "live.suites.$s" 2>&1 | tee >(sed -l $'s/\x1b\\[[0-9;]*m//g' > "$OUT/logs/$s.log")
+  "$PY" -u -m "live.suites.$s" 2>&1 | tee >(sed "$SED_UNBUFFERED" $'s/\x1b\\[[0-9;]*m//g' > "$OUT/logs/$s.log")
   rc=${PIPESTATUS[0]}
   echo "######## $s finished: exit $rc in $(( $(date +%s) - t )) s"
   "$PY" -m live.manifest suite "$s" "$rc" "$(( $(date +%s) - t ))"

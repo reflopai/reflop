@@ -12,6 +12,7 @@ Configuration (nothing touches an Owner unless one of these is set):
   E2E_OWNER_SSH=<host>   drive the Owner over `ssh <host>` (an ~/.ssh/config alias works)
   E2E_LOCAL=1            the Owner is a throwaway reflopd on this machine, whose home is E2E_OWNER_HOME;
                          refused for the default home (~/.local/share/reflop), so a live daemon is never touched
+  E2E_OWNER_BIN          with E2E_LOCAL=1, the directory of the reflopd to run (default: this checkout's bin/)
   E2E_GUEST_IDENTITY     the default Guest's identity name on the Owner (default "guest")
   E2E_NO_OWNER=1         never touch the Owner (Owner suites skip)
 """
@@ -27,7 +28,7 @@ import subprocess
 import sys
 import time
 
-from live.harness import LOGS, PREFIX, Skip
+from live.harness import LOGS, PREFIX, REPO, Skip
 
 HOST = os.environ.get("E2E_OWNER_SSH", "")
 LOCAL = os.environ.get("E2E_LOCAL") == "1"
@@ -64,7 +65,10 @@ def local_home() -> str:
 
 def _argv(cmd: str) -> list[str]:
     if LOCAL:
-        return ["bash", "-c", f"export REFLOP_HOME={shlex.quote(local_home())}; " + PRE + cmd]
+        # This checkout's reflopd (make build), not an installed one, when there is one.
+        bindir = os.environ.get("E2E_OWNER_BIN") or str(REPO / "bin")
+        path = f'export PATH={shlex.quote(bindir)}:"$PATH"; ' if os.path.exists(os.path.join(bindir, "reflopd")) else ""
+        return ["bash", "-c", f"export REFLOP_HOME={shlex.quote(local_home())}; " + PRE + path + cmd]
     if not HOST:
         raise Skip("no Owner configured (set E2E_OWNER_SSH, or E2E_LOCAL=1 with E2E_OWNER_HOME)")
     return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "ServerAliveInterval=15", HOST, PRE + cmd]

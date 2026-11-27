@@ -73,7 +73,9 @@ def amp_train(dev, name, dtype, scaler, capture=False):
         ref.append(l.item())
     check(all(v == v and abs(v) < 1e6 for v in losses), f"non-finite: {losses}")
     check(abs(losses[0] - ref[0]) / abs(ref[0]) < 3e-2, f"first loss {losses[0]:.4f} vs fp32 {ref[0]:.4f}")
-    check(losses[-1] < losses[0], f"no progress: {losses[0]:.3f}->{losses[-1]:.3f}")
+    # Over E2E_QUICK's 5 steps a momentum CNN's loss can rise in fp32 too: require progress where fp32 makes it.
+    check(losses[-1] < losses[0] or ref[-1] >= ref[0],
+          f"no progress: {losses[0]:.3f}->{losses[-1]:.3f} (fp32 {ref[0]:.3f}->{ref[-1]:.3f})")
     rep = f", replays {f.replays}" if capture else ""
     scale = f", scale {sc.get_scale():.0f}" if sc else ""
     return f"{losses[0]:.3f}->{losses[-1]:.3f} (fp32 cpu {ref[0]:.3f}->{ref[-1]:.3f}){scale}{rep}"

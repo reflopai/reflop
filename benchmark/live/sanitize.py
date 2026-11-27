@@ -9,12 +9,13 @@
 A run records the Owner's and Guest's host names, addresses, user paths, GPU UUIDs, `reflop status` and
 `reflopd status` output and the command lines of processes on the Owner's GPU. `run` drops the status texts,
 process command lines and network peer details, and in every remaining string replaces IP addresses, home
-directories, GPU UUIDs and the run's own server and host names with placeholders. `check` looks for what
+directories, GPU UUIDs, the run's own server and host names and the user names in its paths with placeholders. `check` looks for what
 `run` removes; it cannot know names a run did not record, so read a document before publishing it.
 """
 
 from __future__ import annotations
 
+import getpass
 import json
 import re
 import sys
@@ -47,6 +48,29 @@ def names_of(run: dict) -> list[str]:
             found.add(n)
             found.add(n.split("@")[-1].split(".")[0])     # user@host.domain -> host
     return sorted((n for n in found if len(n) >= 3 and n.lower() not in GENERIC), key=len, reverse=True)
+
+
+def users_in(texts: list[str]) -> set[str]:
+    """User names from home directories in the run (a temporary directory can carry them outside one), and the
+    user running the sanitizer, who usually ran the suite."""
+    found = {m.group(0).split("/")[2] for t in texts for m in HOMES.finditer(t)}
+    try:
+        found.add(getpass.getuser())
+    except Exception:  # noqa: BLE001 - no user name to add
+        pass
+    return {u for u in found if len(u) >= 3 and u.lower() not in GENERIC}
+
+
+def strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, list):
+        for x in obj:
+            yield from strings(x)
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield k
+            yield from strings(v)
 
 
 def scrub(text: str, names: list[str]) -> str:
@@ -85,15 +109,25 @@ def sanitize_run_json(run: dict) -> dict:
         n = run.get(k)
         if isinstance(n, dict):
             ts = n.get("tailscale") or {}
-            run[k] = {kk: v for kk, v in n.items() if kk.startswith("ping") and isinstance(v, (int, float))}
+            run[k] = {kk: v for kk, v in n.items() if kk.startswith("ping") and isinstance(v, (int, float, dict))
+                      and not isinstance(v, bool)}
+            if isinstance(n.get("interface"), str):
+                run[k]["interface"] = n["interface"]
             if ts.get("path"):
                 run[k]["tailscale_path"] = ts["path"]
     return run
 
 
+def run_names(src: Path) -> list[str]:
+    """Every name to replace in a run: its server and host names and the user names it contains."""
+    run = json.loads((src / "run.json").read_text())
+    texts = [t for f in sorted(src.glob("*.json")) for t in strings(json.loads(f.read_text()))]
+    return sorted(set(names_of(run)) | users_in(texts), key=len, reverse=True)
+
+
 def sanitize_run(src: Path, dst: Path) -> list[str]:
     run = json.loads((src / "run.json").read_text())
-    names = names_of(run)
+    names = run_names(src)
     dst.mkdir(parents=True, exist_ok=True)
     (dst / "run.json").write_text(json.dumps(walk(sanitize_run_json(run), names), separators=(",", ":")) + "\n")
     for f in sorted(src.glob("*.json")):
@@ -125,7 +159,7 @@ def main(argv=None):
         print(f"wrote {a[2]} ({len(names)} names replaced)")
         return 0
     if a[:1] == ["text"] and len(a) == 5 and a[3] == "--run":
-        names = names_of(json.loads((Path(a[4]) / "run.json").read_text()))
+        names = run_names(Path(a[4]))
         Path(a[2]).write_text(scrub(Path(a[1]).read_text(), names))
         return 0
     if a[:1] == ["check"] and len(a) >= 2:

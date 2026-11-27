@@ -37,7 +37,8 @@ def live(tmp_path, monkeypatch):
 
 PRIVATE = {"server": "myowner-box", "ssh": "myowner", "ip4": "100.64.12.34", "lan": "192.168.7.9",
            "ip6": "fd7a:115c:a1e0::12", "uuid": "gpu-0a1b2c3d-1111-2222-3333-444455556666",
-           "mac_home": "/Users/somebody/proj", "linux_home": "/home/someone/.local/share/reflop/runtime/cu1/python"}
+           "mac_home": "/Users/somebody/proj", "linux_home": "/home/someone/.local/share/reflop/runtime/cu1/python",
+           "tmp": "/tmp/build-1000/-home-someone-proj/x"}
 
 
 def fake_run(d: Path):
@@ -49,12 +50,12 @@ def fake_run(d: Path):
            "owner_gpu_start": {"gpus": [{"name": "Card"}], "processes": [
                {"pid": 7, "user": "someone", "cmd": PRIVATE["linux_home"] + "/bin/python3", "used_memory_mib": 9.0,
                 "reflop_worker": True}]},
-           "network_start": {"ping_ms": 3.2, "tailscale": {"peer": "peer-host", "path": "direct",
+           "network_start": {"ping_ms": {"avg": 3.2}, "interface": "en0", "tailscale": {"peer": "peer-host", "path": "direct",
                                                          "addr": PRIVATE["lan"] + ":41641"}},
            "suites": [{"suite": "a01_cli", "exit_code": 0, "seconds": 1.0, "counts": {"pass": 1}}]}
     (d / "run.json").write_text(json.dumps(run))
     detail = (f"paired with {PRIVATE['ssh']} via {PRIVATE['ip6']} on {PRIVATE['uuid']} at 12:34:56; "
-              f"File \"{PRIVATE['mac_home']}/x.py\"; e2e-alice ok; torch 2.15.0")
+              f"File \"{PRIVATE['mac_home']}/x.py\"; key in {PRIVATE['tmp']}; e2e-alice ok; torch 2.15.0")
     (d / "a01_cli.json").write_text(json.dumps({"suite": "a01_cli", "description": "a01", "meta": {},
                                                 "cases": [{"id": "c", "status": "pass", "detail": detail}],
                                                 "metrics": []}))
@@ -72,7 +73,8 @@ def test_sanitize_removes_what_a_run_records(live, tmp_path):
     assert not (tmp_path / "pub" / "logs").exists()
     assert live.sanitize.check([tmp_path / "pub"]) == 0
     # What is not private stays readable.
-    for keep in ("e2e-alice", "12:34:56", "2.15.0", "9.9.9", '"tailscale_path":"direct"', '"ping_ms":3.2'):
+    for keep in ("e2e-alice", "12:34:56", "2.15.0", "9.9.9", '"tailscale_path":"direct"', '"ping_ms":{"avg":3.2}',
+                 '"interface":"en0"'):
         assert keep in text, keep
     assert live.sanitize.check([tmp_path / "raw"]) == 1
 
