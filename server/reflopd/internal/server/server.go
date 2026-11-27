@@ -71,6 +71,7 @@ type Server struct {
 	ids       *auth.Store
 	audit     *audit.Log
 	usage     *usage.Ledger
+	baselines *baselineCache // native baselines for `reflop test` (baseline.go)
 	store     *store.Store
 	runtime   runtime.Installed
 	workerDir string
@@ -157,6 +158,7 @@ func New(opts Options) (*Server, error) {
 		sessions: map[string]*Session{}, conns: map[*clientConn]bool{}, preauth: map[string]int{}, events: newBroadcaster(),
 		throttles: map[string]*bucket{}, started: time.Now(), idReserved: map[string]uint64{},
 		persisting: map[string]chan struct{}{}}
+	s.baselines = newBaselineCache(s.baselinesFile())
 	s.store = store.New(l.Store(), int64(cfg.Limits.UploadChunkBytes), cfg.Limits.MaxTensorNumel,
 		func() config.Rails { return s.cfg().Rails },
 		func(name string) uint64 { return uint64(s.quotaByID(name).StorageBytes) })
@@ -605,7 +607,7 @@ func (s *Server) capabilitiesFor(id *auth.Identity) *pb.ServerCapabilities {
 			}
 		}
 	}
-	c.Capabilities = append(c.Capabilities, "usage", "snapshots", "checkpoints")
+	c.Capabilities = append(c.Capabilities, "usage", "snapshots", "checkpoints", "native_baseline")
 	if ck := s.cfg().Checkpoints; ck.Enabled {
 		c.CheckpointIntervalS = uint64(ck.GuestInterval() / time.Second)
 		c.CheckpointDiskIntervalS = uint64(time.Duration(ck.Interval) / time.Second)

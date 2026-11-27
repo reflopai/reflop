@@ -288,7 +288,7 @@ func (c *clientConn) route(env *pb.Envelope) error {
 		return c.snapshotAdmin(env)
 	case *pb.Envelope_RegisterGraph, *pb.Envelope_Execute, *pb.Envelope_UploadTensor, *pb.Envelope_Fetch,
 		*pb.Envelope_Free, *pb.Envelope_Snapshot, *pb.Envelope_Restore, *pb.Envelope_Reseed,
-		*pb.Envelope_Checkpoint, *pb.Envelope_RecoverSession:
+		*pb.Envelope_Checkpoint, *pb.Envelope_RecoverSession, *pb.Envelope_NativeBaseline:
 		if c.session == nil {
 			c.sendErr(rid, pb.ErrorCode_ERROR_UNKNOWN_SESSION, "open a session first")
 			return nil

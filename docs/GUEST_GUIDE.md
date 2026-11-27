@@ -28,6 +28,7 @@ uv add reflop                   # or: pip install reflop, in your project's envi
 reflop pair reflop1-…          # the code the Owner gave you
 reflop status
 reflop verify                   # optional: compares a few results with your CPU
+reflop test --transformer       # optional: your speed over this connection
 ```
 
 `reflop` on PyPI is the library you import and the `reflop` command. Install it
@@ -360,6 +361,40 @@ the wire; in the 28 November benchmark run it took a CNN step from 142 ms to
 
 `torch.compile` does not work with reFLOP tensors (TorchDynamo cannot trace this
 kind of tensor subclass). `reflop.capture` gives the same benefit.
+
+## Testing your connection
+
+How fast reFLOP is for you depends on your connection as much as on the GPU.
+`reflop test` measures it for one kind of model in about 10 seconds:
+
+```sh
+reflop test --transformer      # or --mlp, --cnn, --resnet, --unet, --lstm, --gru, --gpt, --lora, --autoencoder
+reflop test --unet --batch 128 # batch 8, 16, 32 (default), 64 or 128
+reflop test --all              # every architecture, about 2 minutes (up to 5 on a slow connection)
+```
+
+It trains a small model of that kind on the server for a few seconds and
+prints a score: the share of the speed the same model has when it trains
+natively on the server's own GPU. 100% would be as fast as sitting at that
+machine. It shows three ways of training:
+
+- `reflop.capture` with the data on the server (a dataset): the score;
+- the same, uploading each batch from your machine;
+- eager, without `reflop.capture`.
+
+It also shows the round trip and upload speed it measured, and says what costs
+the most on your connection. With the Guest on the Owner's own machine (a
+0.3 ms round trip), a transformer at batch 32 kept 53% with capture and data on
+the server; an LSTM kept 1.6%, slowed down by reFLOP's cost per operation, not
+by the network.
+
+The native time comes from the Owner's reflopd, which trains its own copy of
+the same model on the GPU, so nothing runs on your machine's GPU (you need
+none) and no code from your machine runs on the server. reflopd keeps each
+native time and reuses it for every Guest, so usually only the first test of
+an architecture on a GPU measures it. It measures only while no one else is
+using the GPU; if someone is, the test still prints your numbers and says
+that the native time is missing. A reflopd without this feature gives no score.
 
 ## Measuring throughput
 
@@ -721,6 +756,7 @@ with `reflop run`:
 | `reflop data build\|push\|ls\|rm` | datasets |
 | `reflop run <command>` | run a command here with `cuda` mapped to reFLOP |
 | `reflop verify` | compare small results with your CPU |
+| `reflop test --<architecture>\|--all [--batch N] [--cpu]` | your training speed over this connection, as a share of native speed on the server ([Testing your connection](#testing-your-connection)) |
 | `reflop doctor` | check torch, its OpenMP runtimes, the key, the config and the connection |
 | `reflop key [--ssh] [--write-file]` | print or export the legacy machine key |
 | `reflop key --ssh --new` | create and print a new public key for a GPU's SSH invite |

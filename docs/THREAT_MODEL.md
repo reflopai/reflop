@@ -34,7 +34,7 @@ A Guest can influence the server only through:
 
 1. the handshake (Hello, Pair, Authenticate),
 2. protobuf requests (register graph, execute, upload, fetch, free, datasets, snapshots,
-   checkpoints, session recovery),
+   checkpoints, session recovery, native baselines),
 3. raw tensor bytes with an explicit dtype and shape,
 4. TensorPack uploads (safetensors shards and a JSON manifest).
 
@@ -191,6 +191,7 @@ session per interval: on disk never more often than every 5 minutes
 | RAM checkpoints (ADR-061) holding Guest data in the Owner's RAM | reflopd creates each memfd, seals it (no write, grow or shrink, also through the worker's descriptor) and checks its size before keeping it; it never maps it and copies it to disk in the kernel (`sendfile`). The pages count against the RAM rail (the writing worker's cgroup, then the shared one); reflopd reserves the size first, caps all RAM checkpoints at half of the workers' budget and drops them before any worker is limited or killed. An end on purpose drops them unwritten. The disk copy is parsed in full on recovery like any checkpoint (I6) |
 | A revived session the Owner ended | kill, revoke, unpair and CloseSession delete the session's checkpoint, and a late write of that session is never published; RecoverSession reads only the calling identity's own directory and checks the file in full (Go and Python parsers) before anything is allocated |
 | The suspend helper (ADR-030) | it runs four CUDA driver calls on one pid. The driver's checkpoint API works between processes of one user without ptrace, so the helper is limited to reflop workers: reflopd passes only its own workers' pids, and the helper refuses any process whose parent is not its own parent or whose command line is not the worker's. It reads no Guest data; the driver moves GPU memory into the worker's own host memory |
+| Native baselines for `reflop test` (ADR-064) | a Guest can make its own session's worker train one of reflopd's built-in test models natively for about a second. The request is a name and a batch size, both checked against fixed lists by reflopd and again by the worker before anything is allocated; the model code is reflopd's (`testzoo.py`), and the run restores the session's RNG streams. reflopd caches each result, so a GPU is measured at most once per model, batch, numerics and runtime, and it measures only while no other session uses the device. The cost a Guest can cause is a few seconds of GPU time per new combination, inside its own worker's limits |
 | A tampered client on PyPI | `pip` and `uv` do not check the offline signature. Only `pypi.yml`, through Trusted Publishing and the `pypi` GitHub environment, can upload, and only signed files. Someone who controls the PyPI account or the repository's Actions could still upload a different file. `install.sh` and `reflop update` check the signature on the Guest's machine |
 
 ## Known limitations

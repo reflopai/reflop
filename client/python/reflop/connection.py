@@ -309,7 +309,7 @@ class LocalConnection(Connection):
 
         c = kpb.ServerCapabilities(protocol_versions=[1], opset_versions=[1],
                                    enabled_op_ids=self.ready.enabled_op_ids, capabilities=self.ready.capabilities)
-        c.capabilities.extend(["snapshots", "checkpoints"])
+        c.capabilities.extend(["snapshots", "checkpoints", "native_baseline"])
         c.checkpoint_interval_s = self.checkpoint_interval_s
         c.devices.extend(self.ready.devices)
         c.limits.CopyFrom(self.worker.limits)

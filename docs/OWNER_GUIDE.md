@@ -547,6 +547,24 @@ reflopd in `~/.local/share/reflop`.
 The [reports](../benchmark/report/README.md) keep each published run, with its
 data and without addresses or host names.
 
+### Native baselines for `reflop test`
+
+`reflop test --<architecture>` on a Guest scores the Guest's connection
+against the same model trained natively on your GPU. reflopd measures that
+native time itself: the session's worker trains reflopd's own copy of one of
+ten small built-in models for about a second. No Guest code runs; a request
+can only name a built-in model and a batch size from a fixed list.
+
+reflopd keeps every measurement in `<state>/native_baselines.json` (with the
+default home, `~/.local/share/reflop/native_baselines.json`), keyed by the
+GPU, the torch and CUDA versions, the driver, the session's numerics, the
+model and the batch, and answers later requests from any Guest from there.
+It measures only while no other session uses that device, so a Guest's test
+never slows another Guest down; otherwise the Guest's test reports no score.
+If you change something these keys do not cover (clocks, power limits), delete
+the file and reflopd measures again. Each request shows in the audit log as
+`native_baseline`, with whether it came from the cache.
+
 ## Troubleshooting
 
 Start with `reflopd doctor`. It explains each sandbox layer, the rails, the

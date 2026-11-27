@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- `reflop test --<architecture>` measures how fast a model of that kind trains
+  over your connection, as a share of the same model trained natively on the
+  server's GPU (ADR-064). Pick `--mlp`, `--cnn`, `--resnet`, `--unet`, `--lstm`,
+  `--gru`, `--transformer`, `--gpt`, `--lora` or `--autoencoder` (about 10
+  seconds each), or `--all` (about 2 minutes). It prints the round trip and
+  upload speed it measured, the score with `reflop.capture` and the data on
+  the server, with each batch uploaded, and without capture, and what costs
+  the most. Nothing runs on your machine's GPU.
+- reflopd answers the new NativeBaseline request: the session's worker trains
+  reflopd's own copy of the chosen built-in model natively and reports its
+  time. reflopd keeps each result in `native_baselines.json`, keyed by GPU,
+  runtime, driver, numerics, model and batch, and serves it to every Guest
+  after that; it measures only while no other session uses the device.
+  Update both: an older reflopd gives `reflop test` no score.
+
 - `reflopd revoke`, `unpair`, `users delete`, `kill` and `usage` take a
   Guest's name as `reflopd users` shows it (ADR-062). Since 0.2.10 a Guest
   paired with a GPU has an identity per GPU, named `alice@gpu-…`, and these
