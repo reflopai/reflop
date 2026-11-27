@@ -244,3 +244,14 @@ def test_cases_cover_the_ops_this_fix_checks():
     for op in STRICT:
         assert len(BY_OP[op]) > 10, op
     assert len(CASES) > 10_000
+
+
+def test_an_output_dtype_the_wire_cannot_carry(sess, device):
+    # A 0-dim complex64 plus a float16 tensor is complex32, which has no wire
+    # dtype: no graph can declare the output, so check() has nothing to
+    # compare. It raised KeyError building the graph (sequence fuzz seed 101).
+    from parity import Call
+
+    call = Call("aten.add.Tensor", [torch.tensor(1 + 2j, dtype=torch.complex64), torch.ones(3, 2, dtype=torch.float16), 1])
+    assert check(sess, call, device) is None
+    ok_after(sess)

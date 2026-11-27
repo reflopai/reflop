@@ -513,6 +513,10 @@ def check(sess, call: Call, device="cpu", mark=lambda s: None):
         # gradient): no graph can return one, so none runs the kernel.
         want = native(call, device)
         return f"the meta has no outputs; the kernel returned {len(want)}" if isinstance(want, list) and want else None
+    if any(dt not in TORCH_TO_PB for dt, _ in outs):
+        # Type promotion can infer a dtype the wire cannot carry (complex32):
+        # no graph can declare that output, so none returns it.
+        return None
     if any(_extent(shape) > MAX_NATIVE_NUMEL for _, shape in outs):
         return None  # too big to run on either side; the Owner's rails decide it
     kind, got = worker(sess, call, outs)
