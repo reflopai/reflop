@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.3 (2026-11-28)
+
+Shorter `reflop test` output. Client only: a 0.4.2 daemon is all it needs.
+
+- `reflop test` now leads with a rating: great (70% or more of native speed),
+  okay (30 to 70%) or slow (under 30%), in green, yellow or red on a terminal.
+  Uploading each batch and eager training take one line each, with a short
+  tip only where they cost much more than `reflop.capture`. `--all` prints
+  one row per architecture, best first, with colored dots for upload and
+  eager (percentages when output is not a terminal or `NO_COLOR` is set).
+
 ## 0.4.2 (2026-11-28)
 
 `reflop test`, which scores your connection against native speed on the
