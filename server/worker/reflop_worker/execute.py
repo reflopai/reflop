@@ -60,6 +60,10 @@ RANGE_PRESERVING = {
     "reflop.dataset_gather.default",
 }
 
+# Every op propagate_range can give a range to; it is not called for others.
+RANGE_SOURCES = RANGE_PRESERVING | {"aten._to_copy.default", "aten.randperm.default", "reflop.randperm_seeded.default",
+                                    "aten.argmax.default", "aten.argmin.default"}
+
 
 def propagate_range(node, pos: list, outs: list) -> None:
     name = node.op.name
@@ -165,13 +169,16 @@ class Executor:
 
     # -------------------------------------------------------------- E1
 
-    def bind(self, prog: Program, ex: cpb.Execute) -> dict:
+    def bind(self, prog: Program, ex: cpb.Execute, nslots: int) -> tuple[list, list]:
+        """E1. Returns (env, scalars): env holds one slot per value of the
+        program (graph input i is slot i, see compile), scalars one entry per
+        graph input."""
         if len(ex.bindings) != len(prog.inputs):
             raise binding_error(f"graph has {len(prog.inputs)} inputs, got {len(ex.bindings)} bindings")
         if len(ex.outputs) != len(prog.outputs):
             raise binding_error(f"graph has {len(prog.outputs)} outputs, got {len(ex.outputs)} output specs")
-        env: dict = {}
-        scalars: dict[int, object] = {}
+        env: list = [None] * nslots
+        scalars: list = [None] * len(prog.inputs)
         K = gpb.GraphInput
         for i, (spec, b) in enumerate(zip(prog.inputs, ex.bindings)):
             which = b.WhichOneof("value")
@@ -189,7 +196,7 @@ class Executor:
                 if t.dtype != spec.dtype or tuple(t.shape) != spec.shape:
                     raise binding_error(f"input {i}: bound tensor is {t.dtype}{list(t.shape)}, the graph expects "
                                         f"{spec.dtype}{list(spec.shape)}")
-                env[Ref(-1, i)] = t
+                env[i] = t
             elif spec.kind == K.KIND_SCALAR:
                 if which != "scalar":
                     raise binding_error(f"input {i}: expected a scalar binding")
@@ -216,7 +223,7 @@ class Executor:
                     raise binding_error(f"dataset has no tensor {b.dataset.tensor!r}")
                 if t.dtype != spec.dtype or tuple(t.shape) != spec.shape:
                     raise binding_error(f"input {i}: dataset tensor does not match the graph")
-                env[Ref(-1, i)] = t
+                env[i] = t
         seen = set()
         for o, spec in enumerate(ex.outputs):
             k = cpb.OutputSpec
@@ -244,108 +251,137 @@ class Executor:
         if new and len(self.handles) + new > self.handles.max:
             raise ReflopError(cpb.ERROR_RESOURCE_LIMIT, f"storing {new} outputs would exceed "
                               f"{self.handles.max} live handles", E1)
-        env["__scalars__"] = scalars
-        return env
+        return env, scalars
 
     # -------------------------------------------------------------- E2 + E3
 
-    def compile(self, prog: Program) -> list:
-        """Flatten a validated program into per-node plans (once per graph)."""
+    def compile(self, prog: Program) -> tuple:
+        """Flatten a validated program into per-node plans (once per graph).
+
+        Every value of the program gets a slot in a list: graph input i is
+        slot i, and output k of node n is slot base[n] + k. Constant
+        arguments are placed once here; each execute copies the templates
+        and fills in only the arguments that come from slots. Only
+        bookkeeping moves here: every check still runs on every execute."""
         if getattr(prog, "_compiled", None) is not None:
             return prog._compiled
+        base, nslots = [], len(prog.inputs)
+        for node in prog.nodes:
+            base.append(nslots)
+            nslots += node.outputs
+
+        def slot(r: Ref) -> int:
+            return r.index if r.node < 0 else base[r.node] + r.index
+
+        outputs = set(prog.outputs)
         expiring: dict[int, list] = {}
         for r, last in prog.last_use.items():
-            if r.node >= 0 and r not in set(prog.outputs):
-                expiring.setdefault(last, []).append(r)
+            if r.node >= 0 and r not in outputs:
+                expiring.setdefault(last, []).append(slot(r))
         plans = []
         for node in prog.nodes:
-            args = []
+            ptmpl, ktmpl, dyn = [], {}, []
             for spec, a in zip(node.op.args, node.args):
                 if isinstance(a, Ref):
-                    kind, val = 0, a
+                    kind, val = 0, slot(a)
                 elif isinstance(a, ScalarRef):
                     kind, val = 1, a.input
                 elif isinstance(a, list) and any(isinstance(x, (Ref, ScalarRef)) for x in a):
-                    kind, val = 2, a
+                    # Tensor lists: Ref or None (graph.py); a ScalarRef is never in one.
+                    kind, val = 2, [None if x is None else slot(x) for x in a]
                 elif isinstance(a, str) and a == "session-device":
                     kind, val = 3, None
                 else:
                     kind, val = 4, a
-                args.append((spec.kwarg_only, spec.name, kind, val))
+                if spec.kwarg_only:
+                    key = spec.name
+                    if kind == 4:
+                        ktmpl[key] = val
+                    else:
+                        ktmpl[key] = None  # keeps the schema's keyword order
+                        dyn.append((True, key, kind, val))
+                else:
+                    key = len(ptmpl)
+                    ptmpl.append(val if kind == 4 else None)
+                    if kind != 4:
+                        dyn.append((False, key, kind, val))
             outs = []
             for k in range(node.outputs):
                 r = Ref(node.index, k)
                 m = prog.metas[r]
-                outs.append((r, m.dtype, tuple(m.shape), r in prog.last_use))
-            plans.append((node, node.op.fn, natives.is_native(node.op), args, outs,
+                outs.append((slot(r), m.dtype, tuple(m.shape), r in prog.last_use))
+            plans.append((node, node.op.fn, natives.is_native(node.op), ptmpl, ktmpl, tuple(dyn), tuple(outs),
                           validators.has_runtime(node.op), bool(node.op.flags & FLAG_UNINIT),
-                          expiring.get(node.index, ()), PRE.get(node.op.name), POST.get(node.op.name),
-                          writes.plan(node.op)))
-        prog._compiled = plans
-        return plans
+                          tuple(expiring.get(node.index, ())), PRE.get(node.op.name), POST.get(node.op.name),
+                          writes.plan(node.op), node.op.name in RANGE_SOURCES))
+        prog._compiled = (plans, nslots, [slot(r) for r in prog.outputs])
+        return prog._compiled
 
     def run(self, prog: Program, ex: cpb.Execute) -> cpb.ExecuteResult:
         if self.flops_quota and prog.flops > self.flops_quota:
             raise ReflopError(cpb.ERROR_QUOTA, f"graph needs ~{prog.flops} FLOPs; the per-execute quota is "
                               f"{self.flops_quota}", cpb.STAGE_V5_SAFETY)
-        plans = self.compile(prog)
-        env = self.bind(prog, ex)
-        scalars = env.pop("__scalars__")
+        plans, nslots, out_slots = self.compile(prog)
+        env, scalars = self.bind(prog, ex, nslots)
         t0 = time.perf_counter()
         dev = self.device
+        cuda = dev.type == "cuda"
         node = None
         moved: dict = {}  # tensors written by a kernel: their copies (writes.py)
+        Tensor = torch.Tensor
         try:
             with torch.inference_mode():
-                for node, fn, native, args, outs, check, uninit, free, pre, post, wplan in plans:
-                    pos, kw = [], {}
-                    for is_kw, name, kind, val in args:
+                for (node, fn, native, ptmpl, ktmpl, dyn, outs, check, uninit, free, pre, post, wplan,
+                     ranged) in plans:
+                    pos = ptmpl.copy()
+                    kw = ktmpl.copy() if ktmpl else {}
+                    for is_kw, key, kind, val in dyn:
                         if kind == 0:
                             v = env[val]
-                        elif kind == 4:
-                            v = val
                         elif kind == 1:
                             v = scalars[val]
                         elif kind == 3:
                             v = dev
                         else:
-                            v = [None if x is None else (env[x] if isinstance(x, Ref) else scalars[x.input])
-                                 for x in val]
+                            v = [None if x is None else env[x] for x in val]
                         if is_kw:
-                            kw[name] = v
+                            kw[key] = v
                         else:
-                            pos.append(v)
+                            pos[key] = v
                     if check:
                         validators.check_runtime(node, pos, kw)
                     if pre is not None:
-                        pre(node, pos, kw, dev.type == "cuda")
+                        pre(node, pos, kw, cuda)
                     written = writes.copy_written(wplan, pos, kw) if wplan is not None else None
                     out = natives.call(node.op.name, pos, kw, dev) if native else fn(*pos, **kw)
-                    if isinstance(out, torch.Tensor):
+                    if isinstance(out, Tensor):
                         flat = [out]
+                    elif isinstance(out, (tuple, list)) and all(isinstance(x, Tensor) for x in out):
+                        flat = list(out)  # what tree_flatten returns for a flat sequence of tensors
                     else:
-                        flat = [x for x in tree_flatten(out)[0] if isinstance(x, torch.Tensor)]
+                        flat = [x for x in tree_flatten(out)[0] if isinstance(x, Tensor)]
                     if len(flat) != len(outs):
                         raise ReflopError(cpb.ERROR_INTERNAL, f"{node.op.name}: produced {len(flat)} outputs, "
                                           f"validated {len(outs)}", E3, node.index, node.op.id)
-                    propagate_range(node, pos, flat)
+                    if ranged:
+                        propagate_range(node, pos, flat)
                     if post is not None:
                         post(node, pos, kw, flat)
-                    for t, (r, dt, shape, used) in zip(flat, outs):
+                    for t, (s, dt, shape, used) in zip(flat, outs):
                         # V4 gives every output the shape and dtype the device's
                         # kernel returns (outmeta.py). Anything consumed must
                         # match; an unused output that does not is never read.
-                        if used and (t.dtype != dt or tuple(t.shape) != shape):
+                        if used and (t.dtype != dt or t.shape != shape):  # torch.Size is a tuple
                             raise ReflopError(cpb.ERROR_INTERNAL, f"{node.op.name}: output is {t.dtype}"
                                               f"{list(t.shape)}, validated {dt}{list(shape)}", E3,
                                               node.index, node.op.id)
                         if uninit:
                             t.zero_()  # never return stale memory (I13)
-                        env[r] = t
+                        env[s] = t
                     if written:
                         writes.adopt(node, written, env, moved, E3)
-                    for r in free:
-                        env.pop(r, None)
+                    for s in free:
+                        env[s] = None
                 # No device sync here: the next execute's Python dispatch overlaps
                 # with this one's kernels. RETURN outputs sync when copied out;
                 # asynchronous kernel faults surface on the next sync and are
@@ -369,10 +405,10 @@ class Executor:
         # Before the outputs, so that an output stored or rebound to the
         # same handle replaces the written copy.
         writes.commit(moved, self.handles)
-        for spec, r in zip(ex.outputs, prog.outputs):
+        for spec, s in zip(ex.outputs, out_slots):
             # Handles hold plain values: a conj() or _neg_view() output would
             # keep its lazy bit, and later raw copies (reads, snapshots) drop it.
-            t = resolved(env[r])
+            t = resolved(env[s])
             if spec.kind == K.KIND_STORE:
                 self.handles.put_new(spec.handle, t)
             elif spec.kind == K.KIND_REBIND:

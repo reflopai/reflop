@@ -115,11 +115,13 @@ def copy_written(p, pos: list, kw: dict) -> list:
     return list(copies.values())
 
 
-def adopt(node, pairs: list, env: dict, moved: dict, stage) -> None:
+def adopt(node, pairs: list, env, moved: dict, stage) -> None:
     """After the kernel: later nodes read each copy instead of its original,
     and moved records which tensor, as bound, each copy stands for.
 
+    env is the executor's list of value slots (or any dict of values).
     moved maps id(current copy) -> [tensor as bound, current copy]."""
+    keys = range(len(env)) if isinstance(env, list) else list(env)
     for orig, c in pairs:
         if c.shape != orig.shape or c.dtype != orig.dtype:
             raise ReflopError(cpb.ERROR_EXECUTION, f"{node.op.name}: the kernel would resize an argument it writes "
@@ -130,8 +132,8 @@ def adopt(node, pairs: list, env: dict, moved: dict, stage) -> None:
         else:
             entry[1] = c
         moved[id(c)] = entry
-        for k, v in env.items():
-            if v is orig:
+        for k in keys:
+            if env[k] is orig:
                 env[k] = c
 
 
