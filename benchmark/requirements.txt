@@ -1,5 +1,6 @@
+# The live suite's dependencies besides reflop (setup.sh installs reflop from this checkout or PyPI).
 torch>=2.6
 torchvision
-numpy>=1.24
-safetensors>=0.4
-psutil>=5.9
+numpy
+psutil
+safetensors

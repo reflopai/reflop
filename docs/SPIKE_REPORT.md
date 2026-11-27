@@ -145,7 +145,7 @@ the later benchmark below.
 
 ## Later benchmark evidence
 
-The [15 November 2026 report](../benchmark/report/README.md) is a separate
+The [15 November 2026 report](../benchmark/report/historical/README.md) is a separate
 experiment: native eager PyTorch on the Linux Owner workstation versus a
 MacBook Pro Guest over Tailscale TLS to the same RTX 5070. ResNet-18 batch 128
 with resident inputs retains 70.1% with capture and 21.7% eagerly. The report

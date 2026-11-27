@@ -531,29 +531,21 @@ URL (plain `http://` works only for `localhost`).
 
 ## Benchmarking the GPU
 
-The [benchmark guide](../benchmark/README.md) covers native GPU and remote
-throughput collection. Run `benchmark/scripts/native_cuda.sh` on this machine
-with a local CUDA-enabled PyTorch installation. It does not require pairing
-or a daemon. Select the physical GPU that reFLOP uses with
-`CUDA_VISIBLE_DEVICES` when more than one GPU is installed.
+The [live suite](../benchmark/README.md) runs from a Guest. With your
+permission it also drives this machine over ssh (`E2E_OWNER_SSH=<host>`): it
+times the same workloads natively with reflopd's own runtime Python (b02), and
+tests pause, kill, checkpoints, invites and quotas. It only touches the Guest
+that runs it and its own `e2e-*` identities, waits for other Guests' sessions
+to end before it pauses anything, and undoes every change when it finishes
+(`python -m live.owner cleanup` does it again). Stop other GPU work first, or
+the numbers include it; the suite records what else held GPU memory.
 
-The Guest runs the matching correctness and throughput suites against
-`reflopd`. Run native and remote measurements separately, with other GPU work
-stopped. Match the Owner runtime's Torch/CUDA versions and numerical flags;
-record the driver, GPU identity, power or clock settings, and network conditions.
-Send the complete native result directory to the person preparing the
-comparison so `compare_cuda.sh` can check the metadata and generate the report.
+To test this machine without a second one, run the Guest here against a
+throwaway reflopd (`E2E_LOCAL=1`, see the guide). It never runs against the
+reflopd in `~/.local/share/reflop`.
 
-The [15 November 2026 comparison](../benchmark/report/README.md) uses native
-execution on the Linux Owner workstation and a MacBook Pro Guest over
-Tailscale TLS to the same RTX 5070. It includes 78 passing native cases and
-156 matched remote cases. Network RTT, bandwidth, clocks, and competing load
-were not recorded; it is not a controlled LAN/WAN comparison.
-
-Fault probes are separate from throughput measurement. They run only the
-commands configured in `owner_hooks`; use a test server and keep a management
-connection available to restore service. Inspect `run_all.sh`'s configuration
-before running it because it includes those hooks and the long soak tests.
+The [reports](../benchmark/report/README.md) keep each published run, with its
+data and without addresses or host names.
 
 ## Troubleshooting
 

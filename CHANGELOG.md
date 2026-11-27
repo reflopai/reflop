@@ -11,6 +11,16 @@
   0.2.10, which was the only one revoked before. `unpair` lists what it will
   delete before asking. `users delete` deletes nothing while any of them is
   still active. `--gpu` still narrows a command to one GPU.
+- `benchmark/` is now the live suite that produced the README's numbers:
+  19 suites of end-to-end tests and benchmarks against a real reflopd,
+  including the Owner's controls (ADR-063). It tests this checkout by
+  default (`./benchmark/setup.sh --release X.Y.Z` tests a release), touches
+  an Owner only when told which, and never a live reflopd in local mode.
+  `python -m live.report` writes the comparison of two runs, and
+  `python -m live.sanitize` removes addresses, host names and paths before
+  one is published. The 0.4.1 run is in `benchmark/report/2026-11-28/`. The
+  older harness (`benchmark/scripts/`, `bench/`) is removed; its reports are
+  in `benchmark/report/historical/`.
 
 ## 0.4.1 (2026-11-27)
 

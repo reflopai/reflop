@@ -2271,3 +2271,48 @@ Names cannot contain `@` (`auth.NameRe`), so `alice` never matches
 `alicex@gpu-…`. Tests: `TestRevokeReachesEveryIdentityOfAGuest`,
 `TestUnpairAndDeleteReachEveryIdentityOfAGuest`,
 `TestKillTargetsAGuestOnEveryGPU`, `TestOfGuest`.
+
+## ADR-063: One live suite in benchmark/, publishing only sanitized runs
+
+**Context.** The README's performance numbers came from an end-to-end suite
+the maintainer ran from a Mac Guest against the Owner, kept in a separate
+project: 18 suites of feature checks and benchmarks against a live reflopd,
+including the Owner's controls over ssh. It installed reflop from PyPI,
+cloned this repository for the C API suite, and defaulted to the
+maintainer's host. The older harness in `benchmark/` measured an earlier
+setup and was no longer what produced the published numbers. Because the
+suite lived elsewhere, behaviour changes in 0.4.0 left four of its cases
+asserting the old behaviour and kept 14 identity and quota cases from
+running on 0.4.1. A run records the Owner's address and host names, user
+paths, GPU UUIDs and the command lines of processes on the Owner's GPU, so
+raw results cannot be published.
+
+**Decision.** (The maintainer chose these on 2026-11-28.)
+
+- The suite replaces the old harness in `benchmark/` (package `live`;
+  `tests/e2e` would shadow a top-level `e2e` on pytest's path). Its old
+  reports move to `benchmark/report/historical/`.
+- It tests this checkout by default (editable install); `setup.sh --release
+  X.Y.Z` tests the PyPI release, and the C API suite then builds libreflop
+  from that tag (`git archive`).
+- No Owner by default. `E2E_OWNER_SSH` names one; `E2E_LOCAL=1` runs Owner
+  commands against a throwaway reflopd home and refuses
+  `~/.local/share/reflop`. The guards treat `name@gpu-…` as `name`.
+- Raw results stay gitignored. One sanitized run per release goes to
+  `benchmark/report/<date>/` (`live.sanitize run`, then `live.report`), and
+  CI checks the committed reports for addresses, home paths and GPU UUIDs.
+- The old harness's like-for-like correctness check (GH#19) is ported as
+  a15, which runs only where the Guest has the Owner's hardware.
+
+**Alternatives.** Keeping both harnesses: two tools, two copies of the
+workloads, and no clear answer to which produced a number. Testing the PyPI
+release by default: failures show up only after a release. Keeping results
+out of the repository: the README's numbers would have no data behind them.
+
+**Consequences.** The suite never runs in CI (it needs a daemon and changes
+the Owner's state); CI lints it and runs `tests/benchmark/`. A change to
+behaviour a live case checks updates the case in the same pull request. The
+sanitizer cannot know names a run never recorded, so a report is read before
+it is committed. Checks of the old harness that the suite lacks are listed
+in `benchmark/README.md` ("Not covered"); ADR-059's reference now lives in
+`benchmark/live/helpers/reference_train.py`.

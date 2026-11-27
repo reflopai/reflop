@@ -1,4 +1,7 @@
 .venv/
-cache/
-results/
 __pycache__/
+# Run output and local state: results hold host names, addresses and process command lines; guests/ holds the
+# client homes (keys) of throwaway e2e-* Guests; cache/ the source of a release under test.
+results/
+guests/
+cache/
