@@ -168,24 +168,46 @@ def resume_bit_exact():
     return f"10 resumed steps bit-identical (loss {a[0]:.4f}->{a[-1]:.4f})"
 
 
-def load_default_session_two_open():
-    """Docs: model.load_state_dict(reflop.load("run1")). With a GPU and a server-CPU session open, where does an
-    index-less load go? It should be the default device (reflop.device() = index 0), like the model."""
+def load_follows_the_default_session():
+    """Docs: model.load_state_dict(reflop.load("run1")). An index-less load goes to the default session: the one the
+    Guest opened last (ADR-036, BUGS #35 kept as documented). A server-CPU session that `placement("remote-cpu")`
+    opens by itself does not become the default, so the load still lands where the model is (#5)."""
+    import json
+
     import reflop
 
+    # Opened on purpose: reflop:1 becomes the default, and index=0 reaches the model's session.
     d = gpu()
-    reflop.device(1, kind="cpu")
+    cpu = reflop.device(1, kind="cpu")
     m = wl.build("mlp", 0).to(d)
     reflop.save(sn("dflt"), m.state_dict())
-    back = reflop.load(sn("dflt"))
-    where = {back[k].device for k in back}
-    try:
+    where = {v.device for v in reflop.load(sn("dflt")).values()}
+    check(where == {cpu}, f"index-less reflop.load() went to {where}; the session opened last is {cpu}")
+    back = reflop.load(sn("dflt"), index=d.index)
+    check({v.device for v in back.values()} == {d}, "reflop.load(index=0) did not reach reflop:0")
+    m.load_state_dict(back)
+
+    # Opened by placement, in a fresh process: the default stays the GPU session.
+    script = SCRATCH / "snap_default.py"
+    script.write_text(textwrap.dedent(f"""
+        import json, torch, reflop
+        d = reflop.device()
+        with reflop.placement("remote-cpu"):
+            c = torch.zeros(3, device=d).device
+        m = torch.nn.Linear(4, 2).to(d)
+        reflop.save({sn('dflt-auto')!r}, m.state_dict())
+        back = reflop.load({sn('dflt-auto')!r})
         m.load_state_dict(back)
-        ok = "load_state_dict ok"
-    except Exception as e:  # noqa: BLE001
-        ok = f"load_state_dict failed: {str(e).splitlines()[-1][:120]}"
-    check(where == {d}, f"index-less reflop.load() went to {where} (model on {d}); {ok}")
-    return f"{where}; {ok}"
+        print("RESULT", json.dumps({{"model": str(d), "placement_cpu": str(c),
+                                    "loaded": sorted({{str(v.device) for v in back.values()}})}}))
+    """))
+    r = py([script], timeout=180)
+    got = [json.loads(line.split(" ", 1)[1]) for line in r.stdout.splitlines() if line.startswith("RESULT")]
+    check(r.returncode == 0 and got, f"rc {r.returncode}: {r.stderr[-500:]}")
+    g = got[0]
+    check(g["placement_cpu"] != g["model"], f"placement('remote-cpu') did not open a CPU session: {g}")
+    check(g["loaded"] == [g["model"]], f"a placement-opened CPU session took the default: {g}")
+    return f"explicit: load -> {cpu}, index=0 -> {d}; placement-opened {g['placement_cpu']} left the default {g['model']}"
 
 
 def validation_errors():
@@ -319,7 +341,7 @@ def main():
 
     s = Suite("a08_snapshots", __doc__.splitlines()[0])
     for fn in (roundtrip, nested_views_tied, replace_same_name, load_in_new_process, load_into_cpu_session,
-               resume_bit_exact, load_default_session_two_open, validation_errors, hostile_names):
+               resume_bit_exact, load_follows_the_default_session, validation_errors, hostile_names):
         s.case(f"snapshot/{fn.__name__}", fn, timeout=600)
     s.case("snapshot/throughput", throughput, s, timeout=1800)
     s.case("snapshot/delete_all", delete_all, timeout=300)
