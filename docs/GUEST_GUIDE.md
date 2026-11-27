@@ -355,8 +355,8 @@ capture, because the batch dominated. With the data already on the server, the
 same step took 19 ms eagerly and 5.7 ms with capture. Keep the data on the
 server: use a [dataset](#datasets), or upload the tensors once before the loop
 and index them inside the step. A dataset batch costs 8 bytes per sample on
-the wire; in the 21 November benchmark run it took a CNN step from 158 ms to
-2.8 ms.
+the wire; in the 28 November benchmark run it took a CNN step from 142 ms to
+2.5 ms.
 
 `torch.compile` does not work with reFLOP tensors (TorchDynamo cannot trace this
 kind of tensor subclass). `reflop.capture` gives the same benefit.
@@ -376,17 +376,17 @@ step. Capture/eager speedup alone does not tell you how much native performance
 you retain. Check correctness failures and missing cases before selecting a
 workload, and record your connection conditions with the results.
 
-In the 21 November 2026 run (Owner RTX 5070, batch 128, data resident,
+In the 28 November 2026 run (Owner RTX 5070, batch 128, data resident,
 capture on, Guest on another machine), reFLOP kept this share of native CUDA
-speed: UNet 90%, GPT 75%, attention 73%, ResNet-18 64%, CNN 54%, MLP 16%, and
-LSTM/GRU 2.5–4%. LSTM and GRU run one timestep at a time (about 8,000 graph
+speed: UNet 98%, attention 90%, GPT 77%, ResNet-18 71%, CNN 70%, MLP 28%, and
+LSTM/GRU 3.4–5.3%. LSTM and GRU run one timestep at a time (about 8,000 graph
 nodes per step). Uploading inputs every step was bound by the network (about
-9.8 MiB/s, 15.6 ms round trip) and kept 0.2–10%. Matmul on the GPU reached the
-same TFLOP/s as native CUDA, and eight processes at once reached 3.53× the
+10 MiB/s, 4.1 ms round trip) and kept 0.2–25%. Matmul on the GPU reached the
+same TFLOP/s as native CUDA, and eight processes at once reached 1.77× the
 throughput of one, sharing the GPU evenly. These are synthetic steady-state
 measurements. The [saved report](../benchmark/report/README.md) has an earlier
-run with its raw data. ResNet-18's correctness check against a native CPU
-reference on a different machine is still open
+run with its raw data. The ResNet-18 correctness failures in that report came
+from the CPU reference, not reFLOP
 ([#19](https://github.com/reflopai/reflop/issues/19)).
 
 ## Unmodified CUDA scripts
