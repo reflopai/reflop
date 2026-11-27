@@ -262,7 +262,14 @@ class Executor:
         slot i, and output k of node n is slot base[n] + k. Constant
         arguments are placed once here; each execute copies the templates
         and fills in only the arguments that come from slots. Only
-        bookkeeping moves here: every check still runs on every execute."""
+        bookkeeping moves here: every check still runs on every execute.
+
+        A plan is (True, node, fn, ptmpl, ktmpl, dyn, pairs, out, free) for a
+        simple node (one output, and no runtime check, pre or post fix-up,
+        written-argument copy, UNINIT zeroing, range propagation or native
+        implementation), run by a shorter path in run(); and (False, node,
+        fn, native, ptmpl, ktmpl, dyn, outs, check, uninit, free, pre, post,
+        wplan, ranged) for every other node."""
         if getattr(prog, "_compiled", None) is not None:
             return prog._compiled
         base, nslots = [], len(prog.inputs)
@@ -310,10 +317,25 @@ class Executor:
                 r = Ref(node.index, k)
                 m = prog.metas[r]
                 outs.append((slot(r), m.dtype, tuple(m.shape), r in prog.last_use))
-            plans.append((node, node.op.fn, natives.is_native(node.op), ptmpl, ktmpl, tuple(dyn), tuple(outs),
-                          validators.has_runtime(node.op), bool(node.op.flags & FLAG_UNINIT),
-                          tuple(expiring.get(node.index, ())), PRE.get(node.op.name), POST.get(node.op.name),
-                          writes.plan(node.op), node.op.name in RANGE_SOURCES))
+            native, check = natives.is_native(node.op), validators.has_runtime(node.op)
+            uninit, wplan = bool(node.op.flags & FLAG_UNINIT), writes.plan(node.op)
+            pre, post = PRE.get(node.op.name), POST.get(node.op.name)
+            free = tuple(expiring.get(node.index, ()))
+            # propagate_range sets ranges on integer outputs only (set_range),
+            # so a float view or reshape has nothing to propagate.
+            ranged = node.op.name in RANGE_SOURCES and any(dt in validators.INT_DTYPES for _, dt, _, _ in outs)
+            if (len(outs) == 1 and not (native or check or uninit or ranged)
+                    and wplan is None and pre is None and post is None):
+                # A simple node: nothing to do around the kernel but the
+                # output check. `pairs` is set when every argument that comes
+                # from a slot is positional and a tensor.
+                pairs = None
+                if all(not is_kw and kind == 0 for is_kw, _, kind, _ in dyn):
+                    pairs = tuple((key, val) for _, key, _, val in dyn)
+                plans.append((True, node, node.op.fn, ptmpl, ktmpl, tuple(dyn), pairs, outs[0], free))
+            else:
+                plans.append((False, node, node.op.fn, native, ptmpl, ktmpl, tuple(dyn), tuple(outs), check,
+                              uninit, free, pre, post, wplan, ranged))
         prog._compiled = (plans, nslots, [slot(r) for r in prog.outputs])
         return prog._compiled
 
@@ -331,8 +353,48 @@ class Executor:
         Tensor = torch.Tensor
         try:
             with torch.inference_mode():
-                for (node, fn, native, ptmpl, ktmpl, dyn, outs, check, uninit, free, pre, post, wplan,
-                     ranged) in plans:
+                for plan in plans:
+                    if plan[0]:
+                        _, node, fn, ptmpl, ktmpl, dyn, pairs, (s, dt, shape, used), free = plan
+                        pos = ptmpl.copy()
+                        if pairs is not None:
+                            for key, val in pairs:
+                                pos[key] = env[val]
+                            # ktmpl holds constants only here; ** unpacks it into a new dict.
+                            out = fn(*pos, **ktmpl) if ktmpl else fn(*pos)
+                        else:
+                            kw = ktmpl.copy() if ktmpl else {}
+                            for is_kw, key, kind, val in dyn:
+                                if kind == 0:
+                                    v = env[val]
+                                elif kind == 1:
+                                    v = scalars[val]
+                                elif kind == 3:
+                                    v = dev
+                                else:
+                                    v = [None if x is None else env[x] for x in val]
+                                if is_kw:
+                                    kw[key] = v
+                                else:
+                                    pos[key] = v
+                            out = fn(*pos, **kw)
+                        if not isinstance(out, Tensor):
+                            flat = [x for x in tree_flatten(out)[0] if isinstance(x, Tensor)]
+                            if len(flat) != 1:
+                                raise ReflopError(cpb.ERROR_INTERNAL, f"{node.op.name}: produced {len(flat)} "
+                                                  "outputs, validated 1", E3, node.index, node.op.id)
+                            out = flat[0]
+                        # The same output check as below (V4, outmeta.py).
+                        if used and (out.dtype != dt or out.shape != shape):
+                            raise ReflopError(cpb.ERROR_INTERNAL, f"{node.op.name}: output is {out.dtype}"
+                                              f"{list(out.shape)}, validated {dt}{list(shape)}", E3,
+                                              node.index, node.op.id)
+                        env[s] = out
+                        for f in free:
+                            env[f] = None
+                        continue
+                    (_, node, fn, native, ptmpl, ktmpl, dyn, outs, check, uninit, free, pre, post, wplan,
+                     ranged) = plan
                     pos = ptmpl.copy()
                     kw = ktmpl.copy() if ktmpl else {}
                     for is_kw, key, kind, val in dyn:
