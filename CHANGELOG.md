@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.4.1 (2026-11-27)
+
+Faster executes on the server. Update the daemon. The client has no
+changes besides its version number, and every 0.4 client and daemon work
+together.
+
+- The worker spends less time in Python per graph node. It kept every
+  intermediate value in a dictionary keyed by a Python object and rebuilt
+  each node's arguments on every execute. Now values live in numbered
+  slots, constant arguments are set up once per graph, and nodes that need
+  no runtime check, fix-up, copy or zeroing take a shorter path. Every
+  check still runs, and results are the same bit for bit. Replaying
+  captured steps on an RTX 5070 at batch 128, steps take 21–25% less time
+  for the MLP, LSTM, GRU, transformer, GPT, LoRA and autoencoder benchmark
+  models, and 6–11% less for the CNN, U-Net and ResNet-18 (part of GH#20).
+- Tests: the sequence fuzzer now sends graphs whose output type promotion
+  makes `complex32`, a dtype the wire format cannot carry. It stopped with
+  a `KeyError` before any of them reached the worker. The worker refuses
+  them, as it should.
+
 ## 0.4.0 (2026-11-27)
 
 Checkpoints kept in RAM between disk writes, checkpoints for sessions whose
