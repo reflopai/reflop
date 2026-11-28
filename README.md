@@ -316,32 +316,36 @@ Guest on another machine over the network.
 
 | Workload | Native CUDA speed kept |
 |---|---|
-| UNet | **98%** |
-| Attention | 90% |
+| UNet | **89%** |
+| ResNet-18 | **88%** |
+| Attention | 87% |
 | GPT | 77% |
-| ResNet-18 | 71% |
-| CNN | 70% |
-| MLP | 28% |
-| LSTM / GRU | 3.4–5.3% |
+| CNN | 68% |
+| MLP | 25% |
+| LSTM / GRU | 3.3–5.0% |
 
 - **LSTM and GRU are slow by design.** They run one timestep at a time, about
   8,000 graph nodes per step.
 - **Uploading inputs every step is bound by the network** (about 10 MiB/s
-  and a 4.1 ms round trip in this run). Those cases keep 0.2–25% of native
-  speed. Keep the data on the server: a [dataset](docs/GUEST_GUIDE.md#datasets)
-  needs 8 bytes per sample, and took the CNN from 142 ms to 2.5 ms per step.
+  and a 4.6 ms round trip in this run; reFLOP moves data as fast as plain
+  ssh over the same link). Those cases keep 0.2–73% of native speed,
+  depending on how much a step uploads. Keep the data on the server: a
+  [dataset](docs/GUEST_GUIDE.md#datasets) needs 8 bytes per sample, and took
+  the CNN from 142 ms to 2.3 ms per step.
 - **The GPU itself runs at native speed.** Matmul measured on the GPU reaches
   the same TFLOP/s as native CUDA.
-- **Several Guests share the GPU.** Eight processes at once reached 1.77× the
+- **Several Guests share the GPU.** Eight processes at once reached 1.94× the
   throughput of one, with the GPU split evenly between them.
-- **Long runs are stable.** A 20-minute soak ran 83,300 steps at a constant
-  14.2 ms/step, with flat memory use.
+- **Long runs are stable.** A 20-minute soak ran 80,750 steps at a constant
+  14.6 ms/step, with flat memory use.
+- **Opening a session takes about 3.4 s.** Almost all of it is the Owner
+  starting the sandboxed worker.
 
-These numbers come from a LAN connection with a 4.1 ms round trip. Yours
+These numbers come from a LAN connection with a 4.6 ms round trip. Yours
 depend on your connection: `reflop test --<architecture>` (for example
 `reflop test --transformer`) measures them in about 10 seconds. See
 [`benchmark/`](benchmark/README.md) to reproduce the full run, and the
-[report](benchmark/report/2026-11-28/README.md) for this run with its data.
+[report](benchmark/report/2026-11-28-0.4.4/README.md) for this run with its data.
 
 Steps whose Python numbers change every step (a non-capturable Adam's bias
 correction, a Python learning-rate schedule) are detected and refused; use
