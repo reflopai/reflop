@@ -119,8 +119,18 @@ func runServe(f serveFlags) error {
 	if err := l.Ensure(); err != nil {
 		return err
 	}
-	// Unpack the worker package before the daemon confines itself (its
+	// Compile the bytecode of a runtime installed before reflopd 0.4.5 and
+	// unpack the worker package before the daemon confines itself (its
 	// Landlock domain keeps the runtime tree read-only).
+	for _, inst := range runtime.List(l.Runtime) {
+		if inst.Marker.Bytecode >= runtime.BytecodeVersion {
+			continue
+		}
+		fmt.Fprintf(os.Stderr, "reflopd: compiling runtime %s's Python bytecode once (workers start faster)\n", inst.Marker.ID)
+		if _, err := runtime.EnsureBytecode(context.Background(), inst); err != nil {
+			fmt.Fprintf(os.Stderr, "reflopd: runtime %s: %v (workers start without it)\n", inst.Marker.ID, err)
+		}
+	}
 	if _, err := runtime.EnsureWorker(l.Runtime); err != nil {
 		return fmt.Errorf("worker package: %w", err)
 	}

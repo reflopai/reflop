@@ -21,6 +21,7 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	goruntime "runtime"
@@ -202,6 +203,14 @@ func EnsureWorker(root string) (string, error) {
 	if err := copyWorker(tmp); err != nil {
 		return "", err
 	}
+	// Bytecode for the worker package too, with any installed runtime's
+	// interpreter (they share one Python version). Without one the worker
+	// still starts, compiling its own modules each time.
+	for _, inst := range List(root) {
+		if compileBytecode(context.Background(), inst.PythonBin(), tmp, dir) == nil {
+			break
+		}
+	}
 	if err := os.WriteFile(filepath.Join(tmp, "READY"), []byte(WorkerHash()+"\n"), 0o444); err != nil {
 		return "", err
 	}
@@ -234,7 +243,14 @@ type Marker struct {
 	CUDA      string    `json:"cuda"`
 	Python    string    `json:"python"`
 	Installed time.Time `json:"installed"`
+	// Bytecode is BytecodeVersion once the runtime's Python files have
+	// their .pyc files (ADR-066); 0 for a runtime installed before.
+	Bytecode int `json:"bytecode,omitempty"`
 }
+
+// BytecodeVersion marks a runtime whose .py files under lib/ have
+// checked-hash .pyc files next to them.
+const BytecodeVersion = 1
 
 // Installed describes a ready runtime.
 type Installed struct {
@@ -247,8 +263,13 @@ func (i Installed) PythonBin() string { return filepath.Join(i.Dir, "python", "b
 
 // SitePackages is the site-packages dir.
 func (i Installed) SitePackages(pyVersion string) string {
+	return filepath.Join(i.lib(pyVersion), "site-packages")
+}
+
+// lib is the interpreter's lib/pythonX.Y dir (standard library and site-packages).
+func (i Installed) lib(pyVersion string) string {
 	mm := strings.Join(strings.Split(pyVersion, ".")[:2], ".")
-	return filepath.Join(i.Dir, "python", "lib", "python"+mm, "site-packages")
+	return filepath.Join(i.Dir, "python", "lib", "python"+mm)
 }
 
 // Find returns the installed runtime with id, if complete.
@@ -315,11 +336,19 @@ func (l *Lock) Install(ctx context.Context, root, variant string, progress Progr
 			return Installed{}, fmt.Errorf("%s: %w", w.File, err)
 		}
 	}
-	// Python must never write .pyc files into the runtime at run time.
+	// Python must never write .pyc files into the runtime at run time
+	// (reflopd compiles them once, below, before the runtime is sealed).
 	if err := os.WriteFile(filepath.Join(site, "reflop_runtime.pth"), []byte("import sys; sys.dont_write_bytecode = True\n"), 0o644); err != nil {
 		return Installed{}, err
 	}
-	m := Marker{ID: id, Variant: variant, Arch: arch, Torch: v.Torch, CUDA: v.CUDA, Python: l.Python.Version, Installed: time.Now().UTC()}
+	final := filepath.Join(root, id)
+	progress("compiling Python bytecode")
+	if err := compileBytecode(ctx, inst.PythonBin(), inst.lib(l.Python.Version),
+		Installed{Dir: final}.lib(l.Python.Version)); err != nil {
+		return Installed{}, fmt.Errorf("python bytecode: %w", err)
+	}
+	m := Marker{ID: id, Variant: variant, Arch: arch, Torch: v.Torch, CUDA: v.CUDA, Python: l.Python.Version,
+		Installed: time.Now().UTC(), Bytecode: BytecodeVersion}
 	b, _ := json.MarshalIndent(m, "", "  ")
 	if err := os.WriteFile(filepath.Join(tmp, "READY.json"), b, 0o644); err != nil {
 		return Installed{}, err
@@ -327,12 +356,72 @@ func (l *Lock) Install(ctx context.Context, root, variant string, progress Progr
 	if err := makeReadOnly(tmp); err != nil {
 		return Installed{}, err
 	}
-	final := filepath.Join(root, id)
 	os.RemoveAll(final)
 	if err := os.Rename(tmp, final); err != nil {
 		return Installed{}, err
 	}
 	return Installed{Dir: final, Marker: m}, nil
+}
+
+// compileBytecode writes a checked-hash .pyc next to every .py under dir,
+// with the runtime's own interpreter, recording displayDir as the files'
+// directory for tracebacks (dir is a temporary directory that is renamed
+// to displayDir). The worker runs with -B, which stops Python from writing
+// .pyc files but not from reading them, so without them every worker start
+// compiles each module it imports again. A checked-hash .pyc is used only
+// while its source's hash matches (PEP 552), so it can never differ from
+// the .py next to it. Files that do not compile (tests some wheels ship
+// with deliberate syntax errors) keep only their source.
+func compileBytecode(ctx context.Context, python, dir, displayDir string) error {
+	cmd := exec.CommandContext(ctx, python, "-I", "-m", "compileall", "-q", "-q", "-j", "0",
+		"--invalidation-mode", "checked-hash", "-d", displayDir, dir)
+	cmd.Env = []string{"LANG=C.UTF-8"}
+	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == 1 {
+		return nil // some files did not compile; the rest did
+	}
+	if err != nil {
+		return fmt.Errorf("%w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// EnsureBytecode compiles the .pyc files of a runtime installed before
+// BytecodeVersion. Only the directories become writable while it runs:
+// compileall adds __pycache__ directories and new files and changes no
+// existing file, so a runtime whose files are hard links into another
+// reflopd home (benchmark local mode) leaves that home's files as they were.
+func EnsureBytecode(ctx context.Context, inst Installed) (Installed, error) {
+	if inst.Marker.Bytecode >= BytecodeVersion {
+		return inst, nil
+	}
+	err := filepath.WalkDir(inst.Dir, func(p string, d fs.DirEntry, err error) error {
+		if err == nil && d.IsDir() {
+			return os.Chmod(p, 0o755)
+		}
+		return err
+	})
+	if err == nil {
+		lib := inst.lib(inst.Marker.Python)
+		err = compileBytecode(ctx, inst.PythonBin(), lib, lib)
+	}
+	if err == nil {
+		m := inst.Marker
+		m.Bytecode = BytecodeVersion
+		b, _ := json.MarshalIndent(m, "", "  ")
+		tmp := filepath.Join(inst.Dir, "READY.json.tmp")
+		if err = os.WriteFile(tmp, b, 0o444); err == nil {
+			err = os.Rename(tmp, filepath.Join(inst.Dir, "READY.json"))
+		}
+		if err == nil {
+			inst.Marker = m
+		}
+	}
+	if e := makeReadOnly(inst.Dir); e != nil && err == nil {
+		err = e
+	}
+	return inst, err
 }
 
 // List returns installed runtimes, newest first.

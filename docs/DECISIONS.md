@@ -2414,3 +2414,55 @@ CNN 1.41 → 0.86 ms. The rule was checked against both kernels on about
 `test_window_rule_matches_the_kernels` repeats a smaller grid on every run.
 A future PyTorch whose kernels start a window elsewhere would break the
 rule; that test fails first.
+
+## ADR-066: The runtime ships compiled bytecode
+
+**Context.** Opening a session took 3.4 s, almost all of it the worker
+starting (live run, 0.4.4). reflopd unpacks the runtime's wheels itself and
+wrote no `.pyc` files, and the worker runs with `-B` from a read-only tree,
+so every worker start compiled each Python module it imported again:
+1,857 modules for a CUDA worker, about 2 s of the 3.3 s. `-B` only stops
+Python from writing bytecode; it reads `.pyc` files that exist.
+
+**Decision.**
+
+- `Install` runs the runtime's own interpreter,
+  `python -I -m compileall --invalidation-mode checked-hash`, over
+  `lib/pythonX.Y` (standard library and site-packages) before the runtime
+  is made read-only. `-d` records the final path, so tracebacks show it and
+  not the temporary install directory. `READY.json` records
+  `"bytecode": 1`.
+- A runtime installed before gets its bytecode once, when reflopd starts
+  and before the daemon confines itself (`EnsureBytecode`). Only the
+  directories become writable while it runs: compileall adds `__pycache__`
+  directories and new files and changes no existing file, so a runtime whose
+  files are hard links into another home (benchmark local mode) leaves that
+  home's files as they were. The runtime is sealed again afterwards.
+- The worker package gets its bytecode when it is unpacked, with an
+  installed runtime's interpreter.
+- Files that do not compile (some wheels ship test files with deliberate
+  syntax errors) keep only their source.
+
+**Alternatives.** Timestamp-based `.pyc` files: valid only while the
+source's mtime and size match, which unpacking does not keep stable, and
+they do not tie the bytecode to the source's content. Unchecked-hash `.pyc`
+files: Python would never compare them with their source. A bytecode cache
+outside the runtime (`pycache_prefix`): one more writable location the worker
+reads code from. A pre-started worker per device: removes the start from
+the open path entirely, but holds GPU memory while idle and needs the
+session's configuration after the worker started; not decided.
+Calling `torch._C._set_deterministic_algorithms` instead of
+`torch.use_deterministic_algorithms`, which imports `torch._inductor.config`
+(and with it dynamo, sympy and DTensor): the import then happens at the
+session's first graph instead, and took longer there (0.75 s against
+0.50 s), because dynamo's first `disable()` also loads its trace rules.
+
+**Consequences.** A checked-hash `.pyc` is used only while the SipHash of
+its source matches (PEP 552), so it cannot differ from the `.py` next to it,
+and the bytecode is generated on the Owner's machine from the verified
+wheels, like the rest of the runtime. The runtime grows by about 140 MB
+(6,296 files), and compiling takes about 2 s on a 16-core CPU. The worker
+becomes ready in 1.36 s instead of 3.35 s (CUDA) and 1.13 s instead of
+3.12 s (CPU), RTX 5070. What is left is mostly importing PyTorch (0.5 s) and
+the `torch._dynamo` import that PyTorch's Python meta kernels trigger
+(0.5 s).
