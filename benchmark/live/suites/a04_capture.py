@@ -36,22 +36,36 @@ def ref_losses(kind, batches, model=None):
     return [step(x, y).item() for x, y in batches], m
 
 
+def train_float64(dev, kind, batches):
+    m = wl.build("mlp", 0).double().to(dev)
+    step = wl.make_step(m, wl.optimizer(m.parameters(), kind), F.cross_entropy)
+    for x, y in batches:
+        step(x.double().to(dev), y.to(dev))
+    return m
+
+
 def optim_eager(dev, kind):
     import reflop
 
     b = data()
-    ref, mref = ref_losses(kind, b)
+    ref, _ = ref_losses(kind, b)
     m = wl.build("mlp", 0).to(dev)
     opt = wl.optimizer(m.parameters(), kind)
     step = wl.make_step(m, opt, F.cross_entropy)
     rem = [step(x.to(dev), y.to(dev)).item() for x, y in b]
     worst = max(abs(a - c) / max(abs(c), 1e-9) for a, c in zip(rem, ref))
-    st = reflop.fetch(m.state_dict())
-    pd = max((st[k] - v).abs().max().item() for k, v in mref.state_dict().items())
     check(worst < 1e-4, f"max rel loss diff {worst:.2e}")
-    ptol = 1e-3 if kind in ("rmsprop", "adagrad", "adadelta", "adamax") else 1e-4   # sqrt(v) amplifies rounding
-    check(pd < ptol, f"param diff {pd:.2e}")
-    return f"max rel loss diff {worst:.1e}, param diff {pd:.1e}"
+    # Parameters are compared in float64. In float32, a ReLU input within an ulp of 0 can land on either side
+    # depending on how the CPU or GPU rounds; that unit's gradient then changes, and adaptive optimizers move every
+    # weight it touches by about lr per step (1.3e-3 for Adamax against an x86 reference, with reFLOP within 3e-5 of
+    # float64). Plain optimizers then agree to ~1e-11; a wrong hyperparameter shows as 2e-3 or more. Capturable Adam
+    # keeps its step count in float32, which leaves ~5e-7.
+    st = reflop.fetch(train_float64(dev, kind, b).state_dict())
+    ref64 = train_float64("cpu", REF_KIND.get(kind, kind), b).state_dict()
+    pd = max((st[k] - v).abs().max().item() for k, v in ref64.items())
+    ptol = 1e-5 if kind in ("adam_cap", "adamw_cap") else 1e-9
+    check(pd < ptol, f"float64 param diff {pd:.2e}")
+    return f"max rel loss diff {worst:.1e}, float64 param diff {pd:.1e}"
 
 
 def optim_capture(dev, kind):
