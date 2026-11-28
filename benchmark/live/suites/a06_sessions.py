@@ -148,21 +148,47 @@ def close_and_reopen():
 
 
 def open_close_latency(s):
+    """Open + first op, split on the Guest side: handshake (TCP and TLS or ssh, hello, authentication), worker start
+    (the session-open request, while reflopd starts the sandboxed worker: Python, torch import, CUDA init), the
+    first op, and close. Timed by wrapping the client's own functions for the length of the case."""
     import reflop
+    from reflop import client
 
-    for kind in ("cuda", "cpu"):
-        ts_open, ts_close = [], []
-        for _ in range(q(5, 2)):
-            reflop.close()
-            t0 = time.perf_counter()
-            d = reflop.device(0, kind=kind)
-            torch.ones(1).to(d).item()
-            ts_open.append(time.perf_counter() - t0)
-            t0 = time.perf_counter()
-            reflop.close()
-            ts_close.append(time.perf_counter() - t0)
-        s.metric("session_latency", kind=kind, open_first_op_ms=1000 * sorted(ts_open)[len(ts_open) // 2],
-                 close_ms=1000 * sorted(ts_close)[len(ts_close) // 2], samples=len(ts_open))
+    phase: dict = {}
+
+    def timed(name, fn):
+        def wrapper(*a, **kw):
+            t = time.perf_counter()
+            try:
+                return fn(*a, **kw)
+            finally:
+                phase[name] = time.perf_counter() - t
+        return wrapper
+
+    real_auth, real_open = client._authenticated_framer, client.RemoteConnection.open_session
+    client._authenticated_framer = timed("handshake", real_auth)
+    client.RemoteConnection.open_session = timed("worker_start", real_open)
+    try:
+        for kind in ("cuda", "cpu"):
+            rows = []
+            for _ in range(q(5, 2)):
+                reflop.close()
+                phase.clear()
+                t0 = time.perf_counter()
+                d = reflop.device(0, kind=kind)
+                t1 = time.perf_counter()
+                torch.ones(1).to(d).item()
+                t2 = time.perf_counter()
+                reflop.close()
+                rows.append({"total": t2 - t0, "handshake": phase.get("handshake", 0.0),
+                             "worker_start": phase.get("worker_start", 0.0), "first_op": t2 - t1,
+                             "close": time.perf_counter() - t2})
+            med = {k: 1000 * sorted(r[k] for r in rows)[len(rows) // 2] for k in rows[0]}
+            s.metric("session_latency", kind=kind, open_first_op_ms=med["total"], close_ms=med["close"],
+                     handshake_ms=med["handshake"], worker_start_ms=med["worker_start"],
+                     first_op_ms=med["first_op"], samples=len(rows))
+    finally:
+        client._authenticated_framer, client.RemoteConnection.open_session = real_auth, real_open
     return "see metrics"
 
 
