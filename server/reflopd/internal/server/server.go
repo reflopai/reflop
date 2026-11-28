@@ -584,6 +584,7 @@ func (s *Server) limits() *pb.Limits {
 
 func (s *Server) capabilitiesFor(id *auth.Identity) *pb.ServerCapabilities {
 	c := &pb.ServerCapabilities{ProtocolVersions: []uint32{ProtocolVersion}, OpsetVersions: []uint32{1}}
+	toggles := s.cfg().Ops.Capabilities
 	seen := map[string]bool{}
 	for _, slot := range s.devices() {
 		if !slot.allowed(id.GPUUUID) {
@@ -601,6 +602,12 @@ func (s *Server) capabilitiesFor(id *auth.Identity) *pb.ServerCapabilities {
 			c.Devices = append(c.Devices, &pb.DeviceInfo{Device: slot.PB, Name: slot.Name})
 		}
 		for _, k := range slot.Caps {
+			// A capability the Owner turned off is not offered, like its
+			// operators (filterOps): the worker reports what the device
+			// supports, not what the Owner allows.
+			if on, ok := toggles[k]; ok && !on {
+				continue
+			}
 			if !seen[k] {
 				seen[k] = true
 				c.Capabilities = append(c.Capabilities, k)
