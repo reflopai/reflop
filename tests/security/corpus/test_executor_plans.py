@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import pytest
 import torch
-from helpers import NAME, I, decode, graph, make_session, meta, register, run, tensor_binding, tin, tnode
+from helpers import NAME, NONE, B, I, decode, graph, make_session, meta, register, run, tensor_binding, tin, tnode
 from reflop_worker import validators
 from reflop_worker._pb import compute_pb2 as cpb
 from reflop_worker._pb import graph_pb2 as gpb
@@ -171,3 +171,114 @@ def test_an_out_of_range_index_still_fails_after_the_views(sess):
     expect(err, cpb.ERROR_INDEX_OUT_OF_BOUNDS, cpb.STAGE_E2_RUNTIME)
     assert err.node_index == 6
     ok_after(sess)
+
+
+# ------------------------------------------------- pooling indices (ADR-065)
+
+def _counting_measure(monkeypatch):
+    calls = []
+    real = validators.measure
+
+    def measure(t):
+        calls.append(tuple(t.shape))
+        return real(t)
+
+    monkeypatch.setattr(validators, "measure", measure)
+    return calls
+
+
+def _pool_graph(sess, shape, k, s, p, d):
+    """max_pool2d_with_indices, then its backward on the forward's indices."""
+    out_shape = tuple(torch.ops.aten.max_pool2d_with_indices.default(
+        torch.zeros(shape), [k, k], [s, s], [p, p], [d, d], False)[0].shape)
+    pool = [ints(k, k), ints(s, s), ints(p, p), ints(d, d), B(False)]
+    return graph(sess, [(F32, shape), (F32, out_shape)],
+                 [("aten.max_pool2d_with_indices.default", [tin(0)] + pool),
+                  ("aten.max_pool2d_with_indices_backward.default", [tin(1), tin(0)] + pool + [tnode(0, 1)])],
+                 [(F32, shape)]), out_shape
+
+
+def test_max_pool_indices_need_no_measurement(sess, monkeypatch):
+    # Every window holds an input element, so the indices are positions in
+    # the input and the backward's bounds check needs no device sync.
+    g, out_shape = _pool_graph(sess, (2, 3, 8, 8), 3, 2, 1, 1)
+    calls = _counting_measure(monkeypatch)
+    x, go = torch.randn(2, 3, 8, 8), torch.randn(out_shape)
+    r = run(sess, g, [x, go])
+    assert isinstance(r, cpb.ExecuteResult), r
+    assert calls == []
+    _, idx = torch.ops.aten.max_pool2d_with_indices.default(x, [3, 3], [2, 2], [1, 1], [1, 1], False)
+    want = torch.ops.aten.max_pool2d_with_indices_backward.default(go, x, [3, 3], [2, 2], [1, 1], [1, 1], False, idx)
+    assert torch.equal(decode(r.returned[0]), want)
+
+
+def test_max_pool_empty_window_indices_are_measured(sess, monkeypatch):
+    # Kernel 2, padding 1, dilation 2 on a 1x1 input: the window holds only
+    # padding, and both kernels return index 2, past the input. The rule
+    # gives these indices no range; the measurement refuses them.
+    x = torch.randn(1, 1, 1, 1)
+    _, idx = torch.ops.aten.max_pool2d_with_indices.default(x, [2, 2], [1, 1], [1, 1], [2, 2], False)
+    assert int(idx.max()) >= 1  # the kernel's behaviour this guards against
+    g, out_shape = _pool_graph(sess, (1, 1, 1, 1), 2, 1, 1, 2)
+    calls = _counting_measure(monkeypatch)
+    err = run(sess, g, [x, torch.randn(out_shape)])
+    expect(err, cpb.ERROR_INDEX_OUT_OF_BOUNDS, cpb.STAGE_E2_RUNTIME)
+    assert err.node_index == 1 and calls
+    ok_after(sess)
+
+
+def test_adaptive_max_pool_indices_need_no_measurement(sess, monkeypatch):
+    shape = (2, 3, 7, 5)
+    g = graph(sess, [(F32, shape), (F32, (2, 3, 3, 4))],
+              [("aten.adaptive_max_pool2d.default", [tin(0), ints(3, 4)]),
+               ("aten.adaptive_max_pool2d_backward.default", [tin(1), tin(0), tnode(0, 1)])],
+              [(F32, shape)])
+    calls = _counting_measure(monkeypatch)
+    r = run(sess, g, [torch.randn(shape), torch.randn(2, 3, 3, 4)])
+    assert isinstance(r, cpb.ExecuteResult), r
+    assert calls == []
+
+
+@pytest.mark.parametrize("dev", ["cpu", "cuda"])
+def test_window_rule_matches_the_kernels(dev):
+    # Wherever the rule says every window holds an input element, both
+    # kernels return indices inside the input (the rule may be stricter).
+    if dev == "cuda" and not torch.cuda.is_available():
+        pytest.skip("no CUDA")
+    import itertools
+
+    from reflop_worker.execute import windows_cover_input
+
+    A = torch.ops.aten
+    covered = 0
+    for h, k, s, p, d, ceil in itertools.product(range(1, 7), range(1, 4), range(1, 3), range(0, 2), range(1, 4),
+                                                 (False, True)):
+        try:
+            out, idx = A.max_pool2d_with_indices.default(torch.full((1, 1, h, h + 1), float("-inf"), device=dev),
+                                                         [k, k], [s, s], [p, p], [d, d], ceil)
+        except RuntimeError:
+            continue
+        rule = (windows_cover_input(h, out.shape[-2], k, s, p, d)
+                and windows_cover_input(h + 1, out.shape[-1], k, s, p, d))
+        if rule:
+            covered += 1
+            assert 0 <= int(idx.min()) and int(idx.max()) < h * (h + 1), (h, k, s, p, d, ceil)
+    assert covered > 100
+
+
+def test_a_bound_that_does_not_fit_is_measured(sess):
+    # argmax gives its output the bound [0, 15]; the actual index is 3, which
+    # fits a 10-row table. The check measures instead of refusing on the bound.
+    x = torch.zeros(16)
+    x[3] = 1.0
+    g = graph(sess, [(F32, (16,)), (F32, (10, 2))],
+              [("aten.argmax.default", [tin(0), NONE, B(False)]),
+               ("aten.view.default", [tnode(0), ints(1)]),
+               ("aten.index_select.default", [tin(1), I(0), tnode(1)])],
+              [(F32, (1, 2))])
+    table = torch.arange(20.0).reshape(10, 2)
+    r = run(sess, g, [x, table])
+    assert isinstance(r, cpb.ExecuteResult), r
+    assert decode(r.returned[0]).tolist() == [[6.0, 7.0]]
+    x[3], x[12] = 0.0, 1.0
+    expect(run(sess, g, [x, table]), cpb.ERROR_INDEX_OUT_OF_BOUNDS, cpb.STAGE_E2_RUNTIME)

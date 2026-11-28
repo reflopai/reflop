@@ -82,7 +82,9 @@ def bounds(node, idx: torch.Tensor, lo: int, hi: int, sentinel: int | None = Non
     Server tensors are never mutated in place, so a tensor's value range,
     once known (measured on the host at upload, scanned for datasets,
     inherited through gathers and views, or measured here), stays valid and
-    is reused instead of synchronizing with the device again."""
+    is reused instead of synchronizing with the device again. A known range
+    may be a bound rather than the exact span (argmax, pooling indices), so
+    one that does not fit is measured before the index is refused."""
     if not _is_t(idx) or idx.numel() == 0:
         return
     if idx.dtype not in INDEX_DTYPES and idx.dtype not in INT_DTYPES:
@@ -91,9 +93,8 @@ def bounds(node, idx: torch.Tensor, lo: int, hi: int, sentinel: int | None = Non
     if r is not None and r[0] >= lo and r[1] < hi:
         return
     if sentinel is None:
-        if r is None:
-            r = measure(idx)
-            set_range(idx, r)
+        r = measure(idx)
+        set_range(idx, r)
         mn, mx = r
         if mn < lo or mx >= hi:
             raise _oob(node, f"{what} out of range: values span [{mn}, {mx}], valid range is [{lo}, {hi})")

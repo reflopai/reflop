@@ -2369,3 +2369,48 @@ deletes the file to measure again. Older reflopd answers ERROR_PROTOCOL and
 does not list the capability, so the client shows no score. Tests:
 `baseline_test.go`, `tests/client/test_reflop_test.py`,
 `tests/security/corpus/test_native_baseline.py`.
+
+## ADR-065: Max pool indices carry a range when every window covers the input
+
+**Context.** The pooling backward ops check their indices against the input
+(I4). The indices come from the forward, inside the same program, so their
+range was unknown and every check measured them on the device: one sync per
+max pool per execute. The captured CNN, ResNet-18 and U-Net each stopped
+once to three times per step. The indices are not always in range, though.
+A window that lies entirely in the padding, which dilation allows
+(`max_pool2d_with_indices` on a 1x1 input with kernel 2, padding 1,
+dilation 2), leaves its index at the kernel's start value, past the input.
+Of 2,144 small 2D configurations that PyTorch accepts, 66 returned such
+indices on CPU or CUDA.
+
+**Decision.**
+
+- `max_pool2d/3d_with_indices` give their indices the range
+  `[0, n)`, `n` the input's spatial numel, only when every window along
+  every spatial dim holds an input element (`windows_cover_input`, from the
+  kernel size, stride, padding, dilation and the validated output size).
+  Otherwise the indices get no range and are measured where they are used,
+  as before.
+- `adaptive_max_pool2d/3d` always give theirs that range: an adaptive window
+  runs from `floor(i * size / out)` to `ceil((i + 1) * size / out)` and is
+  never empty.
+- The values output gets no range: it has the input's dtype, which can be an
+  integer type.
+- A known range can now be a bound rather than the exact span (argmax and
+  pooling indices). `bounds()` measures a tensor whose known range does not
+  fit before refusing it, so a bound never refuses an index that is in range.
+
+**Alternatives.** Giving every max pool's indices the range: wrong for the
+empty windows above, and the backward would scatter outside its output.
+Requiring padding and dilation that cannot produce an empty window:
+refuses programs PyTorch runs. Measuring once per program and caching the
+result: a per-execute check must not be cached (§3).
+
+**Consequences.** Captured steps with max pools no longer synchronize for
+their indices. Worker time per execute, RTX 5070, batch 128, in-process:
+CNN 1.41 → 0.86 ms. The rule was checked against both kernels on about
+16,600 configurations (2D and 3D, three dtypes, channels-last, NaN and
+-inf inputs) with no index outside the input where it claims a range;
+`test_window_rule_matches_the_kernels` repeats a smaller grid on every run.
+A future PyTorch whose kernels start a window elsewhere would break the
+rule; that test fails first.
