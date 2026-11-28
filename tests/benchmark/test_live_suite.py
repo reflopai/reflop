@@ -12,7 +12,15 @@ from pathlib import Path
 import pytest
 
 BENCH = Path(__file__).resolve().parents[2] / "benchmark"
-REPORT = BENCH / "report" / "2026-11-28"
+# report dir, NEW run, OLD run, generated rows that pin the tables
+REPORTS = [
+    ("2026-11-28", "2026-11-28_00-00-27", "2026-11-21_16-09-26",
+     ("| TOTAL | 662 | 6 | 14 | 0 | 4 nonzero | 3921 | 657 | 17 | 22 | 0 | 8 nonzero | 3976 |",
+      "| capture | resident | 30 | -21.2% |")),
+    ("2026-11-28-0.4.4", "2026-11-28_18-17-58", "2026-11-28_00-00-27",
+     ("| TOTAL | 683 | 0 | 14 | 20 | 0 nonzero | 3564 | 662 | 6 | 14 | 0 | 4 nonzero | 3921 |",
+      "| capture | resident | 30 | -2.3% |")),
+]
 
 
 @pytest.fixture
@@ -79,17 +87,20 @@ def test_sanitize_removes_what_a_run_records(live, tmp_path):
     assert live.sanitize.check([tmp_path / "raw"]) == 1
 
 
-def test_published_report_is_clean(live):
-    assert live.sanitize.check([REPORT]) == 0
+@pytest.mark.parametrize("name", [r[0] for r in REPORTS])
+def test_published_report_is_clean(live, name):
+    assert live.sanitize.check([BENCH / "report" / name]) == 0
 
 
-def test_report_reproduces_the_published_tables(live):
-    data = REPORT / "data"
-    new, old = (live.report.Run(data / n) for n in ("2026-11-28_00-00-27", "2026-11-21_16-09-26"))
+@pytest.mark.parametrize("name, new_run, old_run, rows", REPORTS)
+def test_report_reproduces_the_published_tables(live, name, new_run, old_run, rows):
+    report = BENCH / "report" / name
+    data = report / "data"
+    new, old = (live.report.Run(data / n) for n in (new_run, old_run))
     text = live.report.report(new, old, None)
-    published = (REPORT / "README.md").read_text()
-    assert "| TOTAL | 662 | 6 | 14 | 0 | 4 nonzero | 3921 | 657 | 17 | 22 | 0 | 8 nonzero | 3976 |" in text
-    assert "| capture | resident | 30 | -21.2% |" in text
+    published = (report / "README.md").read_text()
+    for row in rows:
+        assert row in text
     # Everything but the hand-written section 2 is generated.
     start, end = "## 3. Suite totals", "## Appendix A."
     assert text[text.index(start):text.index(end)] == published[published.index(start):published.index(end)]
