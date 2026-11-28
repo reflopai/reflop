@@ -82,7 +82,7 @@ this way is not in a systemd scope, so the a12 cases that crash a worker through
 | a03_models | 10 workloads against a CPU reference; checkpointing, clipping, hooks, accumulation, BatchNorm stats, compile boundaries |
 | a04_capture | 12 optimizers eager and under `reflop.capture`; capture rules |
 | a05_precision | autocast bf16/fp16, AMP and GradScaler, AMP under capture, storage dtypes |
-| a06_sessions | GPU and CPU sessions, moves, placement modes, threads, flush, stats, async errors, OOM, long graphs |
+| a06_sessions | GPU and CPU sessions, moves, placement modes, threads, flush, stats, async errors, OOM, long graphs; session open split into handshake, worker start and first op |
 | a07_datasets | dataset build, push, ls, rm, loader semantics, training from datasets, resume, corruption, push throughput |
 | a08_snapshots | `reflop.save/load/snapshots/delete_snapshot`, the default session, bit-exact resume, fetch to safetensors |
 | a09_run_shim | `reflop run` on CUDA scripts, the torch.cuda API map, exit codes, signals, environment defaults |
@@ -94,7 +94,7 @@ this way is not in a systemd scope, so the a12 cases that crash a worker through
 | a15_reference | training against native PyTorch on the same device kind with the session's numerics (GH#19); only with `E2E_LOCAL=1`, or `E2E_REFERENCE=1` when this machine has the Owner's GPU and CPU |
 | b01_throughput | 10 workloads × batch 8/32/128 × eager/capture × resident/upload on the GPU, plus a server-CPU subset |
 | b02_native | the same matrix with native CUDA on the Owner, and a matmul sweep |
-| b03_micro | round trip, transfer sweep, matmul TFLOP/s, recording cost per op, graph cache, `step_boundary` |
+| b03_micro | round trip, transfer sweep, link baseline (the same bytes through plain `ssh` to the Owner next to reFLOP's upload and fetch; needs `E2E_OWNER_SSH`), matmul TFLOP/s, recording cost per op, graph cache, `step_boundary` |
 | b04_soak | 20-minute captured GPT trained from a dataset: step time, RSS, loss (`E2E_SOAK_MINUTES` changes it) |
 
 A new `live/suites/<letter><nn>_<name>.py` with a `main()` is picked up by `run_full.sh`. Run one suite alone
