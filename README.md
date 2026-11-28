@@ -310,44 +310,45 @@ for x, y in data:
     loss = step(x, y)                 # one request per step after two warm-up calls
 ```
 
-Share of native CUDA speed kept, from the 28 November 2026 benchmark run:
-Owner RTX 5070, batch 128, data already on the GPU, `reflop.capture` on,
+Share of native CUDA speed kept, from the 0.4.5 benchmark run of 28 November
+2026: Owner RTX 5070, batch 128, data already on the GPU, `reflop.capture` on,
 Guest on another machine over the network.
 
 | Workload | Native CUDA speed kept |
 |---|---|
-| UNet | **89%** |
-| ResNet-18 | **88%** |
-| Attention | 87% |
-| GPT | 77% |
-| CNN | 68% |
-| MLP | 25% |
-| LSTM / GRU | 3.3–5.0% |
+| Attention | **94%** |
+| UNet | **93%** |
+| ResNet-18 | 83% |
+| CNN | 79% |
+| GPT | 79% |
+| MLP | 31% |
+| LSTM / GRU | 7.7–9.0% |
 
 - **LSTM and GRU are the slowest.** They run one timestep at a time. Since
-  0.4.5 each cell is one fused kernel instead of about a dozen ops, which
-  takes 2.2–2.5× less time per step on the same GPU (measured on the Owner
-  after this run; ADR-067).
+  0.4.5 each cell is one fused kernel instead of about a dozen ops (ADR-067):
+  against 0.4.4, a captured step takes 1.6–3.2× less time and an eager step
+  2.4–2.5× less.
 - **Uploading inputs every step is bound by the network** (about 10 MiB/s
-  and a 4.6 ms round trip in this run; reFLOP moves data as fast as plain
-  ssh over the same link). Those cases keep 0.2–73% of native speed,
+  and a 4.1 ms round trip in this run; reFLOP moves data as fast as plain
+  ssh over the same link). Those cases keep 0.2–72% of native speed,
   depending on how much a step uploads. Keep the data on the server: a
   [dataset](docs/GUEST_GUIDE.md#datasets) needs 8 bytes per sample, and took
-  the CNN from 142 ms to 2.3 ms per step.
+  the CNN from 142 ms to 2.2 ms per step.
 - **The GPU itself runs at native speed.** Matmul measured on the GPU reaches
   the same TFLOP/s as native CUDA.
-- **Several Guests share the GPU.** Eight processes at once reached 1.94× the
+- **Several Guests share the GPU.** Eight processes at once reached 1.84× the
   throughput of one, with the GPU split evenly between them.
-- **Long runs are stable.** A 20-minute soak ran 80,750 steps at a constant
+- **Long runs are stable.** A 20-minute soak ran 80,850 steps at a constant
   14.6 ms/step, with flat memory use.
-- **Opening a session takes about 3.4 s.** Almost all of it is the Owner
-  starting the sandboxed worker.
+- **Opening a session takes about 1.4 s.** Almost all of it is the Owner
+  starting the sandboxed worker (3.5 s before 0.4.5, which ships the
+  runtime with compiled bytecode).
 
-These numbers come from a LAN connection with a 4.6 ms round trip. Yours
+These numbers come from a LAN connection with a 4.1 ms round trip. Yours
 depend on your connection: `reflop test --<architecture>` (for example
 `reflop test --transformer`) measures them in about 10 seconds. See
 [`benchmark/`](benchmark/README.md) to reproduce the full run, and the
-[report](benchmark/report/2026-11-28-0.4.4/README.md) for this run with its data.
+[report](benchmark/report/2026-11-28-0.4.5/README.md) for this run with its data.
 
 Steps whose Python numbers change every step (a non-capturable Adam's bias
 correction, a Python learning-rate schedule) are detected and refused; use
