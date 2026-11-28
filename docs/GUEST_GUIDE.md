@@ -416,8 +416,9 @@ workload. The suite records the round trip and network path with each run.
 In the 0.4.4 run of 28 November 2026 (Owner RTX 5070, batch 128, data
 resident, capture on, Guest on another machine), reFLOP kept this share of
 native CUDA speed: UNet 89%, ResNet-18 88%, attention 87%, GPT 77%, CNN 68%,
-MLP 25%, and LSTM/GRU 3.3–5.0%. LSTM and GRU run one timestep at a time (about
-8,000 graph nodes per step). Uploading inputs every step was bound by the
+MLP 25%, and LSTM/GRU 3.3–5.0%. LSTM and GRU run one timestep at a time; since
+0.4.5 each cell is one fused kernel, which takes 2.2–2.5× less time per step
+(measured after this run, ADR-067). Uploading inputs every step was bound by the
 network (about 10 MiB/s, 4.6 ms round trip; reFLOP moved data as fast as plain
 ssh over the same link) and kept 0.2–73%. Matmul on the GPU reached the same
 TFLOP/s as native CUDA, and eight processes at once reached 1.94× the

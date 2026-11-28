@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.4.5 (2026-11-28)
+
+LSTM and GRU train 2.2–2.5× faster, and workers start in 1.4 s instead of
+3.4 s. Update the daemon; the client has no changes besides its version
+number, and every 0.4 client and daemon work together.
+
+- The fused LSTM and GRU cells (`rnn_fused`: `_thnn_fused_lstm_cell`,
+  `_thnn_fused_gru_cell` and their backwards) are on by default, like the
+  other Tier 2 groups. They were off because the capability once covered
+  `_cudnn_rnn`, which is banned since ADR-051; without them the client
+  records each cell as its parts, three times the operators. Captured
+  steps at batch 8 to 128 on an RTX 5070: LSTM 37–38 → 17 ms, GRU 37–44 →
+  17–18 ms; eager steps take about 2.4× less time. Results match the
+  decomposition to 1e-7 in float32 and differ by rounding in bfloat16, so
+  LSTM and GRU results are not bit-identical to 0.4.4's. Owners who want
+  the old behaviour set `[ops] capabilities = { rnn_fused = false }`
+  (ADR-067).
+- A session lists only the capabilities the Owner allows: `reflop status`
+  showed `rnn_fused` while the Owner's configuration turned its operators
+  off. A server CPU device no longer lists it at all (the cells have CUDA
+  kernels only).
+- The compute runtime ships compiled bytecode. reflopd unpacked the
+  PyTorch wheels without `.pyc` files, so every worker start compiled each
+  module it imported again. Workers now become ready in 1.36 s instead of
+  3.35 s (CUDA) and 1.13 s instead of 3.12 s (CPU); opening a session
+  takes about 1.3 s. A runtime installed before gets its bytecode once,
+  when reflopd 0.4.5 first starts (about 2 s, 140 MB); the `.pyc` files
+  are checked against their source's hash on every import (ADR-066).
+- `benchmark/report/2026-11-28-0.4.4/` publishes the 0.4.4 live run against
+  0.4.1, with what explained the slow LSTM and GRU and the 3.4 s session
+  open. The README takes its numbers from it.
+
 ## 0.4.4 (2026-11-28)
 
 Faster captured steps for models with max pooling. Update the daemon; the

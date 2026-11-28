@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # One-time setup of benchmark/.venv for the live suite (and again after changing what it tests).
 #   ./benchmark/setup.sh                    the client from this checkout (editable): test before a release
-#   ./benchmark/setup.sh --release 0.4.4    reflop==0.4.4 from PyPI: test what users install
+#   ./benchmark/setup.sh --release 0.4.5    reflop==0.4.5 from PyPI: test what users install
 # The C API suite (a10) builds libreflop from this checkout, or, for a release, from that tag's source, which
 # run_full.sh extracts to benchmark/cache/src-v<version>.
 set -euo pipefail
@@ -11,7 +11,7 @@ command -v uv >/dev/null || { echo "needs uv (https://docs.astral.sh/uv/)"; exit
 release=""
 case "${1:-}" in
   "") ;;
-  --release) release="${2:?--release needs a version, e.g. 0.4.4}" ;;
+  --release) release="${2:?--release needs a version, e.g. 0.4.5}" ;;
   *) echo "usage: $0 [--release X.Y.Z]"; exit 2 ;;
 esac
 [ -x .venv/bin/python ] || uv venv --python 3.12 .venv

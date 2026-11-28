@@ -141,8 +141,8 @@ the files of the signed GitHub release.
 
 <br>
 
-Download `reflopd_0.4.4_linux_<arch>.tar.gz` or
-`reflop-0.4.4-py3-none-any.whl` from
+Download `reflopd_0.4.5_linux_<arch>.tar.gz` or
+`reflop-0.4.5-py3-none-any.whl` from
 [Releases](https://github.com/reflopai/reflop/releases) with `checksums.txt`
 and `checksums.txt.sig`. Check the signature, then the file:
 
@@ -324,8 +324,10 @@ Guest on another machine over the network.
 | MLP | 25% |
 | LSTM / GRU | 3.3–5.0% |
 
-- **LSTM and GRU are slow by design.** They run one timestep at a time, about
-  8,000 graph nodes per step.
+- **LSTM and GRU are the slowest.** They run one timestep at a time. Since
+  0.4.5 each cell is one fused kernel instead of about a dozen ops, which
+  takes 2.2–2.5× less time per step on the same GPU (measured on the Owner
+  after this run; ADR-067).
 - **Uploading inputs every step is bound by the network** (about 10 MiB/s
   and a 4.6 ms round trip in this run; reFLOP moves data as fast as plain
   ssh over the same link). Those cases keep 0.2–73% of native speed,
