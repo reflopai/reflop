@@ -25,6 +25,20 @@ def sess():
     return make_session("cuda")
 
 
+CELLS = ("aten._thnn_fused_lstm_cell.default", "aten._thnn_fused_lstm_cell_backward_impl.default",
+         "aten._thnn_fused_gru_cell.default", "aten._thnn_fused_gru_cell_backward.default")
+
+
+def test_a_cpu_session_offers_neither_the_cells_nor_the_capability():
+    """The cells have CUDA kernels only; `reflop status` must not list
+    rnn_fused for a server CPU device."""
+    from helpers import NAME
+
+    cpu = make_session("cpu")
+    assert "rnn_fused" not in cpu.caps
+    assert not {NAME[n] for n in CELLS} & set(cpu.enabled)
+
+
 def run(sess, op, args):
     call = Call(op, args)
     outs, err = infer_outputs(sess, call)

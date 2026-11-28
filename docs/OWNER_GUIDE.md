@@ -491,7 +491,8 @@ cpu = true        # also expose the server CPU as a device
 
 [ops]
 disabled = ["aten._scaled_mm.default"]
-capabilities = { rnn_fused = false, fp8 = true }
+capabilities = { fp8 = false }   # Tier 2 groups (linalg, complex, fp8, rnn_fused, ctc,
+                                 # cdist_backward) are on by default; false turns one off
 
 [numerics]
 tf32_matmul = false

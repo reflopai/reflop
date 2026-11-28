@@ -274,7 +274,7 @@ func Defaults() Config {
 	c.Devices.CPU = true
 	c.Ops.Capabilities = map[string]bool{
 		"linalg": true, "complex": true, "fp8": true, "ctc": true, "cdist_backward": true,
-		"rnn_fused": false, // O11: off by default; _cudnn_rnn is BANNED (ADR-051)
+		"rnn_fused": true, // ADR-067; _cudnn_rnn itself is BANNED (ADR-051)
 	}
 	c.Yield.Interval = Duration(2 * time.Second)
 	c.Checkpoints.Interval = Duration(DefaultCheckpointInterval)

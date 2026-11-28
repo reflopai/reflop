@@ -37,8 +37,9 @@ def torch_device(d: gpb.Device) -> torch.device:
 
 
 def detect_capabilities(device: torch.device, allowed: set[str] | None) -> list[str]:
-    caps = {"linalg", "complex", "ctc", "cdist_backward", "rnn_fused"}
+    caps = {"linalg", "complex", "ctc", "cdist_backward"}
     if device.type == "cuda":
+        caps.add("rnn_fused")  # the _thnn_fused_* cells have CUDA kernels only
         major, minor = torch.cuda.get_device_capability(device)
         if (major, minor) >= (8, 9):
             caps.add("fp8")

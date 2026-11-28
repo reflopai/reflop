@@ -509,7 +509,7 @@ These are emitted by AOTAutograd backward graphs, `torch.optim`, AMP, `F.scaled_
 | `linalg` | `linalg_cholesky_ex`, `linalg_qr`, `_linalg_svd`, `_linalg_eigh`, `_linalg_solve_ex`, `linalg_solve_triangular`, `linalg_inv_ex`, `_linalg_det`, `_linalg_slogdet`, `linalg_lu_factor_ex`, `linalg_lu_solve`, `cholesky_solve`, `triangular_solve`, `linalg_pinv` (if not decomposed), `linalg_matrix_exp` | `info` outputs returned as tensors; no exceptions across the wire. Batch and matrix sizes capped by protocol sanity limits (cubic cost). |
 | `complex` | `_fft_c2c`, plus Tier 0/1 ops on complex64/complex128 (`_fft_r2c`, `_fft_c2r`, `view_as_real`, `view_as_complex`, `polar`, `complex`) | Needed for FFT-based models and rotary embeddings implemented with complex numbers (e.g. LLaMA-style RoPE via `view_as_complex`). |
 | `fp8` | `_scaled_mm` | Only on GPUs that report fp8 support; scale tensors validated |
-| `rnn_fused` | `_thnn_fused_lstm_cell`, `_thnn_fused_lstm_cell_backward_impl`, `_thnn_fused_gru_cell`, `_thnn_fused_gru_cell_backward` | Without this capability, LSTM/GRU cells decompose to Tier 0 (correct, slower). `_cudnn_rnn` and its backward are `BANNED` (ADR-051). |
+| `rnn_fused` | `_thnn_fused_lstm_cell`, `_thnn_fused_lstm_cell_backward_impl`, `_thnn_fused_gru_cell`, `_thnn_fused_gru_cell_backward` | On by default (ADR-067). Turned off, LSTM/GRU cells decompose to Tier 0: the same results, about 2.3× slower. `_cudnn_rnn` and its backward are `BANNED` (ADR-051). |
 | `ctc` | `_ctc_loss`, `_ctc_loss_backward` | `IDX` on targets; length tensors validated (`target_lengths` ≤ max, `input_lengths` ≤ T) |
 | `cdist_backward` | `_cdist_backward`, `_pdist_backward` | — |
 
@@ -1004,7 +1004,7 @@ All of these are settled. New questions go here first (R4), with a default until
 | O8 | Session state TTL after disconnect | 30 minutes (`session.ttl`) |
 | O9 | Scope of `DDS` support in v1 | Two-phase execution, ADR-012 |
 | O10 | Audit log retention | 30 days (`audit.retention_days`) |
-| O11 | Ship Tier 2 enabled by default when the hardware supports it? | Yes, except `rnn_fused`, which stays off. `_cudnn_rnn` itself is `BANNED` (ADR-051) |
+| O11 | Ship Tier 2 enabled by default when the hardware supports it? | Yes, all of it. `rnn_fused` was off until ADR-067, while it still covered `_cudnn_rnn`, which is now `BANNED` (ADR-051) |
 | O12 | Should the Owner also use reFLOP for their own jobs (as an identity) or run PyTorch directly? | Direct use; reFLOP does not manage the Owner's own processes (`reflopd yield --auto` can pause Guests while the Owner uses the GPU) |
 
 ---|---|---|
