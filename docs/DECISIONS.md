@@ -2466,3 +2466,50 @@ becomes ready in 1.36 s instead of 3.35 s (CUDA) and 1.13 s instead of
 3.12 s (CPU), RTX 5070. What is left is mostly importing PyTorch (0.5 s) and
 the `torch._dynamo` import that PyTorch's Python meta kernels trigger
 (0.5 s).
+
+## ADR-067: The fused LSTM and GRU cells are on by default
+
+**Context.** reflopd turned the `rnn_fused` capability off by default
+(PLAN.md O11), because it once covered `_cudnn_rnn`, whose reserve buffer
+cannot be sized before it runs. ADR-051 has since banned `_cudnn_rnn`, and
+`rnn_fused` covers only `_thnn_fused_lstm_cell`, `_thnn_fused_gru_cell` and
+their backwards: elementwise CUDA kernels that combine a cell's gates. With
+them off, the client records each cell as its parts (`reflop/decomp.py`),
+3.2× the operators: 8,182 ATen calls per captured LSTM step at batch 128
+against 2,550. That was most of the LSTM and GRU overhead in the 0.4.4 live
+run (benchmark/report/2026-11-28-0.4.4, §2.4).
+
+**Decision.** `rnn_fused` is on by default like the other Tier 2 groups.
+An Owner turns it off with `[ops] capabilities = { rnn_fused = false }`.
+reflopd offers a capability only while the Owner allows it: the list a
+Guest sees (`reflop status`) follows the same toggles as the operators.
+
+**Alternatives.** Keeping it off and documenting how to turn it on: almost
+no Owner would, and LSTM and GRU would stay the slowest workloads for no
+reason the tests found. A worker-side RNN loop or an IR loop construct
+(BUGS.md P1) would gain more, but changes the protocol and the validators.
+
+**Consequences.**
+
+- Safety. The cells read no indices, draw no random numbers, and have
+  fixed output shapes; the backward's workspace is `B × 4H` (LSTM) or
+  `B × 5H` (GRU), known before allocation. The meta kernels and the CUDA
+  kernels both refuse every wrong shape, and the meta-parity test runs 262
+  mutated calls of the four ops (rank, size, dtype, layout, optionals) and
+  checks that the worker decides each like the kernel. A workspace a Guest
+  fills with inf, NaN, ±3e38, -0 or denormals gives wrong gradients and
+  leaves the worker serving (`test_rnn_fused_cells.py`). Guests can reach
+  four more CUDA kernels, also through the C API.
+- Numerics. In float32 the fused kernels match the decomposition to
+  1e-7 relative. Training the live suite's LSTM and GRU for 100 steps ends
+  with parameters within 6.4e-7 (LSTM) and 4.0e-7 (GRU) of a CPU reference,
+  as with the cells off. Under bfloat16 autocast the cells run in bfloat16,
+  as natively; fused and decomposed results differ by rounding in either
+  direction, both within 3e-2 of float32 relative to the largest value.
+  Results are not bit-identical to an earlier daemon's.
+- Speed, RTX 5070, Guest on the Owner: captured LSTM 37–38 → 16.8–16.9 ms
+  per step and GRU 37–44 → 17.4–18.1 ms at batch 8, 32 and 128; eager
+  LSTM 366–380 → 150–155 ms and GRU 368–371 → 149–153 ms. Clients need no
+  change: they record the cells whenever the session offers the operators.
+- CPU sessions are unchanged: the cells have CUDA kernels only, so a CPU
+  worker offers neither the operators nor, now, the `rnn_fused` capability.

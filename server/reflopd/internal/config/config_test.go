@@ -156,3 +156,28 @@ func TestRAMCheckpointSettings(t *testing.T) {
 		t.Fatal("a 10s ram_interval loaded")
 	}
 }
+
+// Every Tier 2 group is on by default (O11, ADR-067), and an Owner's
+// [ops.capabilities] table turns off only the groups it names.
+func TestCapabilityToggles(t *testing.T) {
+	all := []string{"linalg", "complex", "fp8", "rnn_fused", "ctc", "cdist_backward"}
+	for _, k := range all {
+		if on, ok := Defaults().Ops.Capabilities[k]; !ok || !on {
+			t.Errorf("%s is not on by default", k)
+		}
+	}
+	dir := t.TempDir()
+	file := filepath.Join(dir, "reflopd.toml")
+	if err := os.WriteFile(file, []byte("[ops]\ncapabilities = { rnn_fused = false }\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(file, filepath.Join(dir, "settings.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range all {
+		if want := k != "rnn_fused"; c.Ops.Capabilities[k] != want {
+			t.Errorf("%s = %v after turning rnn_fused off, want %v", k, c.Ops.Capabilities[k], want)
+		}
+	}
+}
