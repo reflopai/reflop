@@ -6,6 +6,7 @@ table; section 2 of each report is the hand-written analysis.
 
 | Report | reFLOP | Compared with | Setup |
 |---|---|---|---|
+| [2026-11-28-0.4.5](2026-11-28-0.4.5/README.md) | 0.4.5 | 0.4.4 (2026-11-28) | Owner RTX 5070 (Linux); Guest a MacBook (macOS, arm64) over Tailscale TLS, direct LAN path |
 | [2026-11-28-0.4.4](2026-11-28-0.4.4/README.md) | 0.4.4 | 0.4.1 (2026-11-28) | Owner RTX 5070 (Linux); Guest a MacBook (macOS, arm64) over Tailscale TLS, direct LAN path |
 | [2026-11-28](2026-11-28/README.md) | 0.4.1 | 0.2.2 (2026-11-21) | Owner RTX 5070 (Linux); Guest a MacBook (macOS, arm64) over Tailscale TLS, direct LAN path |
 

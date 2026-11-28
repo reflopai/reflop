@@ -353,11 +353,11 @@ Capture removes the client's per-operation cost. It does not make uploads
 faster. A step that uploads its batch every call is bound by the upload: in a
 live test, ResNet-18 at batch 128 took 143 ms per step both eagerly and with
 capture, because the batch dominated. With the data already on the server, the
-same step took 19 ms eagerly and 5.7 ms with capture. Keep the data on the
+same step took 18 ms eagerly and 4.8 ms with capture. Keep the data on the
 server: use a [dataset](#datasets), or upload the tensors once before the loop
 and index them inside the step. A dataset batch costs 8 bytes per sample on
-the wire; in the 28 November benchmark run it took a CNN step from 142 ms to
-2.5 ms.
+the wire; in the 0.4.5 benchmark run it took a CNN step from 142 ms to
+2.2 ms.
 
 `torch.compile` does not work with reFLOP tensors (TorchDynamo cannot trace this
 kind of tensor subclass). `reflop.capture` gives the same benefit.
@@ -413,18 +413,19 @@ step. Capture/eager speedup alone does not tell you how much native performance
 you retain. Check correctness failures and missing cases before choosing a
 workload. The suite records the round trip and network path with each run.
 
-In the 0.4.4 run of 28 November 2026 (Owner RTX 5070, batch 128, data
+In the 0.4.5 run of 28 November 2026 (Owner RTX 5070, batch 128, data
 resident, capture on, Guest on another machine), reFLOP kept this share of
-native CUDA speed: UNet 89%, ResNet-18 88%, attention 87%, GPT 77%, CNN 68%,
-MLP 25%, and LSTM/GRU 3.3–5.0%. LSTM and GRU run one timestep at a time; since
-0.4.5 each cell is one fused kernel, which takes 2.2–2.5× less time per step
-(measured after this run, ADR-067). Uploading inputs every step was bound by the
-network (about 10 MiB/s, 4.6 ms round trip; reFLOP moved data as fast as plain
-ssh over the same link) and kept 0.2–73%. Matmul on the GPU reached the same
-TFLOP/s as native CUDA, and eight processes at once reached 1.94× the
-throughput of one, sharing the GPU evenly. These are synthetic steady-state
-measurements. The [report](../benchmark/report/2026-11-28-0.4.4/README.md) has
-this run with its data.
+native CUDA speed: attention 94%, UNet 93%, ResNet-18 83%, CNN 79%, GPT 79%,
+MLP 31%, and LSTM/GRU 7.7–9.0%. LSTM and GRU run one timestep at a time; since
+0.4.5 each cell is one fused kernel (ADR-067), so a captured step takes
+1.6–3.2× less time than on 0.4.4 and an eager step 2.4–2.5× less. Uploading
+inputs every step was bound by the network (about 10 MiB/s, 4.1 ms round trip;
+reFLOP moved data as fast as plain ssh over the same link) and kept 0.2–72%.
+Matmul on the GPU reached the same TFLOP/s as native CUDA, and eight processes
+at once reached 1.84× the throughput of one, sharing the GPU evenly. Opening a
+session took 1.4 s. These are synthetic steady-state measurements. The
+[report](../benchmark/report/2026-11-28-0.4.5/README.md) has this run with its
+data.
 
 ## Unmodified CUDA scripts
 
