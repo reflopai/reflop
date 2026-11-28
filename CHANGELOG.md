@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.4.4 (2026-11-28)
+
+Faster captured steps for models with max pooling. Update the daemon; the
+client has no changes besides its version number, and every 0.4 client and
+daemon work together.
+
+- The worker no longer stops the GPU to check pooling indices. A max pool's
+  indices are positions in its input whenever every pooling window holds an
+  input element, which the worker now works out from the kernel size,
+  stride, padding and dilation; the backward's bounds check then needs no
+  device synchronization. A window that lies entirely in the padding
+  (possible with dilation) still has its indices measured and refused: both
+  PyTorch kernels return an index past the input there (ADR-065). Captured
+  CNN, ResNet-18 and U-Net steps synchronized one to three times per step
+  for this; the CNN's worker time per step at batch 128 on an RTX 5070 fell
+  from 1.41 to 0.86 ms (part of GH#20).
+- A bounds check whose known range is only a bound (argmax, pooling indices)
+  measures the index before refusing it, so a bound alone no longer refuses
+  an index that is in range.
+- Live suite: opening a session is split into handshake, worker start and
+  first op, and `b03` measures the link with plain ssh next to reFLOP's own
+  transfers (`link_baseline`, needs `E2E_OWNER_SSH`).
+
 ## 0.4.3 (2026-11-28)
 
 Shorter `reflop test` output. Client only: a 0.4.2 daemon is all it needs.
