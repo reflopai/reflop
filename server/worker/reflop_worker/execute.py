@@ -9,6 +9,7 @@ implementation from natives.IMPL.
 from __future__ import annotations
 
 import hashlib
+import math
 import time
 
 import torch
@@ -60,9 +61,76 @@ RANGE_PRESERVING = {
     "reflop.dataset_gather.default",
 }
 
+# Max pools whose second output (indices) holds flat positions in the
+# input's spatial dims: name -> number of spatial dims.
+MAX_POOL = {"aten.max_pool2d_with_indices.default": 2, "aten.max_pool3d_with_indices.default": 3}
+ADAPTIVE_MAX_POOL = {"aten.adaptive_max_pool2d.default": 2, "aten.adaptive_max_pool3d.default": 3}
+
 # Every op propagate_range can give a range to; it is not called for others.
 RANGE_SOURCES = RANGE_PRESERVING | {"aten._to_copy.default", "aten.randperm.default", "reflop.randperm_seeded.default",
-                                    "aten.argmax.default", "aten.argmin.default"}
+                                    "aten.argmax.default", "aten.argmin.default"} | set(MAX_POOL) | set(ADAPTIVE_MAX_POOL)
+
+
+def _spatial(v, n: int, default=None) -> list | None:
+    """An int[n] pooling argument as n values (PyTorch also takes one value,
+    and an empty stride means the kernel size)."""
+    v = list(v) if isinstance(v, (list, tuple)) else [v]
+    if not v and default is not None:
+        return default
+    if len(v) == 1:
+        v = v * n
+    return v if len(v) == n and all(isinstance(x, int) for x in v) else None
+
+
+def windows_cover_input(size: int, out: int, k: int, s: int, p: int, d: int) -> bool:
+    """True if every one of the `out` pooling windows along one dim holds an
+    input element. A window that lies entirely in the padding (possible with
+    dilation) leaves its index at the kernels' start value, which can be past
+    the input: max_pool2d_with_indices(1x1 input, kernel 2, padding 1,
+    dilation 2) returns index 2. The CPU and CUDA kernels both start at the
+    window's first element at or after 0, stepping by the dilation."""
+    if out <= 0:
+        return True
+    if k <= 0 or s <= 0 or d <= 0 or p < 0 or (out - 1) * s - p >= size:
+        return False
+    for o in range(out):  # only windows that start in the padding can be empty
+        start = o * s - p
+        if start >= 0:
+            break
+        first = start + (-start + d - 1) // d * d
+        if first >= min(start + d * (k - 1) + 1, size):
+            return False
+    return True
+
+
+def pool_index_range(node, pos: list, outs: list):
+    """(0, n - 1), n the input's spatial numel, for a max pool's indices when
+    every index is provably a position in the input, else None (the indices
+    are then measured where they are used). ADR-065."""
+    name = node.op.name
+    spatial = MAX_POOL.get(name) or ADAPTIVE_MAX_POOL.get(name)
+    if len(outs) != 2 or not pos or not isinstance(pos[0], torch.Tensor):
+        return None
+    x, o = pos[0], outs[0]
+    if x.dim() < spatial or o.dim() < spatial:
+        return None
+    sizes, osizes = tuple(x.shape[-spatial:]), tuple(o.shape[-spatial:])
+    n = math.prod(sizes)
+    if n == 0:
+        return None
+    if name in MAX_POOL:
+        a = validators._named(node, pos, {})
+        k = _spatial(a["kernel_size"], spatial)
+        if k is None:
+            return None
+        s = _spatial(a["stride"], spatial, default=k)
+        p, d = _spatial(a["padding"], spatial), _spatial(a["dilation"], spatial)
+        if s is None or p is None or d is None:
+            return None
+        if not all(windows_cover_input(sizes[i], osizes[i], k[i], s[i], p[i], d[i]) for i in range(spatial)):
+            return None
+    # Adaptive windows run from floor(i * size / out) to ceil((i + 1) * size / out): never empty.
+    return 0, n - 1
 
 
 def propagate_range(node, pos: list, outs: list) -> None:
@@ -89,6 +157,13 @@ def propagate_range(node, pos: list, outs: list) -> None:
         src = (0, max(int(pos[0]) - 1, 0))
     elif name in ("aten.argmax.default", "aten.argmin.default") and pos:
         src = (0, max(pos[0].numel() - 1, 0))
+    elif name in MAX_POOL or name in ADAPTIVE_MAX_POOL:
+        # Only the indices: the values output is the input's dtype, which
+        # can be an integer type with any values.
+        r = pool_index_range(node, pos, outs)
+        if r is not None:
+            validators.set_range(outs[1], r)
+        return
     if src is not None:
         for o in outs:
             validators.set_range(o, src)
