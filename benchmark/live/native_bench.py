@@ -77,7 +77,7 @@ def main():
                     y = x @ x
                 torch.cuda.synchronize()
                 dt = time.perf_counter() - t
-                print(json.dumps({"kind": "matmul", "dtype": str(dtype), "n": n, "reps": k,
+                print(json.dumps({"kind": "matmul", "dtype": str(dtype).removeprefix("torch."), "n": n, "reps": k,
                                   "tflops": 2 * n ** 3 * k / dt / 1e12}), flush=True)
                 del x, y
 

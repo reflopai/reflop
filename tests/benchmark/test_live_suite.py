@@ -22,7 +22,9 @@ REPORTS = [
       "| capture | resident | 30 | -2.3% |")),
     ("2026-11-28-0.4.5", "2026-11-28_23-59-43", "2026-11-28_18-17-58",
      ("| TOTAL | 683 | 0 | 14 | 20 | 0 nonzero | 3202 | 683 | 0 | 14 | 20 | 0 nonzero | 3564 |",
-      "| capture | resident | 30 | -4.8% |")),
+      "| capture | resident | 30 | -4.8% |",
+      # b02 wrote "torch.bfloat16", b03 "bfloat16": the matmul table still joins them.
+      "| bfloat16 | 8192 | 68.15 | 68.19 | 61.77 | 58.54 | 69.41 | 65.79 | 90.64 | 1 |")),
 ]
 
 

@@ -320,7 +320,9 @@ def native_drift(new: Run, old: Run) -> str:
 
 def matmul(new: Run, old: Run | None) -> str:
     def idx(r, suite, group):
-        return {(m.get("dtype"), m.get("n")): m for m in r.metrics(suite, group)} if r else {}
+        # b02 wrote "torch.float32" before the live suite named dtypes as b03 does ("float32").
+        return {(str(m.get("dtype")).removeprefix("torch."), m.get("n")): m
+                for m in r.metrics(suite, group)} if r else {}
     rn, ro = idx(new, "b03_micro", "matmul"), idx(old, "b03_micro", "matmul")
     nn, no = idx(new, "b02_native", "native_matmul"), idx(old, "b02_native", "native_matmul")
     body = []

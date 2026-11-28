@@ -80,7 +80,7 @@ Resident inputs, ms per step, OLD → NEW:
 - **Checkpoints (a12):** step time with checkpoints on has a median of 26.35–27.00 ms (OLD 26.78–27.69). The first checkpoint lands after 59.8–60.0 s.
 - **Owner pause --now (a11):** GPU suspend: pause 0.607 s, resume 0.462 s, Guest stall 9.08 s. CPU freeze: Guest stall 6.23 s.
 - **Quotas (a13):** all 16 cases pass. The 1 MiB/s upload quota held 12.03 MiB to 0.917 MiB/s.
-- **Matmul runs at native speed on the GPU.** reFLOP's device-time TFLOP/s (b03) matches b02's native sweep from n=2048 up: bfloat16 at n=8192 reached 69.41 against 68.15 native, and float32 24.44 against 23.33. §7.5's native column is empty because b02 records dtypes as `torch.bfloat16` and b03 as `bfloat16`, so the report does not join them; the native figures are in `data/<NEW>/b02_native.json`.
+- **Matmul runs at native speed on the GPU.** reFLOP's device-time TFLOP/s (b03) matches b02's native sweep from n=2048 up: bfloat16 at n=8192 reached 69.41 against 68.15 native, and float32 24.44 against 23.33. Wall time includes one round trip per request, so it keeps 91–100 % of native only from n=4096 up (§7.5).
 - Matmul wall time, snapshots, datasets, the C API, the recording cost and the graph cache changed by amounts within their latency and link spread. bfloat16 matmul at n=1024 went from 2.49 to 5.65 TFLOP/s of wall time. OLD's figure is the odd one out: float16 at the same size took 5.65 TFLOP/s in OLD.
 
 ### 2.6 Correctness
@@ -414,21 +414,21 @@ Median Δ% +0.4% over 60 configurations (native code is the same in both runs).
 
 | dtype | n | native TFLOP/s NEW | native OLD | reflop wall TFLOP/s NEW | reflop wall OLD | reflop device TFLOP/s NEW | reflop device OLD | wall retained % NEW | usage_flops_ratio NEW |
 |---|---|---|---|---|---|---|---|---|---|
-| bfloat16 | 512 |  |  | 0.7549 | 0.7351 | 21.89 | 21.29 |  | 1 |
-| bfloat16 | 1024 |  |  | 5.649 | 2.487 | 54.34 | 52.12 |  | 1 |
-| bfloat16 | 2048 |  |  | 28.69 | 27.05 | 66.08 | 64.31 |  | 1 |
-| bfloat16 | 4096 |  |  | 52.69 | 51.82 | 68.56 | 67.1 |  | 1 |
-| bfloat16 | 8192 |  |  | 61.77 | 58.54 | 69.41 | 65.79 |  | 1 |
-| float16 | 512 |  |  | 0.7508 | 0.7398 | 22.68 | 20.17 |  | 1 |
-| float16 | 1024 |  |  | 5.78 | 5.645 | 49.38 | 54.28 |  | 1 |
-| float16 | 2048 |  |  | 28.17 | 26.74 | 64.38 | 62.01 |  | 1 |
-| float16 | 4096 |  |  | 52.3 | 51.97 | 68.5 | 67.21 |  | 1 |
-| float16 | 8192 |  |  | 62.21 | 59.02 | 69.29 | 66.7 |  | 1 |
-| float32 | 512 |  |  | 0.5394 | 0.5422 | 9.356 | 9.415 |  | 1 |
-| float32 | 1024 |  |  | 4.146 | 4.182 | 19.6 | 18.84 |  | 1 |
-| float32 | 2048 |  |  | 15.12 | 14.46 | 23.56 | 22.86 |  | 1 |
-| float32 | 4096 |  |  | 20.58 | 19.9 | 22.66 | 22.02 |  | 1 |
-| float32 | 8192 |  |  | 23.43 | 22.53 | 24.44 | 23.56 |  | 1 |
+| bfloat16 | 512 | 28.29 | 28.15 | 0.7549 | 0.7351 | 21.89 | 21.29 | 2.669 | 1 |
+| bfloat16 | 1024 | 56.7 | 56.8 | 5.649 | 2.487 | 54.34 | 52.12 | 9.964 | 1 |
+| bfloat16 | 2048 | 65.53 | 65.53 | 28.69 | 27.05 | 66.08 | 64.31 | 43.79 | 1 |
+| bfloat16 | 4096 | 67.65 | 67.87 | 52.69 | 51.82 | 68.56 | 67.1 | 77.88 | 1 |
+| bfloat16 | 8192 | 68.15 | 68.19 | 61.77 | 58.54 | 69.41 | 65.79 | 90.64 | 1 |
+| float16 | 512 | 27.18 | 28.12 | 0.7508 | 0.7398 | 22.68 | 20.17 | 2.763 | 1 |
+| float16 | 1024 | 56.86 | 56.98 | 5.78 | 5.645 | 49.38 | 54.28 | 10.16 | 1 |
+| float16 | 2048 | 65.46 | 65.45 | 28.17 | 26.74 | 64.38 | 62.01 | 43.03 | 1 |
+| float16 | 4096 | 67.64 | 67.67 | 52.3 | 51.97 | 68.5 | 67.21 | 77.33 | 1 |
+| float16 | 8192 | 66.53 | 66.32 | 62.21 | 59.02 | 69.29 | 66.7 | 93.51 | 1 |
+| float32 | 512 | 10.91 | 10.91 | 0.5394 | 0.5422 | 9.356 | 9.415 | 4.945 | 1 |
+| float32 | 1024 | 18.73 | 19.13 | 4.146 | 4.182 | 19.6 | 18.84 | 22.14 | 1 |
+| float32 | 2048 | 22.85 | 22.84 | 15.12 | 14.46 | 23.56 | 22.86 | 66.16 | 1 |
+| float32 | 4096 | 21.76 | 21.6 | 20.58 | 19.9 | 22.66 | 22.02 | 94.58 | 1 |
+| float32 | 8192 | 23.33 | 23.49 | 23.43 | 22.53 | 24.44 | 23.56 | 100.4 | 1 |
 
 ### 7.6 Other measurements
 

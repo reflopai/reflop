@@ -387,8 +387,9 @@ in green, yellow or red on a terminal. It also shows the round trip and upload
 speed it measured, and a short tip where one way of training costs much more
 than another. With the Guest on the Owner's own machine (a
 0.3 ms round trip), a transformer at batch 32 kept 53% with capture and data on
-the server; an LSTM kept 1.6%, slowed down by reFLOP's cost per operation, not
-by the network.
+the server. With reflopd 0.4.4, an LSTM kept 1.6%, slowed down by reFLOP's cost
+per operation, not by the network; 0.4.5's fused LSTM and GRU cells cut that
+cost (see [Measuring throughput](#measuring-throughput)).
 
 The native time comes from the Owner's reflopd, which trains its own copy of
 the same model on the GPU, so nothing runs on your machine's GPU (you need
