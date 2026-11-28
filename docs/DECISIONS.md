@@ -2451,6 +2451,11 @@ outside the runtime (`pycache_prefix`): one more writable location the worker
 reads code from. A pre-started worker per device: removes the start from
 the open path entirely, but holds GPU memory while idle and needs the
 session's configuration after the worker started; not decided.
+Calling `torch._C._set_deterministic_algorithms` instead of
+`torch.use_deterministic_algorithms`, which imports `torch._inductor.config`
+(and with it dynamo, sympy and DTensor): the import then happens at the
+session's first graph instead, and took longer there (0.75 s against
+0.50 s), because dynamo's first `disable()` also loads its trace rules.
 
 **Consequences.** A checked-hash `.pyc` is used only while the SipHash of
 its source matches (PEP 552), so it cannot differ from the `.py` next to it,
